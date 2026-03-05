@@ -1,0 +1,583 @@
+# catalogue/datahub_metadata.yml — DataHub Metadata Ingestion Recipe
+# GI Data Lakehouse · 27 tables Bronze + 16 Silver + 16 Gold
+# Usage: datahub ingest -c datahub_metadata.yml
+
+source:
+  type: "file"
+  config:
+    path: "catalogue/datasets.yml"
+
+sink:
+  type: "datahub-rest"
+  config:
+    server: "${DATAHUB_SERVER:-http://localhost:8080}"
+    token: "${DATAHUB_TOKEN}"
+
+---
+# catalogue/datasets.yml — Dataset definitions
+# Format: DataHub MCE (Metadata Change Event) compatible
+
+datasets:
+
+  # ============================================================
+  # BRONZE — Ingestion brute (S3 Object Storage, JSON Lines)
+  # ============================================================
+
+  # --- Bronze Intérimaires (Phase 2) ---
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_pypersonne,PROD)"
+    name: "raw_pypersonne"
+    platform: "s3"
+    domain: "Intérimaires"
+    description: "Identité civile des personnes (nom, prénom, NIR, adresse, naissance)"
+    source_table: "PYPERSONNE"
+    owner: "Direction Opérations"
+    steward: "Data Team"
+    classification: "SENSIBLE"
+    rgpd_fields: ["PER_NIR", "PER_NOM", "PER_PRENOM", "PER_ADRESSE", "PER_DATENAIS"]
+    frequency: "Quotidien"
+    layer: "Bronze"
+    lineage_upstream: ["evolia.dbo.PYPERSONNE"]
+    lineage_downstream: ["slv_interimaires.dim_interimaires"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_pysalarie,PROD)"
+    name: "raw_pysalarie"
+    domain: "Intérimaires"
+    description: "Statut salarié (matricule, date entrée, actif)"
+    source_table: "PYSALARIE"
+    classification: "PERSONNEL"
+    frequency: "Quotidien"
+    layer: "Bronze"
+    lineage_upstream: ["evolia.dbo.PYSALARIE"]
+    lineage_downstream: ["slv_interimaires.dim_interimaires"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtpint,PROD)"
+    name: "raw_wtpint"
+    domain: "Intérimaires"
+    description: "Attributs spécifiques intérim (candidat, permanent, placement)"
+    source_table: "WTPINT"
+    classification: "PERSONNEL"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_pycoordonnee,PROD)"
+    name: "raw_pycoordonnee"
+    domain: "Intérimaires"
+    description: "Coordonnées : téléphones, emails"
+    source_table: "PYCOORDONNEE"
+    classification: "SENSIBLE"
+    rgpd_fields: ["COORD_EMAIL", "COORD_TEL"]
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtpmet,PROD)"
+    name: "raw_wtpmet"
+    domain: "Intérimaires"
+    description: "Métiers recherchés/maîtrisés par intérimaire"
+    source_table: "WTPMET"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtphab,PROD)"
+    name: "raw_wtphab"
+    domain: "Intérimaires"
+    description: "Habilitations (CACES, électriques...)"
+    source_table: "WTPHAB"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtpdip,PROD)"
+    name: "raw_wtpdip"
+    domain: "Intérimaires"
+    description: "Diplômes des intérimaires"
+    source_table: "WTPDIP"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtexp,PROD)"
+    name: "raw_wtexp"
+    domain: "Intérimaires"
+    description: "Expériences professionnelles"
+    source_table: "WTEXP"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtpeval,PROD)"
+    name: "raw_wtpeval"
+    domain: "Intérimaires"
+    description: "Évaluations qualitatives intérimaires"
+    source_table: "WTPEVAL"
+    classification: "PERSONNEL"
+    rgpd_fields: ["EVAL_COMMENTAIRE"]
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  # --- Bronze Clients (Phase 1) ---
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wttieserv,PROD)"
+    name: "raw_wttieserv"
+    domain: "Clients"
+    description: "Site/établissement client (raison sociale, SIREN, SIRET, NAF, adresse)"
+    source_table: "WTTIESERV"
+    owner: "Direction Commerciale"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+    lineage_downstream: ["slv_clients.dim_clients", "slv_clients.sites_mission"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtclpt,PROD)"
+    name: "raw_wtclpt"
+    domain: "Clients"
+    description: "Fiche client (prospect/actif, CA potentiel, effectif)"
+    source_table: "WTCLPT"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wttieint,PROD)"
+    name: "raw_wttieint"
+    domain: "Clients"
+    description: "Contacts client (nom, prénom, email, fonction)"
+    source_table: "WTTIEINT"
+    classification: "PERSONNEL"
+    rgpd_fields: ["INT_NOM", "INT_PRENOM", "INT_EMAIL", "INT_TEL"]
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtcoef,PROD)"
+    name: "raw_wtcoef"
+    domain: "Clients"
+    description: "Coefficients de facturation par qualification"
+    source_table: "WTCOEF"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtencoursg,PROD)"
+    name: "raw_wtencoursg"
+    domain: "Clients"
+    description: "Encours et garanties de crédit par SIREN"
+    source_table: "WTENCOURSG"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtugcli,PROD)"
+    name: "raw_wtugcli"
+    domain: "Agences"
+    description: "Portefeuille clients par agence"
+    source_table: "WTUGCLI"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtugag,PROD)"
+    name: "raw_wtugag"
+    domain: "Agences"
+    description: "Rattachement agence → client (montant)"
+    source_table: "WTUGAG"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  # --- Bronze Missions / Phase 0 pilote ---
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtmiss,PROD)"
+    name: "raw_wtmiss"
+    domain: "Missions"
+    description: "Missions intérimaires = affectation (PER_ID + CNT_ID + TIE_ID + RGPCNT_ID)"
+    source_table: "WTMISS"
+    owner: "Direction Opérations"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+    lineage_downstream: ["slv_missions.missions"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtcnti,PROD)"
+    name: "raw_wtcnti"
+    domain: "Contrats"
+    description: "Contrat intérimaire (dates, taux horaires paye/facture, métier, poste)"
+    source_table: "WTCNTI"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtefac,PROD)"
+    name: "raw_wtefac"
+    domain: "Facturation"
+    description: "Entête facture intérim (agence, client, site, type, date, TVA)"
+    source_table: "WTEFAC"
+    owner: "Direction Financière"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+    lineage_downstream: ["slv_facturation.factures"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtprh,PROD)"
+    name: "raw_wtprh"
+    domain: "Temps"
+    description: "Relevé d'heures hebdomadaire (intérimaire + contrat + client + période)"
+    source_table: "WTPRH"
+    owner: "Direction Opérations"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-bronze.raw_wtrhdon,PROD)"
+    name: "raw_wtrhdon"
+    domain: "Temps"
+    description: "Lignes du relevé (rubrique : base paye, taux paye, base fact., taux fact.)"
+    source_table: "WTRHDON"
+    classification: "INTERNE"
+    frequency: "Quotidien"
+    layer: "Bronze"
+
+  # ============================================================
+  # SILVER — Nettoyé, typé, dédupliqué (S3 Parquet/Iceberg)
+  # ============================================================
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_interimaires.dim_interimaires,PROD)"
+    name: "dim_interimaires"
+    domain: "Intérimaires"
+    description: "SCD Type 2 — identité, statut, flags (candidat/permanent/actif). NIR pseudonymisé SHA256."
+    classification: "PERSONNEL"
+    rgpd_fields: ["nir_pseudo"]
+    rgpd_note: "NIR brut JAMAIS présent. Pseudonymisation SHA256(nir+salt)[:16]."
+    layer: "Silver"
+    scd_type: 2
+    tracked_columns: ["nom", "prenom", "adresse", "ville", "code_postal", "is_actif", "is_candidat", "is_permanent"]
+    lineage_upstream: ["gi-poc-bronze.raw_pypersonne", "gi-poc-bronze.raw_pysalarie", "gi-poc-bronze.raw_wtpint"]
+    lineage_downstream: ["gld_shared.dim_interimaires", "gld_staffing.fact_activite_int"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_interimaires.competences,PROD)"
+    name: "competences"
+    domain: "Intérimaires"
+    description: "Union normalisée : métiers + habilitations + diplômes + expériences"
+    classification: "INTERNE"
+    layer: "Silver"
+    lineage_upstream: ["gi-poc-bronze.raw_wtpmet", "gi-poc-bronze.raw_wtphab", "gi-poc-bronze.raw_wtpdip", "gi-poc-bronze.raw_wtexp"]
+    lineage_downstream: ["gld_staffing.fact_competences_dispo"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_interimaires.evaluations,PROD)"
+    name: "evaluations"
+    domain: "Intérimaires"
+    description: "Évaluations qualitatives — RGPD Silver-only, jamais en Gold"
+    classification: "PERSONNEL"
+    rgpd_note: "Commentaires JAMAIS propagés en Gold"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_interimaires.coordonnees,PROD)"
+    name: "coordonnees"
+    domain: "Intérimaires"
+    description: "Emails et téléphones — RGPD Silver-only, jamais en Gold"
+    classification: "SENSIBLE"
+    rgpd_note: "Coordonnées JAMAIS propagées en Gold"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_clients.dim_clients,PROD)"
+    name: "dim_clients"
+    domain: "Clients"
+    description: "SCD Type 2 — raison sociale, SIREN, SIRET, NAF, secteur, effectif, adresse"
+    classification: "INTERNE"
+    layer: "Silver"
+    scd_type: 2
+    tracked_columns: ["raison_sociale", "siret", "naf_code", "adresse_complete", "statut_client", "ca_potentiel"]
+    lineage_upstream: ["gi-poc-bronze.raw_wttieserv", "gi-poc-bronze.raw_wtclpt"]
+    lineage_downstream: ["gld_shared.dim_clients", "gld_clients.vue_360_client"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_clients.sites_mission,PROD)"
+    name: "sites_mission"
+    domain: "Clients"
+    description: "Sites/établissements de mission avec adresse et rattachement"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_clients.contacts,PROD)"
+    name: "contacts"
+    domain: "Clients"
+    description: "Contacts client — RGPD Silver-only (email, téléphone)"
+    classification: "PERSONNEL"
+    rgpd_note: "Contacts JAMAIS propagés en Gold"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_clients.encours_credit,PROD)"
+    name: "encours_credit"
+    domain: "Clients"
+    description: "Encours de garantie, limites, décisions par SIREN/période"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_missions.missions,PROD)"
+    name: "missions"
+    domain: "Missions"
+    description: "Affectations intérimaires nettoyées et typées"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_missions.contrats,PROD)"
+    name: "contrats"
+    domain: "Missions"
+    description: "Contrats intérimaires typés (taux horaires, durée, poste)"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_missions.commandes,PROD)"
+    name: "commandes"
+    domain: "Missions"
+    description: "Commandes client (date, nb demandé, statut, agence)"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_facturation.factures,PROD)"
+    name: "factures"
+    domain: "Facturation"
+    description: "Entêtes facture typées (numéro, type F/A, montant, date, TVA)"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_temps.heures_detail,PROD)"
+    name: "heures_detail"
+    domain: "Temps"
+    description: "Détail rubriques heures (base paye/fact, taux paye/fact)"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_agences.dim_agences,PROD)"
+    name: "dim_agences_silver"
+    domain: "Agences"
+    description: "Dimension agences (nom, marque, branche, GPS)"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:s3,gi-poc-silver.slv_agences.hierarchie_territoriale,PROD)"
+    name: "hierarchie_territoriale"
+    domain: "Agences"
+    description: "Agence → Secteur → Périmètre → Zone Géo"
+    classification: "INTERNE"
+    layer: "Silver"
+
+  # ============================================================
+  # GOLD — Data Marts directionnels (PostgreSQL)
+  # ============================================================
+
+  # --- Dimensions conformes (gld_shared) ---
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_shared.dim_calendrier,PROD)"
+    name: "dim_calendrier"
+    domain: "Référentiels"
+    description: "Calendrier 2020–2027 avec jours ouvrés, fériés, semaine ISO"
+    classification: "PUBLIC"
+    layer: "Gold"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_shared.dim_agences,PROD)"
+    name: "dim_agences"
+    domain: "Agences"
+    description: "Dimension agences conforme (SCD1) avec hiérarchie territoriale"
+    classification: "INTERNE"
+    layer: "Gold"
+    lineage_upstream: ["slv_agences.dim_agences", "slv_agences.hierarchie_territoriale"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_shared.dim_clients,PROD)"
+    name: "dim_clients_gold"
+    domain: "Clients"
+    description: "Snapshot clients is_current=true — RGPD : adresse exclue"
+    classification: "INTERNE"
+    layer: "Gold"
+    rgpd_note: "Adresse complète non propagée en Gold, uniquement ville"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_shared.dim_interimaires,PROD)"
+    name: "dim_interimaires_gold"
+    domain: "Intérimaires"
+    description: "Snapshot intérimaires is_current=true — RGPD : NIR, date_naissance, adresse exclus"
+    classification: "INTERNE"
+    layer: "Gold"
+    rgpd_note: "NIR, date_naissance, adresse JAMAIS en Gold. Uniquement ville + code_postal."
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_shared.dim_metiers,PROD)"
+    name: "dim_metiers"
+    domain: "Référentiels"
+    description: "Référentiel métiers + qualifications"
+    classification: "PUBLIC"
+    layer: "Gold"
+
+  # --- Facts (gld_commercial, gld_staffing, gld_performance, gld_clients, gld_operationnel) ---
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_commercial.fact_ca_hebdo_agence,PROD)"
+    name: "fact_ca_hebdo_agence"
+    domain: "Facturation"
+    description: "CA hebdomadaire par agence (ca_ht, avoirs, ca_net, nb_factures)"
+    owner: "Direction Financière"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × semaine ISO"
+    consumers: ["Dashboard COMEX", "Superset CA Agences"]
+    lineage_upstream: ["slv_facturation.factures", "slv_missions.missions"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_commercial.fact_ca_mensuel_client,PROD)"
+    name: "fact_ca_mensuel_client"
+    domain: "Facturation"
+    description: "CA mensuel par client (ca_ht, nb_missions, heures, taux_moyen)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "client × mois"
+    validation: "Cross-check Pyramid BI < 0.5% delta"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_commercial.fact_ca_quotidien,PROD)"
+    name: "fact_ca_quotidien"
+    domain: "Facturation"
+    description: "CA quotidien grain fin (agence × client × jour)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × client × jour"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_commercial.fact_marge_mission,PROD)"
+    name: "fact_marge_mission"
+    domain: "Facturation"
+    description: "Marge brute par mission (CA - coût paye)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "mission"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_staffing.fact_activite_int,PROD)"
+    name: "fact_activite_int"
+    domain: "Intérimaires"
+    description: "Activité individuelle intérimaire par mois (heures, missions, taux occupation, CA)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "intérimaire × mois"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_staffing.fact_missions_detail,PROD)"
+    name: "fact_missions_detail"
+    domain: "Missions"
+    description: "Détail par mission (taux horaires, marge, heures, durée)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "mission"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_staffing.fact_staffing_agence,PROD)"
+    name: "fact_staffing_agence"
+    domain: "Intérimaires"
+    description: "Placement par agence × semaine (en mission, disponibles, taux)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × semaine"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_staffing.fact_turnover_int,PROD)"
+    name: "fact_turnover_int"
+    domain: "Intérimaires"
+    description: "Rotation intérimaires par agence × mois"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × mois"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_staffing.fact_competences_dispo,PROD)"
+    name: "fact_competences_dispo"
+    domain: "Intérimaires"
+    description: "Pool compétences disponibles (métier × agence, taux couverture)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "métier × agence"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_performance.scorecard_agence,PROD)"
+    name: "scorecard_agence"
+    domain: "Agences"
+    description: "Tableau de bord agence mensuel 360° (CA, marge, clients, placement, transformation)"
+    owner: "Direction Réseau"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × mois"
+    consumers: ["Dashboard COMEX", "Superset Performance Agences"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_performance.ranking_agences,PROD)"
+    name: "ranking_agences"
+    domain: "Agences"
+    description: "Classement multi-critères (CA 35%, marge 25%, placement 25%, transfo 15%)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × mois"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_performance.tendances_agence,PROD)"
+    name: "tendances_agence"
+    domain: "Agences"
+    description: "Variations M/M-1 et N/N-1 avec indicateur tendance (HAUSSE/BAISSE/STABLE)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × mois"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_clients.vue_360_client,PROD)"
+    name: "vue_360_client"
+    domain: "Clients"
+    description: "Vision 360° client dénormalisée (25 colonnes : CA, missions, risque, churn)"
+    owner: "Direction Commerciale"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "client"
+    consumers: ["Dashboard 360° Client", "Superset"]
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_clients.fact_retention_client,PROD)"
+    name: "fact_retention_client"
+    domain: "Clients"
+    description: "Suivi fidélisation trimestriel + churn score ML-ready (0→1)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "client × trimestre"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_clients.fact_rentabilite_client,PROD)"
+    name: "fact_rentabilite_client"
+    domain: "Clients"
+    description: "Rentabilité nette par client × année (CA - coût paye - coût gestion)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "client × année"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_operationnel.fact_heures_hebdo,PROD)"
+    name: "fact_heures_hebdo"
+    domain: "Temps"
+    description: "Heures consolidées par agence × client × semaine (normales, sup, nuit, dimanche)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × client × semaine"
+
+  - urn: "urn:li:dataset:(urn:li:dataPlatform:postgres,gld_operationnel.fact_commandes_pipeline,PROD)"
+    name: "fact_commandes_pipeline"
+    domain: "Missions"
+    description: "Pipeline commandes (ouvertes, pourvues, annulées, taux satisfaction, délai moyen)"
+    classification: "INTERNE"
+    layer: "Gold"
+    grain: "agence × semaine"
+
+# ============================================================
+# GLOSSAIRE MÉTIER
+# ============================================================
+glossary:
+  - term: "CA Net HT"
+    definition: "Chiffre d'affaires net hors taxes = factures (type F) - avoirs (type A)"
+    owner: "Direction Financière"
+
+  - term: "Taux de Placement"
+    definition: "Intérimaires en mission / total intérimaires disponibles par agence"
+    owner: "Direction Opérations"
+
+  - term: "Taux de Transformation"
+    definition: "Commandes pourvues / commandes totales reçues par agence"
+    owner: "Direction Opérations"
+
+  - term: "Taux de Marge"
+    definition: "(CA mission - coût paye) / CA mission"
+    owner: "Direction Financière"
+
+  - term: "Risque Churn"
+    definition: "Score 0→1 basé sur inactivité (30%), fréquence (25%), delta CA QoQ (25%), delta CA YoY (20%)"
+    owner: "Direction Commerciale"
+
+  - term: "NIR Pseudonymisé"
+    definition: "SHA256(NIR + RGPD_SALT)[:16] — NIR brut jamais stocké hors Bronze"
+    owner: "CDO / Data Team"
+    classification: "RGPD"
+
+  - term: "SCD Type 2"
+    definition: "Slowly Changing Dimension — historisation par valid_from/valid_to/is_current"
+    owner: "Data Team"
+
+  - term: "Score Global Agence"
+    definition: "Composite pondéré : CA (35%) + Marge (25%) + Placement (25%) + Transformation (15%)"
+    owner: "Direction Réseau"

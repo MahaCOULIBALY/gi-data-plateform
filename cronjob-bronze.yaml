@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gi-bronze-ingestion
+  namespace: data-pipeline
+spec:
+  schedule: "0 5 * * *"   # 05h00 UTC = 06h00 Paris
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: bronze-ingestion
+            image: python:3.12-slim
+            command: ["sh", "-c",
+              "pip install -q boto3 pyodbc && python /scripts/bronze_evolia.py"]
+            envFrom:
+            - secretRef:
+                name: gi-data-secrets
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+          volumes:
+          - name: script
+            configMap:
+              name: bronze-script
+          restartPolicy: OnFailure

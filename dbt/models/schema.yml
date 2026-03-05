@@ -1,0 +1,96 @@
+version: 2
+
+models:
+  # --- gld_commercial ---
+  - name: fact_ca_hebdo_agence
+    description: "CA hebdomadaire par agence (factures - avoirs)"
+    columns:
+      - name: agence_id
+        tests: [not_null]
+      - name: semaine_iso
+        tests: [not_null]
+      - name: ca_net_ht
+        tests:
+          - not_null
+
+  - name: fact_ca_quotidien
+    description: "CA quotidien grain fin (agence × client × jour)"
+    columns:
+      - name: agence_id
+        tests: [not_null]
+      - name: jour
+        tests: [not_null]
+
+  - name: fact_marge_mission
+    description: "Marge brute par mission (CA - coût paye)"
+    columns:
+      - name: mission_sk
+        tests: [not_null, unique]
+      - name: taux_marge
+        tests:
+          - accepted_values:
+              values: [-1, -0.5, 0, 0.5, 1]
+              quote: false
+              # Custom: entre -50% et 100%
+
+  - name: fact_heures_hebdo
+    description: "Heures consolidées par agence × client × semaine"
+    columns:
+      - name: heures_totales
+        tests:
+          - not_null
+
+  - name: fact_commandes_pipeline
+    description: "Pipeline commandes par agence × semaine"
+    columns:
+      - name: nb_commandes
+        tests:
+          - not_null
+
+  # --- gld_performance ---
+  - name: scorecard_agence
+    description: "Tableau de bord agence mensuel — vision 360°"
+    columns:
+      - name: agence_id
+        tests: [not_null]
+      - name: mois
+        tests: [not_null]
+
+  - name: ranking_agences
+    description: "Classement multi-critères (CA 35%, marge 25%, placement 25%, transfo 15%)"
+    columns:
+      - name: score_global
+        tests:
+          - not_null
+
+  - name: tendances_agence
+    description: "Variations M/M-1 et N/N-1 avec indicateur tendance"
+    columns:
+      - name: tendance
+        tests:
+          - accepted_values:
+              values: ['HAUSSE', 'BAISSE', 'STABLE']
+
+  # --- gld_staffing ---
+  - name: fact_staffing_agence
+    description: "Indicateurs placement par agence × semaine"
+    columns:
+      - name: taux_placement
+        description: "Ratio intérimaires en mission / total"
+
+  - name: fact_turnover_int
+    description: "Rotation intérimaires par agence × mois"
+    columns:
+      - name: taux_turnover
+        description: "Sorties / effectif moyen"
+
+  # --- gld_clients ---
+  - name: fact_retention_client
+    description: "Suivi fidélisation trimestriel avec churn score ML-ready"
+    columns:
+      - name: risque_churn
+        tests:
+          - accepted_values:
+              values: ['LOW', 'MEDIUM', 'HIGH', 'PERDU']
+      - name: churn_score_ml
+        description: "Score 0.0 (fidèle) → 1.0 (perdu)"

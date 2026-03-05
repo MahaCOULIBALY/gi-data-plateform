@@ -1,0 +1,81 @@
+version: 2
+
+sources:
+  - name: slv_facturation
+    schema: slv_facturation
+    description: "Silver facturation — factures nettoyées et typées"
+    tables:
+      - name: factures
+        description: "Entêtes facture intérim (WTEFAC)"
+        columns:
+          - name: EFAC_NUM
+            tests: [not_null, unique]
+      - name: lignes_factures
+        description: "Lignes de facture détaillées (WTLFAC)"
+      - name: factures_compta
+        description: "Factures comptabilité (CMFACTURES)"
+
+  - name: slv_missions
+    schema: slv_missions
+    description: "Silver missions — contrats et placements"
+    tables:
+      - name: missions
+        description: "Missions intérimaires (WTMISS)"
+      - name: contrats
+        description: "Contrats intérimaires (WTCNTI)"
+      - name: commandes
+        description: "Commandes client (WTCMD)"
+      - name: placements
+        description: "Placements / offres (WTPLAC)"
+
+  - name: slv_temps
+    schema: slv_temps
+    description: "Silver temps — relevés d'heures"
+    tables:
+      - name: releves_heures
+        description: "Relevés hebdo (WTPRH)"
+      - name: heures_detail
+        description: "Détail rubriques heures (WTRHDON)"
+
+  - name: slv_clients
+    schema: slv_clients
+    description: "Silver clients — dimensions SCD2"
+    tables:
+      - name: dim_clients
+        description: "Dimension clients SCD Type 2"
+        columns:
+          - name: client_sk
+            tests: [not_null]
+      - name: encours_credit
+        description: "Encours et garanties crédit"
+
+  - name: slv_interimaires
+    schema: slv_interimaires
+    description: "Silver intérimaires — dimensions et compétences"
+    tables:
+      - name: dim_interimaires
+        description: "Dimension intérimaires SCD Type 2"
+        columns:
+          - name: interimaire_sk
+            tests: [not_null]
+      - name: competences
+        description: "Compétences normalisées (union métiers/habilitations/diplômes/exp)"
+
+  - name: slv_agences
+    schema: slv_agences
+    description: "Silver agences — hiérarchie territoriale"
+    tables:
+      - name: dim_agences
+        description: "Dimension agences"
+      - name: hierarchie_territoriale
+        description: "Agence → Secteur → Périmètre → Zone Géo"
+
+  - name: gld_shared
+    schema: gld_shared
+    description: "Dimensions conformes partagées (Gold)"
+    tables:
+      - name: dim_calendrier
+      - name: dim_agences
+      - name: dim_clients
+      - name: dim_interimaires
+      - name: dim_metiers

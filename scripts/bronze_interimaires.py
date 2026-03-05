@@ -1,0 +1,179 @@
+"""bronze_interimaires.py — Bronze · 10 tables intérimaires Evolia → S3.
+Phase 0 · GI Data Lakehouse · Manifeste v2.0
+# CORRECTIONS DDL (probe 2026-03-05) :
+#   PYPERSONNE  : PER_DATENAIS→PER_NAISSANCE, PER_NATIONALITE→NAT_CODE,
+#                 PER_PAYS→PAYS_CODE, PER_ADRESSE/COMPL/LIEUNAIS absent.
+#                 PER_DATEMODIF absent → FULL-LOAD
+#   PYSALARIE   : SAL_DATEDEBUT→SAL_DATEENTREE, SAL_DATEMODIF absent → FULL-LOAD
+#   WTPINT      : PINT_PLACEMENT/RGPCNT_ID absent, PINT_DATEMODIF absent → FULL-LOAD
+#   PYCOORDONNEE: TYPTEL→TYPTEL_CODE, COORD_VALEUR→PER_TEL_NTEL,
+#                 COORD_DATEMODIF absent → FULL-LOAD
+#   WTPMET      : ORDRE→PMET_ORDRE, PMET_DATEMODIF absent → FULL-LOAD
+#   WTPHAB      : PHAB_DATEDEB→PHAB_DELIVR, PHAB_DATEFIN→PHAB_EXPIR,
+#                 PHAB_DATEMODIF absent → FULL-LOAD
+#   WTPDIP      : PDIP_ANNEE→PDIP_DATE, PDIP_DATEMODIF absent → FULL-LOAD
+#   WTEXP       : ORDRE→EXP_ORDRE, EXP_SOCIETE→EXP_NOM,
+#                 EXP_DATEDEB→EXP_DEBUT, EXP_DATEFIN→EXP_FIN,
+#                 EXP_DATEMODIF absent → FULL-LOAD
+#   WTPEVAL     : PEVAL_DATE→PEVAL_DU (delta), PEVAL_NOTE→PEVAL_EVALUATION,
+#                 PEVAL_AGENT→PEVAL_UTL, PEVAL_COMMENTAIRE/RGPCNT_ID absent
+#   WTUGPINT    : UGPINT_DATEMODIF → delta (non modifié)
+"""
+import json
+import time
+from datetime import datetime, timezone
+
+import pyodbc
+
+from shared import (
+    Config, Stats, TableConfig, RunMode,
+    generate_batch_id, today_s3_prefix,
+    get_evolia_connection, get_pg_connection, upload_to_s3, logger,
+)
+from pipeline_utils import WatermarkStore, with_retry
+
+PIPELINE = "bronze_interimaires"
+FALLBACK_SINCE = datetime(2023, 1, 1, tzinfo=timezone.utc)
+
+# Seules 2 tables ont une colonne delta confirmée DDL
+TABLES_DELTA: list[TableConfig] = [
+    TableConfig("WTPEVAL", "PEVAL_DU", ["PER_ID", "PEVAL_DU"]),
+    TableConfig("WTUGPINT", "UGPINT_DATEMODIF", ["PER_ID", "RGPCNT_ID"]),
+]
+
+# Toutes les autres : aucune colonne delta en DDL → full-load
+TABLES_FULL: list[TableConfig] = [
+    TableConfig("PYPERSONNE", "", ["PER_ID"], rgpd_flag="SENSIBLE"),
+    TableConfig("PYSALARIE", "", ["PER_ID"], rgpd_flag="PERSONNEL"),
+    TableConfig("WTPINT", "", ["PER_ID"], rgpd_flag="PERSONNEL"),
+    TableConfig("PYCOORDONNEE", "", [
+                "PER_ID", "TYPTEL_CODE"], rgpd_flag="SENSIBLE"),
+    TableConfig("WTPMET", "", ["PER_ID", "PMET_ORDRE"]),
+    TableConfig("WTPHAB", "", ["PER_ID", "THAB_ID"]),
+    TableConfig("WTPDIP", "", ["PER_ID", "TDIP_ID"]),
+    TableConfig("WTEXP", "", ["PER_ID", "EXP_ORDRE"]),
+]
+
+# Noms DDL confirmés par probe 2026-03-05. NIR/PER_TEL_NTEL conservés Bronze,
+# pseudonymisés au Silver.
+_COLS: dict[str, str] = {
+    "PYPERSONNE": (
+        "PER_ID,PER_NOM,PER_PRENOM,PER_NAISSANCE,PER_NIR,"
+        "NAT_CODE,PAYS_CODE,PER_BISVOIE,PER_COMPVOIE,PER_CP,PER_VILLE,PER_COMMUNE"
+    ),
+    "PYSALARIE": "PER_ID,SAL_MATRICULE,SAL_DATEENTREE,SAL_ACTIF",
+    "WTPINT": "PER_ID,PINT_CANDIDAT,PINT_DOSSIER,PINT_PERMANENT",
+    # TYPTEL_CODE remplace TYPTEL, PER_TEL_NTEL remplace COORD_VALEUR
+    "PYCOORDONNEE": "PER_ID,TYPTEL_CODE,PER_TEL_NTEL,PER_TEL_POSTE",
+    "WTPMET": "PER_ID,PMET_ORDRE,MET_ID",
+    "WTPHAB": "PER_ID,THAB_ID,PHAB_DELIVR,PHAB_EXPIR,PHAB_ORDRE",
+    "WTPDIP": "PER_ID,TDIP_ID,PDIP_DATE",
+    # EXP_SOCIETE→EXP_NOM, EXP_DATEDEB→EXP_DEBUT, EXP_DATEFIN→EXP_FIN, ORDRE→EXP_ORDRE
+    "WTEXP": "PER_ID,EXP_ORDRE,EXP_NOM,EXP_DEBUT,EXP_FIN,EXP_INTERNE",
+    # PEVAL_DATE→PEVAL_DU, PEVAL_NOTE→PEVAL_EVALUATION, PEVAL_AGENT→PEVAL_UTL
+    "WTPEVAL": "PER_ID,PEVAL_DU,PEVAL_EVALUATION,PEVAL_UTL",
+    "WTUGPINT": "PER_ID,RGPCNT_ID,AUG_ORI,UGPINT_DATEMODIF",
+}
+
+_RGPD_SENSITIVE: frozenset[str] = frozenset({"PER_NIR", "PER_TEL_NTEL"})
+
+
+def _extract_delta(conn: pyodbc.Connection, tc: TableConfig, since: datetime) -> list[dict]:
+    since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_COLS[tc.name]} FROM {tc.name} WHERE {tc.delta_col} >= ?", since_str)
+        h = [d[0] for d in cur.description]
+        return [dict(zip(h, row)) for row in cur.fetchall()]
+
+
+def _extract_full(conn: pyodbc.Connection, tc: TableConfig) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT {_COLS[tc.name]} FROM {tc.name}")
+        h = [d[0] for d in cur.description]
+        return [dict(zip(h, row)) for row in cur.fetchall()]
+
+
+@with_retry(max_attempts=3, base_delay=2.0, backoff=2.0)
+def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
+            batch_id: str, since: datetime | None, stats: Stats) -> None:
+    t0 = time.monotonic()
+    rows = _extract_delta(
+        conn, tc, since) if since else _extract_full(conn, tc)
+    if not rows:
+        logger.info(json.dumps(
+            {"table": tc.name, "rows": 0, "status": "empty"}))
+        return
+    detected = [c for c in rows[0] if c in _RGPD_SENSITIVE]
+    if detected:
+        logger.warning(json.dumps({
+            "rgpd_alert": True, "table": tc.name, "columns": detected,
+            "action": "pseudonymize_at_silver",
+        }))
+        stats.extra.setdefault("rgpd_columns", []).extend(
+            [f"{tc.name}.{c}" for c in detected])
+    enriched = [
+        {"_loaded_at": datetime.now(timezone.utc).isoformat(),
+         "_batch_id": batch_id, "_source_table": tc.name,
+         "_rgpd_flag": tc.rgpd_flag, **r}
+        for r in rows
+    ]
+    key = f"raw_{tc.name.lower()}/{today_s3_prefix()}/batch_{batch_id}.json"
+    upload_to_s3(cfg, enriched, cfg.bucket_bronze, key, stats)
+    stats.tables_processed += 1
+    stats.rows_ingested += len(rows)
+    logger.info(json.dumps({
+        "table": tc.name, "rows": len(rows), "mode": "full" if not since else "delta",
+        "rgpd": tc.rgpd_flag, "duration_s": round(time.monotonic() - t0, 2),
+    }))
+
+
+def run(cfg: Config) -> dict:
+    stats = Stats()
+    batch_id = generate_batch_id()
+    if cfg.mode == RunMode.OFFLINE:
+        for tc in TABLES_DELTA + TABLES_FULL:
+            logger.info(json.dumps({"mode": "offline", "table": tc.name}))
+        return stats.finish()
+
+    with get_pg_connection(cfg) as pg_conn:
+        wm = WatermarkStore(pg_conn, PIPELINE)
+        with get_evolia_connection(cfg) as conn:
+            for tc in TABLES_DELTA:
+                since = wm.get(tc.name) or FALLBACK_SINCE
+                if cfg.mode == RunMode.PROBE:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {tc.name} WHERE {tc.delta_col} >= ?",
+                            since.strftime("%Y-%m-%d %H:%M:%S"))
+                        logger.info(json.dumps({
+                            "mode": "probe", "table": tc.name,
+                            "count": cur.fetchone()[0]}))
+                    stats.tables_processed += 1
+                    continue
+                try:
+                    _ingest(cfg, conn, tc, batch_id, since, stats)
+                    wm.set(tc.name, datetime.now(timezone.utc), stats)
+                except Exception as e:
+                    logger.exception(json.dumps(
+                        {"table": tc.name, "error": str(e)}))
+                    wm.mark_failed(tc.name, str(e))
+                    stats.errors.append({"table": tc.name, "error": str(e)})
+
+            if cfg.mode != RunMode.PROBE:
+                for tc in TABLES_FULL:
+                    try:
+                        _ingest(cfg, conn, tc, batch_id, None, stats)
+                        wm.set(tc.name, datetime.now(timezone.utc), stats)
+                    except Exception as e:
+                        logger.exception(json.dumps(
+                            {"table": tc.name, "error": str(e)}))
+                        wm.mark_failed(tc.name, str(e))
+                        stats.errors.append(
+                            {"table": tc.name, "error": str(e)})
+
+    return stats.finish()
+
+
+if __name__ == "__main__":
+    run(Config())

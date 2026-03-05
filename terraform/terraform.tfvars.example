@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# terraform.tfvars.example — Template de configuration Terraform
+# GI Data Lakehouse · OVHcloud GRA · Phase 0 POC
+#
+# USAGE :
+#   cp terraform.tfvars.example terraform.tfvars
+#   # Remplir les valeurs ci-dessous
+#   # terraform.tfvars est dans .gitignore — JAMAIS commité
+#
+# SECRETS : ne pas mettre les vraies valeurs dans ce fichier.
+#   → Utiliser .env.local ou un gestionnaire de secrets (Vault, OVH Secret Manager)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Projet OVHcloud ──────────────────────────────────────────────────────────
+ovh_endpoint           = "ovh-eu"
+ovh_application_key    = "CHANGE_ME"   # Généré sur https://eu.api.ovh.com/createToken/
+ovh_application_secret = "CHANGE_ME"
+ovh_consumer_key       = "CHANGE_ME"
+project_id             = "CHANGE_ME"   # ID projet Public Cloud OVH (ex: 4e73968ad7d44224...)
+
+# ─── Région & nommage ─────────────────────────────────────────────────────────
+region                 = "GRA"         # Gravelines — datacenter FR souverain
+environment            = "poc"         # poc | staging | prod
+project_name           = "gi-data"
+
+# ─── Object Storage S3 ────────────────────────────────────────────────────────
+# Buckets créés par Terraform — noms doivent être uniques globalement OVH
+bucket_bronze_name     = "gi-poc-bronze"
+bucket_silver_name     = "gi-poc-silver"
+bucket_gold_name       = "gi-poc-gold"
+
+# Lifecycle Bronze : archiver après N jours (réduction coût stockage)
+bronze_retention_days  = 90    # Déplacement vers Archive après 90j
+bronze_delete_days     = 1095  # Suppression après 3 ans (conformité RGPD)
+
+# ─── PostgreSQL managé (Gold Warehouse) ───────────────────────────────────────
+pg_plan                = "essential"   # essential | business | enterprise
+pg_version             = "16"
+pg_region              = "GRA"
+pg_db_name             = "gi_poc"
+pg_admin_user          = "gi_admin"
+# pg_admin_password    → NE PAS METTRE ICI → variable d'environnement TF_VAR_pg_admin_password
+# export TF_VAR_pg_admin_password="votre_password_fort"
+
+# ─── Kubernetes (services annexes) ────────────────────────────────────────────
+k8s_version            = "1.29"
+k8s_node_flavor        = "b2-7"        # 2 vCPU / 7 Go RAM
+k8s_node_count_poc     = 2             # POC : 2 nœuds suffisent
+k8s_node_count_prod    = 3             # Production recommandée
+
+# ─── Airflow managé (OVH Data Platform) ───────────────────────────────────────
+airflow_plan           = "small"       # small | medium | large
+airflow_dags_bucket    = "gi-poc-airflow-dags"   # Bucket S3 pour les DAGs
+
+# ─── Réseau ───────────────────────────────────────────────────────────────────
+# IP publique du serveur on-prem qui exécute les scripts Bronze
+# (whitelist pour accès PostgreSQL Gold depuis le réseau interne GI)
+allowed_ip_onprem      = "0.0.0.0/0"  # À remplacer par l'IP réelle GI Siège
+# Ex: "195.25.27.0/24"
+
+# ─── Tags ressources ──────────────────────────────────────────────────────────
+# Appliqués à toutes les ressources pour la visibilité FinOps
+tags = {
+  project     = "gi-data-lakehouse"
+  environment = "poc"
+  team        = "data-digital"
+  owner       = "m.coulibaly@groupe-interaction.fr"
+  cost_center = "DDI"
+}

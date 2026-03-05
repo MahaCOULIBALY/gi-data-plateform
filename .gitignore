@@ -1,0 +1,117 @@
+# ─── Secrets & credentials ────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+.env.k8s
+secrets/
+credentials/
+kubeconfig*.yaml          # Contient token K8s — JAMAIS commité
+terraform.tfvars          # Contient les vraies valeurs — utiliser .example
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+*.egg
+.installed.cfg
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+
+# ─── uv / virtualenv ──────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+# uv.lock est commité (reproductibilité des builds)
+
+# ─── DuckDB ───────────────────────────────────────────────────────────────────
+*.duckdb
+*.duckdb.wal
+
+# ─── dbt ──────────────────────────────────────────────────────────────────────
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+
+# ─── Great Expectations ───────────────────────────────────────────────────────
+gx/uncommitted/
+great_expectations/uncommitted/
+
+# ─── Airflow ──────────────────────────────────────────────────────────────────
+airflow.db
+airflow.cfg
+logs/
+airflow/logs/
+standalone_admin_password.txt
+
+# ─── Terraform ────────────────────────────────────────────────────────────────
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfstate.backup
+terraform/.terraform.lock.hcl
+# terraform.tfvars est exclu (secrets) — commiter terraform.tfvars.example
+
+# ─── IDEs & outils locaux ─────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+.dockerignore
+docker-compose.override.yml
+
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── Données locales / exports ────────────────────────────────────────────────
+data/
+*.csv
+*.parquet
+*.json.tmp
+*.jsonl
+probe_results/
+ddl_probe_result*.json    # Output probe local — pas de données ERP dans le repo
+
+# ─── Logs & rapports ──────────────────────────────────────────────────────────
+*.log
+reports/
+benchmark_costs*.csv
+
+# ─── Windows ──────────────────────────────────────────────────────────────────
+$RECYCLE.BIN/
+System Volume Information/
