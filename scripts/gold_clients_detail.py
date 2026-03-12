@@ -4,11 +4,16 @@ Sources Silver : slv_clients/dim_clients, sites_mission, encours_credit + gld_co
 Schemas Gold   : gld_clients
 Note : fact_rentabilite_client — reporté Phase 2 (nécessite fact_marge_mission non encore calculé)
 RGPD : contacts (email/tel) restent Silver-only — jamais en Gold
+# CORRECTIONS (2026-03-11) :
+#   Bug #1  : cfg.pg_* → cfg.ovh_pg_* (noms réels dans shared.Config)
+#   Perf #13: row-by-row cur.execute → psycopg2.extras.execute_batch (batch de 500)
+#   Perf    : connexion PG unique dans run() — réutilisée par _fetch_pg_ca et _write_pg
 """
 import json
 from datetime import datetime, timezone
 
 import psycopg2
+import psycopg2.extras
 
 from shared import Config, RunMode, Stats, get_duckdb_connection, logger
 
@@ -56,7 +61,8 @@ SQL = {
             FROM silver_ca GROUP BY tie_id
         ),
         sites AS (
-            SELECT tie_id, COUNT(*) AS nb_sites FROM silver_sites GROUP BY tie_id
+            -- is_active corrigé Silver (2026-03-11) : CLOT_DAT IS NULL → ne compter que sites actifs
+            SELECT tie_id, COUNT(*) AS nb_sites FROM silver_sites WHERE is_active = true GROUP BY tie_id
         ),
         enc AS (
             SELECT siren, montant_encours, limite_credit
@@ -114,7 +120,7 @@ UPSERT = {
         INSERT INTO gld_clients.vue_360_client
             (client_sk, siren, raison_sociale, naf_code, ville, nb_sites,
              ca_ytd, ca_n1, delta_ca_pct, encours_montant, encours_limite, risque_credit)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES %s
         ON CONFLICT (client_sk) DO UPDATE SET
             ca_ytd=EXCLUDED.ca_ytd, ca_n1=EXCLUDED.ca_n1,
             delta_ca_pct=EXCLUDED.delta_ca_pct, encours_montant=EXCLUDED.encours_montant,
@@ -124,13 +130,15 @@ UPSERT = {
     "fact_retention_client": """
         INSERT INTO gld_clients.fact_retention_client
             (client_sk, trimestre, ca, delta_ca, nb_missions, risque_churn)
-        VALUES (%s,%s,%s,%s,%s,%s)
+        VALUES %s
         ON CONFLICT (client_sk, trimestre) DO UPDATE SET
             ca=EXCLUDED.ca, delta_ca=EXCLUDED.delta_ca,
             nb_missions=EXCLUDED.nb_missions, risque_churn=EXCLUDED.risque_churn,
             _loaded_at=NOW()
     """,
 }
+
+_UPSERT_BATCH_SIZE = 500
 
 
 def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
@@ -154,65 +162,70 @@ def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
         )
 
 
-def _fetch_pg_ca(cfg: Config) -> list[tuple]:
+def _fetch_pg_ca(pg_conn: "psycopg2.connection") -> list[tuple]:
     """Charge fact_ca_mensuel_client depuis PostgreSQL → list[tuple] pour injection DuckDB."""
-    if cfg.mode == RunMode.OFFLINE:
-        return []
-    with psycopg2.connect(
-        host=cfg.pg_host, port=cfg.pg_port, dbname=cfg.pg_db,
-        user=cfg.pg_user, password=cfg.pg_password, sslmode="require"
-    ) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT agence_principale::INT, tie_id::INT, mois::DATE,
-                       ca_net_ht::DECIMAL, nb_missions_facturees::INT
-                FROM gld_commercial.fact_ca_mensuel_client
-            """)
-            return cur.fetchall()
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            SELECT agence_principale::INT, tie_id::INT, mois::DATE,
+                   ca_net_ht::DECIMAL, nb_missions_facturees::INT
+            FROM gld_commercial.fact_ca_mensuel_client
+        """)
+        return cur.fetchall()
 
 
-def _write_pg(cfg: Config, name: str, rows: list, stats: Stats) -> None:
-    with psycopg2.connect(
-        host=cfg.pg_host, port=cfg.pg_port, dbname=cfg.pg_db,
-        user=cfg.pg_user, password=cfg.pg_password, sslmode="require"
-    ) as conn:
-        with conn.cursor() as cur:
-            cur.execute("CREATE SCHEMA IF NOT EXISTS gld_clients")
-            cur.execute(DDL[name])
-            for row in rows:
-                cur.execute(UPSERT[name], row)
-        conn.commit()
+def _write_pg(pg_conn: "psycopg2.connection", name: str, rows: list[tuple], stats: Stats) -> None:
+    """Écrit les lignes dans PostgreSQL via execute_values (batch upsert — évite N round-trips)."""
+    with pg_conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS gld_clients")
+        cur.execute(DDL[name])
+        psycopg2.extras.execute_values(
+            cur, UPSERT[name], rows, page_size=_UPSERT_BATCH_SIZE
+        )
+    pg_conn.commit()
     stats.tables_processed += 1
     stats.rows_ingested += len(rows)
 
 
 def run(cfg: Config) -> dict:
     stats = Stats()
-    pg_ca_rows = _fetch_pg_ca(cfg)
-    logger.info(json.dumps({"step": "fetch_pg_ca", "rows": len(pg_ca_rows)}))
-    with get_duckdb_connection(cfg) as ddb:
-        try:
-            _register_views(ddb, cfg, pg_ca_rows)
-        except Exception as e:
-            logger.exception(json.dumps(
-                {"step": "register_views", "error": str(e)}))
-            stats.errors.append({"step": "register_views", "error": str(e)})
-            return stats.finish()
 
+    if cfg.mode == RunMode.OFFLINE:
         for name in ("vue_360_client", "fact_retention_client"):
+            logger.info(json.dumps({"mode": "offline", "table": name}))
+            stats.tables_processed += 1
+        return stats.finish()
+
+    # Connexion PG unique — réutilisée par _fetch_pg_ca et _write_pg (évite 3 ouvertures TCP)
+    with psycopg2.connect(
+        host=cfg.ovh_pg_host, port=cfg.ovh_pg_port, dbname=cfg.ovh_pg_database,
+        user=cfg.ovh_pg_user, password=cfg.ovh_pg_password, sslmode="require"
+    ) as pg_conn:
+        pg_ca_rows = _fetch_pg_ca(pg_conn)
+        logger.info(json.dumps({"step": "fetch_pg_ca", "rows": len(pg_ca_rows)}))
+
+        with get_duckdb_connection(cfg) as ddb:
             try:
-                rows = ddb.execute(SQL[name]).fetchall()
-                if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                    logger.info(json.dumps(
-                        {"mode": cfg.mode.value, "table": name, "rows": len(rows)}))
-                    stats.tables_processed += 1
-                    continue
-                _write_pg(cfg, name, rows, stats)
-                logger.info(json.dumps(
-                    {"table": name, "rows": len(rows), "status": "ok"}))
+                _register_views(ddb, cfg, pg_ca_rows)
             except Exception as e:
-                logger.exception(json.dumps({"table": name, "error": str(e)}))
-                stats.errors.append({"table": name, "error": str(e)})
+                logger.exception(json.dumps(
+                    {"step": "register_views", "error": str(e)}))
+                stats.errors.append({"step": "register_views", "error": str(e)})
+                return stats.finish()
+
+            for name in ("vue_360_client", "fact_retention_client"):
+                try:
+                    rows = ddb.execute(SQL[name]).fetchall()
+                    if cfg.mode == RunMode.PROBE:
+                        logger.info(json.dumps(
+                            {"mode": cfg.mode.value, "table": name, "rows": len(rows)}))
+                        stats.tables_processed += 1
+                        continue
+                    _write_pg(pg_conn, name, rows, stats)
+                    logger.info(json.dumps(
+                        {"table": name, "rows": len(rows), "status": "ok"}))
+                except Exception as e:
+                    logger.exception(json.dumps({"table": name, "error": str(e)}))
+                    stats.errors.append({"table": name, "error": str(e)})
 
     return stats.finish()
 

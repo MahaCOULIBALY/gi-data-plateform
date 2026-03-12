@@ -7,6 +7,7 @@ import os
 import json
 import hashlib
 import logging
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -34,11 +35,40 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-8s | %(name)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s")
 logger = logging.getLogger("gi-data")
 
+# Taille max d'un objet S3 OVH avant EntityTooLarge — partagée par tous les scripts Bronze
+_CHUNK_SIZE = 100_000
+
+_RGPD_SALT_SENTINEL = "CHANGE_ME_32CHARS_MINIMUM!!!!!!!!"
+
 
 class RunMode(Enum):
     OFFLINE = "offline"  # Zéro connexion externe — CI/CD, mocks, tests unitaires
     PROBE = "probe"    # Connexions actives, comptages/scans, zéro écriture
     LIVE = "live"     # Pipeline complet — production
+
+
+def filter_tables(tables: list, cfg: "Config") -> list:
+    """Filtre _TABLES selon TABLE_FILTER env var.
+    TABLE_FILTER=WTMISS,WTCNTI → traite uniquement ces tables.
+    Vide ou absent → toutes les tables.
+
+    Appelée séparément pour TABLES_DELTA et TABLES_FULL dans chaque run() :
+    retourne [] silencieusement si aucune table de la liste courante n'est dans
+    TABLE_FILTER (la table peut être dans l'autre liste). La validation "table
+    inconnue" se fait via le log WARNING ci-dessous uniquement sur la dernière
+    liste (TABLES_FULL) — couvre les fautes de frappe sans faux positifs.
+    """
+    raw = os.environ.get("TABLE_FILTER", "").strip()
+    if not raw:
+        return tables
+    allowed = {t.strip().upper() for t in raw.split(",")}
+    filtered = [t for t in tables if t.name.upper() in allowed]
+    if not filtered and tables:
+        # Avertissement non-bloquant — la table peut figurer dans l'autre liste (DELTA/FULL)
+        logger.debug(json.dumps({"table_filter": raw,
+                                 "searched_in": [t.name for t in tables],
+                                 "found": 0}))
+    return filtered
 
 
 def get_run_mode() -> RunMode:
@@ -69,17 +99,18 @@ class Config:
     bucket_bronze: str = "gi-poc-bronze"
     bucket_silver: str = "gi-poc-silver"
     bucket_gold: str = "gi-poc-gold"
-    pg_host: str = field(default_factory=lambda: os.environ.get(
-        "PG_HOST", "gi-poc-warehouse.postgresql.ovh.net"))
-    pg_port: int = field(default_factory=lambda: int(
-        os.environ.get("PG_PORT", "5432")))
-    pg_db: str = field(
-        default_factory=lambda: os.environ.get("PG_DB", "gi_poc"))
-    pg_user: str = field(default_factory=lambda: os.environ.get("PG_USER", ""))
-    pg_password: str = field(
-        default_factory=lambda: os.environ.get("PG_PASSWORD", ""))
+    ovh_pg_host: str = field(default_factory=lambda: os.environ.get(
+        "OVH_PG_HOST", "postgresql-5b1201f9-of9dcfaf6.database.cloud.ovh.net"))
+    ovh_pg_port: int = field(default_factory=lambda: int(
+        os.environ.get("OVH_PG_PORT", "20184")))
+    ovh_pg_database: str = field(
+        default_factory=lambda: os.environ.get("OVH_PG_DATABASE", "gi_poc_ddi_gold"))
+    ovh_pg_user: str = field(
+        default_factory=lambda: os.environ.get("OVH_PG_USER", ""))
+    ovh_pg_password: str = field(
+        default_factory=lambda: os.environ.get("OVH_PG_PASSWORD", ""))
     rgpd_salt: str = field(default_factory=lambda: os.environ.get(
-        "RGPD_SALT", "CHANGE_ME_32CHARS_MINIMUM!!!!!!!!"))
+        "RGPD_SALT", _RGPD_SALT_SENTINEL))
     alert_email: str = field(default_factory=lambda: os.environ.get(
         "ALERT_EMAIL", "data-team@groupe-interaction.fr"))
     mode: RunMode = field(default_factory=get_run_mode)
@@ -91,6 +122,14 @@ class Config:
             datetime.now(timezone.utc).strftime("%Y/%m/%d"),
         )
     )
+
+    def __post_init__(self) -> None:
+        # Refus explicite du salt par défaut en production — RGPD non-négociable
+        if self.mode == RunMode.LIVE and self.rgpd_salt == _RGPD_SALT_SENTINEL:
+            raise ValueError(
+                "RGPD_SALT doit être défini en mode LIVE. "
+                "Configurez la variable d'environnement RGPD_SALT (min 32 chars)."
+            )
 
     @property
     def dry_run(self) -> bool:
@@ -125,12 +164,15 @@ class TableConfig:
     delta_col: str
     pk_cols: list[str]
     rgpd_flag: str = ""  # "" | "SENSIBLE" | "PERSONNEL"
+    # True → WHERE delta_col >= ? OR delta_col IS NULL (ex: contrats actifs sans date fin)
+    allow_null_delta: bool = False
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
 def generate_batch_id() -> str:
-    return hashlib.md5(datetime.now(timezone.utc).isoformat().encode()).hexdigest()[:8]
+    """UUID4 — pas de collision même en exécutions parallèles (K8s CronJobs)."""
+    return uuid.uuid4().hex[:8]
 
 
 def today_s3_prefix() -> str:
@@ -160,10 +202,10 @@ def hash_sk(*parts: Any) -> str:
 
 
 def pseudonymize_nir(nir: str | None, salt: str) -> str | None:
-    """SHA-256 + salt. Retourne None si NIR absent."""
+    """SHA-256 + salt — hash complet (256 bits) pour résistance collision RGPD."""
     if not nir:
         return None
-    return hashlib.sha256(f"{nir}{salt}".encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{nir}{salt}".encode()).hexdigest()
 
 
 # ── Connexions ───────────────────────────────────────────────────────────────────
@@ -189,19 +231,33 @@ def get_s3_client(cfg: Config):
 
 
 def get_pg_connection(cfg: Config):
-    return psycopg2.connect(host=cfg.pg_host, port=cfg.pg_port, dbname=cfg.pg_db,
-                            user=cfg.pg_user, password=cfg.pg_password, sslmode="require")
+    return psycopg2.connect(host=cfg.ovh_pg_host, port=cfg.ovh_pg_port, dbname=cfg.ovh_pg_database,
+                            user=cfg.ovh_pg_user, password=cfg.ovh_pg_password, sslmode="require")
 
 
 def get_duckdb_connection(cfg: Config) -> duckdb.DuckDBPyConnection:
-    """LOAD (pas INSTALL) — httpfs est pré-installé sur le K8s OVH."""
+    """LOAD (pas INSTALL) — httpfs est pré-installé sur le K8s OVH.
+    Credentials via CREATE SECRET (DuckDB ≥ 0.10) — évite les credentials en clair
+    dans les logs SET et gère les apostrophes défensivement.
+    """
     conn = duckdb.connect()
     conn.execute("LOAD httpfs;")
     endpoint = cfg.s3_endpoint.replace("https://", "").replace("http://", "")
-    conn.execute(f"SET s3_endpoint='{endpoint}';")
-    conn.execute(f"SET s3_access_key_id='{cfg.s3_access_key}';")
-    conn.execute(f"SET s3_secret_access_key='{cfg.s3_secret_key}';")
-    conn.execute("SET s3_url_style='path';")
+
+    # Échappement défensif — les clés S3 sont alphanumériques mais on ne présume pas
+    def _q(s: str) -> str:
+        return s.replace("'", "''")
+
+    conn.execute(f"""
+        CREATE OR REPLACE SECRET s3_gi (
+            TYPE S3,
+            KEY_ID '{_q(cfg.s3_access_key)}',
+            SECRET '{_q(cfg.s3_secret_key)}',
+            ENDPOINT '{_q(endpoint)}',
+            URL_STYLE 'path',
+            USE_SSL true
+        )
+    """)
     return conn
 
 
@@ -216,10 +272,9 @@ def upload_to_s3(cfg: Config, data: list[dict], bucket: str, key: str, stats: St
         logger.info(
             f"[PROBE] Would upload {len(data)} rows → s3://{bucket}/{key}")
         return
-    body = "\n".join(json.dumps(r, default=str) for r in data)
-    get_s3_client(cfg).put_object(
-        Bucket=bucket, Key=key, Body=body.encode("utf-8"))
-    stats.bytes_written += len(body.encode("utf-8"))
+    body_bytes = "\n".join(json.dumps(r, default=str) for r in data).encode("utf-8")
+    get_s3_client(cfg).put_object(Bucket=bucket, Key=key, Body=body_bytes)
+    stats.bytes_written += len(body_bytes)
 
 
 # Convention de nommage → type PG (évite le tout-TEXT, améliore perfs Superset)
@@ -246,6 +301,7 @@ def pg_bulk_insert(
     columns: list[str], rows: list[tuple], stats: Stats,
 ) -> None:
     """TRUNCATE + COPY via StringIO. DDL auto-typé par convention de nommage.
+    Transaction explicite avec rollback — la table n'est jamais laissée vide sur erreur COPY.
     Usage : tables volumineuses Gold, rechargement complet acceptable.
     """
     if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
@@ -253,18 +309,22 @@ def pg_bulk_insert(
             f"[{cfg.mode.value.upper()}] Would insert {len(rows)} rows → {schema}.{table}")
         return
     ddl_cols = ", ".join(f'"{c}" {_col_pg_type(c)}' for c in columns)
-    with conn.cursor() as cur:
-        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-        cur.execute(
-            f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({ddl_cols})')
-        cur.execute(f'TRUNCATE TABLE "{schema}"."{table}"')
-        buf = io.StringIO()
-        for row in rows:
-            buf.write("\t".join("\\N" if v is None else str(v)
-                      for v in row) + "\n")
-        buf.seek(0)
-        cur.copy_from(buf, f"{schema}.{table}", columns=columns, null="\\N")
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            cur.execute(
+                f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({ddl_cols})')
+            cur.execute(f'TRUNCATE TABLE "{schema}"."{table}"')
+            buf = io.StringIO()
+            for row in rows:
+                buf.write("\t".join("\\N" if v is None else str(v)
+                          for v in row) + "\n")
+            buf.seek(0)
+            cur.copy_from(buf, f"{schema}.{table}", columns=columns, null="\\N")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     stats.rows_ingested += len(rows)
 
 
@@ -287,8 +347,12 @@ def atomic_load_gold(
         psycopg2.sql.SQL(", ").join(
             [psycopg2.sql.Placeholder()] * len(columns)),
     )
-    with conn.cursor() as cur:
-        cur.execute(psycopg2.sql.SQL("TRUNCATE TABLE {}").format(fqn))
-        psycopg2.extras.execute_batch(cur, insert_sql, rows, page_size=500)
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(psycopg2.sql.SQL("TRUNCATE TABLE {}").format(fqn))
+            psycopg2.extras.execute_batch(cur, insert_sql, rows, page_size=500)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     stats.rows_ingested += len(rows)

@@ -8,12 +8,14 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 #            MISS_DATEDEBUT/MOTIF/PRH_BTS→NULL (absent bronze _COLS, WARN DDL)
 #   WTCMD  : CMD_DATE→CMD_DTE, CMD_NBSAL→CMD_NBSALS, CMD_STATUT→NULL (absent DDL)
 #   WTPLAC : PLAC_DATE→PLAC_DTEEDI, PLAC_STATUT→NULL (absent DDL visible)
+# CORRECTIONS DDL (2026-03-11) :
+#   WTCMD  : TIE_ID/MET_ID absents DDL → retirés (state card silver_required)
+#            +STAT_CODE, +STAT_TYPE ajoutés (bronze_missions v2 confirmés)
 """
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, filter_tables, logger
 
 DOMAIN = "missions"
 
@@ -86,15 +88,16 @@ _TABLES: list[_Table] = [
         bronze="wtcmd",
         silver=f"slv_{DOMAIN}/commandes",
         dedup_key="CMD_ID",
+        # TIE_ID/MET_ID absents DDL — retirés (bronze_missions v2 + state card 2026-03-11)
+        # STAT_CODE/STAT_TYPE ajoutés (bronze_missions v2 confirmés)
         sql="""
             SELECT
                 CAST(CMD_ID         AS INTEGER)     AS cmd_id,
                 CAST(RGPCNT_ID      AS INTEGER)     AS rgpcnt_id,
-                CAST(TIE_ID         AS INTEGER)     AS tie_id,
                 CAST(CMD_DTE        AS DATE)        AS cmd_date,
-                NULL::VARCHAR                       AS statut,
                 CAST(CMD_NBSALS     AS INTEGER)     AS nb_sal,
-                CAST(MET_ID         AS INTEGER)     AS met_id,
+                TRIM(COALESCE(STAT_CODE, ''))       AS stat_code,
+                TRIM(COALESCE(STAT_TYPE, ''))       AS stat_type,
                 _batch_id,
                 CAST(_loaded_at     AS TIMESTAMP)   AS _loaded_at
             FROM src
@@ -126,6 +129,35 @@ _TABLES: list[_Table] = [
             ) = 1
         """,
     ),
+    # PYCONTRAT (2026-03-11) — table maîtresse contrats paie
+    # Jointures Gold : PER_ID+CNT_ID ↔ WTMISS/WTCNTI/WTPRH · ETA_ID ↔ PYETABLISSEMENT
+    _Table(
+        name="PYCONTRAT",
+        bronze="pycontrat",
+        silver=f"slv_{DOMAIN}/contrats_paie",
+        dedup_key="PER_ID, CNT_ID",
+        sql="""
+            SELECT
+                CAST(PER_ID         AS INTEGER)     AS per_id,
+                CAST(CNT_ID         AS INTEGER)     AS cnt_id,
+                CAST(ETA_ID         AS INTEGER)     AS eta_id,
+                CAST(RGPCNT_ID      AS INTEGER)     AS rgpcnt_id,
+                CAST(CNT_DATEDEB    AS DATE)        AS date_debut,
+                CAST(CNT_DATEFIN    AS DATE)        AS date_fin,
+                CAST(CNT_FINPREVU   AS DATE)        AS date_fin_prevue,
+                TRIM(LOTPAYE_CODE)                  AS lot_paye_code,
+                TRIM(TYPCOT_CODE)                   AS typ_cotisation_code,
+                CAST(CNT_AVT_ORDRE  AS INTEGER)     AS avt_ordre,
+                CAST(CNT_INI_ORDRE  AS INTEGER)     AS ini_ordre,
+                _batch_id,
+                CAST(_loaded_at     AS TIMESTAMP)   AS _loaded_at
+            FROM src
+            WHERE PER_ID IS NOT NULL AND CNT_ID IS NOT NULL
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY PER_ID, CNT_ID ORDER BY _loaded_at DESC
+            ) = 1
+        """,
+    ),
 ]
 
 
@@ -136,20 +168,20 @@ def _process(ddb, cfg: Config, t: _Table, stats: Stats) -> None:
         ddb.execute(
             f"CREATE OR REPLACE VIEW src AS SELECT * FROM read_json_auto('{bronze_path}')")
         if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-            count = ddb.execute(
-                f"SELECT COUNT(*) FROM ({t.sql})").fetchone()[0]
+            row = ddb.execute(f"SELECT COUNT(*) FROM ({t.sql})").fetchone()
+            count = row[0] if row else 0
             logger.info(json.dumps(
                 {"mode": cfg.mode.value, "table": t.name, "rows": count}))
             stats.tables_processed += 1
             return
         ddb.execute(
-            f"COPY ({t.sql}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
-        count = ddb.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+            f"COPY ({t.sql}) TO '{silver_path}' "
+            f"(FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+        row = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()
+        count = row[0] if row else 0
         stats.tables_processed += 1
         stats.rows_ingested += count
-        logger.info(json.dumps(
-            {"table": t.name, "rows": count, "silver": silver_path}))
+        logger.info(json.dumps({"table": t.name, "rows": count}))
     except Exception as e:
         logger.exception(json.dumps({"table": t.name, "error": str(e)}))
         stats.errors.append({"table": t.name, "error": str(e)})
@@ -158,7 +190,7 @@ def _process(ddb, cfg: Config, t: _Table, stats: Stats) -> None:
 def run(cfg: Config) -> dict:
     stats = Stats()
     with get_duckdb_connection(cfg) as ddb:
-        for t in _TABLES:
+        for t in filter_tables(_TABLES, cfg):
             _process(ddb, cfg, t, stats)
     return stats.finish()
 

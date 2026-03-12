@@ -26,9 +26,10 @@ from datetime import datetime, timezone
 import pyodbc
 
 from shared import (
-    Config, Stats, TableConfig, RunMode,
+    Config, Stats, TableConfig, RunMode, _CHUNK_SIZE,
     generate_batch_id, today_s3_prefix,
     get_evolia_connection, get_pg_connection, upload_to_s3, logger,
+    filter_tables,
 )
 from pipeline_utils import WatermarkStore, with_retry
 
@@ -36,9 +37,9 @@ PIPELINE = "bronze_interimaires"
 FALLBACK_SINCE = datetime(2023, 1, 1, tzinfo=timezone.utc)
 
 # Seules 2 tables ont une colonne delta confirmée DDL
+# UGPINT_DATEMODIF absent DDL (probe 2026-03-10) → WTUGPINT déplacé en full-load
 TABLES_DELTA: list[TableConfig] = [
     TableConfig("WTPEVAL", "PEVAL_DU", ["PER_ID", "PEVAL_DU"]),
-    TableConfig("WTUGPINT", "UGPINT_DATEMODIF", ["PER_ID", "RGPCNT_ID"]),
 ]
 
 # Toutes les autres : aucune colonne delta en DDL → full-load
@@ -52,6 +53,8 @@ TABLES_FULL: list[TableConfig] = [
     TableConfig("WTPHAB", "", ["PER_ID", "THAB_ID"]),
     TableConfig("WTPDIP", "", ["PER_ID", "TDIP_ID"]),
     TableConfig("WTEXP", "", ["PER_ID", "EXP_ORDRE"]),
+    # UGPINT_DATEMODIF absent DDL
+    TableConfig("WTUGPINT", "", ["PER_ID", "RGPCNT_ID"]),
 ]
 
 # Noms DDL confirmés par probe 2026-03-05. NIR/PER_TEL_NTEL conservés Bronze,
@@ -72,7 +75,7 @@ _COLS: dict[str, str] = {
     "WTEXP": "PER_ID,EXP_ORDRE,EXP_NOM,EXP_DEBUT,EXP_FIN,EXP_INTERNE",
     # PEVAL_DATE→PEVAL_DU, PEVAL_NOTE→PEVAL_EVALUATION, PEVAL_AGENT→PEVAL_UTL
     "WTPEVAL": "PER_ID,PEVAL_DU,PEVAL_EVALUATION,PEVAL_UTL",
-    "WTUGPINT": "PER_ID,RGPCNT_ID,AUG_ORI,UGPINT_DATEMODIF",
+    "WTUGPINT": "PER_ID,RGPCNT_ID,AUG_ORI",  # UGPINT_DATEMODIF absent DDL
 }
 
 _RGPD_SENSITIVE: frozenset[str] = frozenset({"PER_NIR", "PER_TEL_NTEL"})
@@ -96,14 +99,13 @@ def _extract_full(conn: pyodbc.Connection, tc: TableConfig) -> list[dict]:
 
 @with_retry(max_attempts=3, base_delay=2.0, backoff=2.0)
 def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
-            batch_id: str, since: datetime | None, stats: Stats) -> None:
+            batch_id: str, since: datetime | None, stats: Stats) -> int:
+    """Extrait, enrichit et charge une table vers S3 Bronze. Retourne le nombre de lignes ingérées."""
     t0 = time.monotonic()
-    rows = _extract_delta(
-        conn, tc, since) if since else _extract_full(conn, tc)
+    rows = _extract_delta(conn, tc, since) if since else _extract_full(conn, tc)
     if not rows:
-        logger.info(json.dumps(
-            {"table": tc.name, "rows": 0, "status": "empty"}))
-        return
+        logger.info(json.dumps({"table": tc.name, "rows": 0, "status": "empty"}))
+        return 0
     detected = [c for c in rows[0] if c in _RGPD_SENSITIVE]
     if detected:
         logger.warning(json.dumps({
@@ -112,65 +114,76 @@ def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
         }))
         stats.extra.setdefault("rgpd_columns", []).extend(
             [f"{tc.name}.{c}" for c in detected])
+    loaded_at = datetime.now(timezone.utc).isoformat()
     enriched = [
-        {"_loaded_at": datetime.now(timezone.utc).isoformat(),
-         "_batch_id": batch_id, "_source_table": tc.name,
-         "_rgpd_flag": tc.rgpd_flag, **r}
+        {"_loaded_at": loaded_at, "_batch_id": batch_id,
+         "_source_table": tc.name, "_rgpd_flag": tc.rgpd_flag, **r}
         for r in rows
     ]
-    key = f"raw_{tc.name.lower()}/{today_s3_prefix()}/batch_{batch_id}.json"
-    upload_to_s3(cfg, enriched, cfg.bucket_bronze, key, stats)
+    # Chunking : 1 fichier S3 par tranche de _CHUNK_SIZE lignes (évite EntityTooLarge OVH)
+    chunks = [enriched[i:i + _CHUNK_SIZE] for i in range(0, len(enriched), _CHUNK_SIZE)]
+    prefix = f"raw_{tc.name.lower()}/{today_s3_prefix()}"
+    for idx, chunk in enumerate(chunks):
+        key = f"{prefix}/batch_{batch_id}_{idx:04d}.json"
+        upload_to_s3(cfg, chunk, cfg.bucket_bronze, key, stats)
     stats.tables_processed += 1
     stats.rows_ingested += len(rows)
     logger.info(json.dumps({
-        "table": tc.name, "rows": len(rows), "mode": "full" if not since else "delta",
+        "table": tc.name, "rows": len(rows), "chunks": len(chunks),
+        "mode": "full" if not since else "delta",
         "rgpd": tc.rgpd_flag, "duration_s": round(time.monotonic() - t0, 2),
     }))
+    return len(rows)
 
 
 def run(cfg: Config) -> dict:
     stats = Stats()
     batch_id = generate_batch_id()
     if cfg.mode == RunMode.OFFLINE:
-        for tc in TABLES_DELTA + TABLES_FULL:
+        for tc in filter_tables(TABLES_DELTA + TABLES_FULL, cfg):
             logger.info(json.dumps({"mode": "offline", "table": tc.name}))
         return stats.finish()
 
     with get_pg_connection(cfg) as pg_conn:
         wm = WatermarkStore(pg_conn, PIPELINE)
         with get_evolia_connection(cfg) as conn:
-            for tc in TABLES_DELTA:
+            for tc in filter_tables(TABLES_DELTA, cfg):
                 since = wm.get(tc.name) or FALLBACK_SINCE
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
                         cur.execute(
                             f"SELECT COUNT(*) FROM {tc.name} WHERE {tc.delta_col} >= ?",
                             since.strftime("%Y-%m-%d %H:%M:%S"))
+                        row = cur.fetchone()
                         logger.info(json.dumps({
                             "mode": "probe", "table": tc.name,
-                            "count": cur.fetchone()[0]}))
+                            "count": row[0] if row else 0}))
                     stats.tables_processed += 1
                     continue
                 try:
-                    _ingest(cfg, conn, tc, batch_id, since, stats)
-                    wm.set(tc.name, datetime.now(timezone.utc), stats)
+                    n = _ingest(cfg, conn, tc, batch_id, since, stats) or 0
+                    wm.set(tc.name, datetime.now(timezone.utc), n)
                 except Exception as e:
-                    logger.exception(json.dumps(
-                        {"table": tc.name, "error": str(e)}))
+                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
 
-            if cfg.mode != RunMode.PROBE:
-                for tc in TABLES_FULL:
-                    try:
-                        _ingest(cfg, conn, tc, batch_id, None, stats)
-                        wm.set(tc.name, datetime.now(timezone.utc), stats)
-                    except Exception as e:
-                        logger.exception(json.dumps(
-                            {"table": tc.name, "error": str(e)}))
-                        wm.mark_failed(tc.name, str(e))
-                        stats.errors.append(
-                            {"table": tc.name, "error": str(e)})
+            for tc in filter_tables(TABLES_FULL, cfg):
+                if cfg.mode == RunMode.PROBE:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT COUNT(*) FROM {tc.name}")
+                        row = cur.fetchone()
+                        logger.info(json.dumps({"mode": "probe", "table": tc.name,
+                                                "count": row[0] if row else 0, "load": "full"}))
+                    stats.tables_processed += 1
+                    continue
+                try:
+                    n = _ingest(cfg, conn, tc, batch_id, None, stats) or 0
+                    wm.set(tc.name, datetime.now(timezone.utc), n)
+                except Exception as e:
+                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                    wm.mark_failed(tc.name, str(e))
+                    stats.errors.append({"table": tc.name, "error": str(e)})
 
     return stats.finish()
 

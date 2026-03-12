@@ -1,12 +1,19 @@
-"""silver_agences_light.py — PYREGROUPCNT + Secteurs → dim_agences + hierarchie_territoriale.
+"""silver_agences_light.py — PYREGROUPECNT + Secteurs → dim_agences + hierarchie_territoriale.
 Phase 3 · GI Data Lakehouse · Manifeste v2.0
 # CORRECTIONS DDL (probe 2026-03-05) :
-#   Bronze écrit raw_pyregroupcnt (pas raw_agences) → chemin S3 corrigé
-#   UG_NOM absent DDL → RGPCNT_LIBELLE (from PYREGROUPCNT) utilisé comme nom agence
-#   UG_GPS_LAT/LNG absent → RGPCNT_GPS_LAT/LON (confirmés dans PYREGROUPCNT)
+#   Bronze écrit raw_pyregroupecnt (PYREGROUPECNT — E manquant corrigé)
+#   UG_NOM absent DDL → RGPCNT_LIBELLE (from PYREGROUPECNT) utilisé comme nom agence
+#   UG_GPS_LAT/LNG absent → RGPCNT_GPS_LAT/LON (confirmés dans PYREGROUPECNT)
 #   UG_CLOTURE → récupéré depuis raw_wtug (table ajoutée en bronze_agences v2)
 #                Si raw_wtug absent → UG_CLOTURE_DATE = NULL (graceful fallback)
 #   UG_MARQUE/BRANCHE → absent DDL, NULL en attendant table de référence externe
+# CORRECTIONS DDL (2026-03-11) :
+#   raw_pyregroupcnt → raw_pyregroupecnt (E manquant — aligné bronze_agences)
+#   RGPCNT_VILLE/EMAIL/GPS_LAT/GPS_LON absents DDL_EVOLIA_FILTERED → NULL (colonnes fantômes)
+#   DATE_CLOTURE ajouté PYREGROUPECNT Bronze → is_cloture/is_active depuis source de vérité
+#   TRY_CAST(UG_CLOTURE_DATE AS BOOLEAN) supprimé (cast incohérent, DATE_CLOTURE suffisant)
+#   c1/c2 initialisés à 0 avant try — UnboundLocalError éliminé
+#   COUNT post-COPY via read_parquet (évite double exécution de la transformation)
 """
 import json
 from shared import Config, RunMode, Stats, get_duckdb_connection, logger
@@ -19,18 +26,10 @@ def run(cfg: Config) -> dict:
     silver_hier = f"s3://{cfg.bucket_silver}/slv_agences/hierarchie_territoriale"
 
     with get_duckdb_connection(cfg) as ddb:
-        # dim_agences : source principale = PYREGROUPCNT (nom/adresse/GPS confirmés)
-        # Enrichissement optionnel WTUG (cloture). JOIN LEFT OUTER → pas de blocage si absent.
         q_agences = f"""
         WITH raw AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY RGPCNT_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{b}/raw_pyregroupcnt/**/*.json',
-                                union_by_name=true, hive_partitioning=false)
-        ),
-        raw_ug AS (
-            SELECT RGPCNT_ID, UG_CLOTURE_DATE, PIL_ID, UG_GPS,
-                   ROW_NUMBER() OVER (PARTITION BY RGPCNT_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{b}/raw_wtug/**/*.json',
+            FROM read_json_auto('{b}/raw_pyregroupecnt/**/*.json',
                                 union_by_name=true, hive_partitioning=false)
         )
         SELECT
@@ -40,15 +39,15 @@ def run(cfg: Config) -> dict:
             TRIM(r.RGPCNT_CODE)                                 AS code,
             NULL::VARCHAR                                       AS marque,
             NULL::VARCHAR                                       AS branche,
-            TRIM(COALESCE(r.RGPCNT_VILLE, ''))                  AS ville,
-            TRIM(COALESCE(r.RGPCNT_EMAIL, ''))                  AS email,
-            TRY_CAST(r.RGPCNT_GPS_LAT AS DOUBLE)               AS latitude,
-            TRY_CAST(r.RGPCNT_GPS_LON AS DOUBLE)               AS longitude,
-            COALESCE(TRY_CAST(u.UG_CLOTURE_DATE AS BOOLEAN), false) AS is_cloture,
-            NOT COALESCE(TRY_CAST(u.UG_CLOTURE_DATE AS BOOLEAN), false) AS is_active,
+            NULL::VARCHAR                                       AS ville,
+            NULL::VARCHAR                                       AS email,
+            NULL::DOUBLE                                        AS latitude,
+            NULL::DOUBLE                                        AS longitude,
+            r.DATE_CLOTURE IS NOT NULL                          AS is_cloture,
+            r.DATE_CLOTURE IS NULL                              AS is_active,
+            TRY_CAST(r.DATE_CLOTURE AS DATE)                    AS cloture_date,
             CURRENT_TIMESTAMP                                   AS _loaded_at
         FROM raw r
-        LEFT JOIN raw_ug u ON u.RGPCNT_ID::INT = r.RGPCNT_ID::INT AND u.rn = 1
         WHERE r.rn = 1 AND r.RGPCNT_ID IS NOT NULL
         """
 
@@ -67,12 +66,15 @@ def run(cfg: Config) -> dict:
         FROM raw WHERE rn = 1 AND ID_UG IS NOT NULL
         """
 
+        # Initialisés avant le try — élimine l'UnboundLocalError si l'exception
+        # se produit entre les deux assignations (ex: c1 OK, c2 échoue)
+        c1, c2 = 0, 0
         try:
             if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                c1 = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q_agences})").fetchone()[0]
-                c2 = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q_hier})").fetchone()[0]
+                row1 = ddb.execute(f"SELECT COUNT(*) FROM ({q_agences})").fetchone()
+                c1 = row1[0] if row1 else 0
+                row2 = ddb.execute(f"SELECT COUNT(*) FROM ({q_hier})").fetchone()
+                c2 = row2[0] if row2 else 0
                 logger.info(json.dumps({"mode": cfg.mode.value,
                                         "dim_agences": c1, "hierarchie": c2}))
             else:
@@ -80,15 +82,15 @@ def run(cfg: Config) -> dict:
                     f"COPY ({q_agences}) TO '{silver_dim}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
                 ddb.execute(
                     f"COPY ({q_hier}) TO '{silver_hier}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+                # COUNT via read_parquet — évite de ré-exécuter la transformation
                 c1 = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q_agences})").fetchone()[0]
+                    f"SELECT COUNT(*) FROM read_parquet('{silver_dim}/**/*.parquet')").fetchone()[0]
                 c2 = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q_hier})").fetchone()[0]
+                    f"SELECT COUNT(*) FROM read_parquet('{silver_hier}/**/*.parquet')").fetchone()[0]
                 logger.info(json.dumps({"dim_agences": c1, "hierarchie": c2}))
         except Exception as e:
-            # raw_wtug peut être absent si bronze_agences pas encore exécuté
             logger.warning(json.dumps(
-                {"warning": "raw_wtug may be missing", "error": str(e)}))
+                {"warning": "silver_agences error", "error": str(e)}))
             raise
 
     stats.tables_processed = 2

@@ -1,3 +1,5 @@
+# State Cards — GI Data Lakehouse
+
 {
   "state_card": {
     "version": "1.0",
@@ -548,6 +550,278 @@
       "rgpd_audit.py — scan regex patterns, pas de référence directe colonnes",
       "pipeline_utils.py — delta_col = noms DDL Bronze confirmés",
       "shared.py — non modifié (contrainte)"
+    ]
+  }
+}
+
+{
+  "state_card": {
+    "version": "3.0",
+    "phase_sortante": "Revue code 20 points + Corrections pipeline + Probe Bronze (Session 3)",
+    "phase_entrante": "LIVE Bronze + Silver Probe (Phase 1)",
+    "date": "2026-03-12",
+    "auteur": "Maha / CDO"
+  },
+
+  "revue_phase": {
+
+    "ce_qui_fonctionne": [
+      "Revue code 20 points livrée et intégrée : shared.py, pipeline_utils.py, 4×Bronze, Silver×4, Gold×2",
+      "shared.py : generate_batch_id() UUID4, pseudonymize_nir SHA-256 256 bits (sans troncature), DuckDB CREATE SECRET (credentials hors logs), upload_to_s3 body_bytes calculé une seule fois, pg_bulk_insert + atomic_load_gold avec rollback explicite",
+      "pipeline_utils.py : ParamSpec/TypeVar (with_retry préserve signature), _EPOCH_SENTINEL (mark_failed sans fausser next delta), _NON_RETRYABLE (erreurs config remontent immédiatement), wm.set() rows par table (élimine cumul bugué)",
+      "bronze_missions.py : _ingest() typé int, chunking 100K, allow_null_delta PYCONTRAT, wm.set(n) corrigé",
+      "bronze_agences.py + bronze_clients.py + bronze_interimaires.py : même niveau de corrections",
+      "silver_clients_detail.py : TQUA→TQUA_ID (bug fix), date_partition, COUNT via read_parquet",
+      "silver_interimaires_detail.py + silver_missions.py : date_partition, fetchone() safe",
+      "silver_agences_light.py : c1/c2=0 avant try (UnboundLocalError éliminé), COUNT via read_parquet",
+      "gold_clients_detail.py : cfg.pg_*→cfg.ovh_pg_* (AttributeError corrigé), execute_values batch 500, connexion PG unique",
+      "filter_tables() : and tables — liste vide retourne [] silencieusement (TABLES_DELTA=[] dans bronze_clients ne bloque plus)",
+      "Probe Bronze complet — 0 exception, 0 timeout sur 4 scripts :",
+      "  bronze_missions : WTMISS=216 WTCNTI=432 WTEFAC=117 WTPRH=992 PYCONTRAT=950217 WTCMD=589155 WTPLAC=13238 WTLFAC=26515214 WTFACINFO=6562449 OK",
+      "  bronze_interimaires : WTPEVAL=16 PYPERSONNE=519462 PYSALARIE=454040 WTPINT=516595 PYCOORDONNEE=1124674 WTPMET=1404129 WTPHAB=277440 WTPDIP=26503 WTEXP=417307 WTUGPINT=705145 OK",
+      "  bronze_clients : CMTIERS=123952 WTTIESERV=211134 WTCLPT=71921 WTTIEINT=182368 WTENCOURSG=81911 WTUGCLI=108561 (WTCOEF+WTUGAG retirés) OK",
+      "  bronze_agences : PYREGROUPECNT=296 PYENTREPRISE=108 PYETABLISSEMENT=400 WTUG=296 PYDOSPETA=295 OK",
+      "README.md professionnel créé : architecture, stack, S3 paths, watermarks, RGPD, FinOps, tests, dette technique, décisions"
+    ],
+
+    "ce_qui_ne_fonctionne_pas": [
+      "WTRHDON count=0 en delta (RHD_DATED = date métier, pas DATEMODIF) — reclassé full-load mais probe full non encore validé",
+      "filter_tables() raise encore si TABLE_FILTER cible une table FULL et que TABLES_DELTA est non-vide — correction v3.1 appliquée (debug log non-bloquant)",
+      "S3 Bronze vide — aucun run LIVE exécuté, Silver non testable",
+      "RGPD_SALT non validé en prod (guard-rail actif mais .env.local non vérifié)",
+      "DAG Airflow non mis à jour"
+    ],
+
+    "dette_technique_identifiee": [
+      {
+        "id": "DT-FILTER",
+        "criticite": "LOW",
+        "description": "filter_tables() appelée 2× par run() (DELTA/FULL) — validation TABLE_FILTER impossible de façon fiable dans la fonction. Correction v3.1 : debug log non-bloquant. Impact zéro en prod (TABLE_FILTER est un outil de debug).",
+        "action": "Accepté — documenter dans TESTING.md que TABLE_FILTER cible une table à la fois (DELTA ou FULL)"
+      },
+      {
+        "id": "DT-WTLFAC",
+        "criticite": "MEDIUM",
+        "description": "WTLFAC 26.5M lignes en full-load à chaque run = 265 chunks S3, ~800 MB/run. Coûteux en temps (~15 min VPN) et stockage S3.",
+        "action": "Phase 1 : investiguer LFAC_DATEMODIF ou stratégie incrément par FAC_NUM pour passer en delta"
+      },
+      {
+        "id": "DT-01",
+        "criticite": "HIGH",
+        "description": "WTPRH.PRH_DATEDEB/FIN et PYCONTRAT.CNT_DATEDEB/FIN — colonnes UNCERTAIN. silver_temps.py et silver_missions.py utilisent noms supposés.",
+        "action": "SELECT TOP 1 * FROM WTPRH; SELECT TOP 1 * FROM PYCONTRAT; avant premier run LIVE Silver"
+      },
+      {
+        "id": "DT-07",
+        "criticite": "LOW",
+        "description": "Coverage tests = 0%.",
+        "action": "3 tests OFFLINE minimum par script Bronze"
+      },
+      {
+        "id": "DT-08",
+        "criticite": "HIGH",
+        "description": "CTEs B-02 dupliquées dans 4 scripts Gold.",
+        "action": "gold_helpers.py Phase 1"
+      },
+      {
+        "id": "DT-09",
+        "criticite": "HIGH",
+        "description": "Jointure releves (per_id+cnt_id) peut produire doublons si plusieurs relevés par contrat.",
+        "action": "QUALIFY avant JOIN dans gold_staffing/scorecard avant premier run Gold LIVE"
+      }
+    ],
+
+    "decisions_prises": [
+      "WTRHDON reclassé full-load (probe count=0 sur RHD_DATED = date métier — pas de DATEMODIF en DDL)",
+      "WTCOEF + WTUGAG retirés bronze_clients (tables vides confirmées probe 2026-03-12)",
+      "filter_tables() : ValueError supprimée → debug log non-bloquant (outil debug, pas guard-rail prod)",
+      "Revue code 20 points intégrée : priorité bugs > performance > design",
+      "gold_clients_detail.py : cfg.ovh_pg_* corrigé, execute_values batch 500, connexion PG unique"
+    ]
+  },
+
+  "state_card_transition": {
+
+    "decisions_prises": [
+      "Probe Bronze 4 scripts validé : 0 exception, volumes cohérents avec base Evolia (~20 tables, ~34M lignes totales)",
+      "WTRHDON → full-load définitif (reclassé — pas de colonne delta disponible)",
+      "WTCOEF + WTUGAG exclus (tables vides — inutile d'alimenter S3 et watermarks)",
+      "Ordre LIVE Bronze : agences → interimaires → clients → missions (WTLFAC en dernier — 265 chunks)",
+      "Silver probe planifié immédiatement après Bronze LIVE table par table"
+    ],
+
+    "blockers": [
+      {
+        "id": "B-03",
+        "description": "S3 Bronze vide — aucun run Bronze LIVE exécuté",
+        "bloque": "Tout le pipeline Silver + Gold",
+        "resolution": "Run Bronze LIVE depuis laptop + VPN GI Siège (ordre : agences → interimaires → clients → missions)"
+      },
+      {
+        "id": "B-DT01",
+        "description": "Colonnes WTPRH.PRH_DATEDEB/FIN et PYCONTRAT.CNT_DATEDEB/FIN UNCERTAIN — silver_temps.py et silver_missions.py peuvent échouer au probe Silver",
+        "bloque": "silver_temps.py (probe), silver_missions.py (probe)",
+        "resolution": "SELECT TOP 1 * FROM WTPRH; SELECT TOP 1 * FROM PYCONTRAT; avant Silver probe"
+      }
+    ],
+
+    "next_actions": [
+      {
+        "ordre": 1,
+        "action": "Probe WTRHDON full-load : $env:TABLE_FILTER='WTRHDON'; $env:RUN_MODE='probe'; uv run .\\scripts\\bronze_missions.py — confirmer count > 0",
+        "responsable": "Data Engineer",
+        "effort": "5 min"
+      },
+      {
+        "ordre": 2,
+        "action": "Vérifier RGPD_SALT dans .env.local (min 32 chars) + connectivité S3 + PostgreSQL OVH",
+        "responsable": "Data Engineer",
+        "effort": "15 min"
+      },
+      {
+        "ordre": 3,
+        "action": "Run Bronze LIVE — bronze_agences.py (296 agences, rapide)",
+        "responsable": "Data Engineer (laptop + VPN)",
+        "effort": "5 min"
+      },
+      {
+        "ordre": 4,
+        "action": "Run Bronze LIVE — bronze_interimaires.py (~4.5M lignes, ~5-10 min)",
+        "responsable": "Data Engineer (laptop + VPN)",
+        "effort": "15 min"
+      },
+      {
+        "ordre": 5,
+        "action": "Run Bronze LIVE — bronze_clients.py (~780K lignes, ~3 min)",
+        "responsable": "Data Engineer (laptop + VPN)",
+        "effort": "10 min"
+      },
+      {
+        "ordre": 6,
+        "action": "Run Bronze LIVE — bronze_missions.py (~34M lignes dont WTLFAC 26.5M, ~20-30 min estimé)",
+        "responsable": "Data Engineer (laptop + VPN)",
+        "effort": "30 min"
+      },
+      {
+        "ordre": 7,
+        "action": "Vérifier S3 Bronze : aws s3 ls s3://gi-poc-bronze/ --endpoint-url $OVH_S3_ENDPOINT — confirmer partitions créées",
+        "responsable": "Data Engineer",
+        "effort": "2 min"
+      },
+      {
+        "ordre": 8,
+        "action": "Probe SELECT TOP 1 * FROM WTPRH; SELECT TOP 1 * FROM PYCONTRAT; — lever DT-01 avant Silver probe",
+        "responsable": "Data Engineer",
+        "effort": "15 min"
+      },
+      {
+        "ordre": 9,
+        "action": "Silver probe table par table (coller les logs ici pour analyse) : agences → interimaires → clients → missions → temps → factures",
+        "responsable": "Data Engineer",
+        "effort": "1h"
+      },
+      {
+        "ordre": 10,
+        "action": "Silver LIVE après probe validé (toutes tables, 0 erreur)",
+        "responsable": "Data Engineer",
+        "effort": "1h"
+      }
+    ],
+
+    "volumes_bronze_confirmes": {
+      "bronze_agences": {
+        "PYREGROUPECNT": 296,
+        "PYENTREPRISE": 108,
+        "PYETABLISSEMENT": 400,
+        "WTUG": 296,
+        "PYDOSPETA": 295
+      },
+      "bronze_clients": {
+        "CMTIERS": 123952,
+        "WTTIESERV": 211134,
+        "WTCLPT": 71921,
+        "WTTIEINT": 182368,
+        "WTENCOURSG": 81911,
+        "WTUGCLI": 108561,
+        "WTCOEF": "RETIRÉ (vide)",
+        "WTUGAG": "RETIRÉ (vide)"
+      },
+      "bronze_interimaires": {
+        "WTPEVAL": 16,
+        "PYPERSONNE": 519462,
+        "PYSALARIE": 454040,
+        "WTPINT": 516595,
+        "PYCOORDONNEE": 1124674,
+        "WTPMET": 1404129,
+        "WTPHAB": 277440,
+        "WTPDIP": 26503,
+        "WTEXP": 417307,
+        "WTUGPINT": 705145
+      },
+      "bronze_missions": {
+        "WTMISS": "216 (delta depuis 2023-01-01)",
+        "WTCNTI": "432 (delta depuis 2023-01-01)",
+        "WTEFAC": "117 (delta depuis 2023-01-01)",
+        "WTPRH": "992 (delta depuis 2023-01-01)",
+        "PYCONTRAT": "950217 (delta + IS NULL — contrats actifs inclus)",
+        "WTCMD": 589155,
+        "WTPLAC": 13238,
+        "WTLFAC": 26515214,
+        "WTFACINFO": 6562449,
+        "WTRHDON": "À confirmer (full-load — probe count=0 en delta RHD_DATED)"
+      }
+    },
+
+    "avertissements_live": [
+      "WTLFAC 26.5M lignes = 265 chunks × 100K — prévoir 20-30 min VPN. Lancer bronze_missions.py en dernier.",
+      "PYCONTRAT 950K lignes delta : premier run = 3 ans historique (FALLBACK_SINCE 2023-01-01). Watermark se stabilise ensuite.",
+      "PYPERSONNE 519K + PYCOORDONNEE 1.1M + WTPMET 1.4M : full-load à chaque run — surveiller temps d'exécution.",
+      "RGPD_SALT obligatoire en LIVE — Config.__post_init__ refuse le démarrage si absent ou sentinel."
+    ],
+
+    "contexte_minimal": {
+      "stack": {
+        "ingest": "pyodbc ODBC Driver 18 — TrustServerCertificate=yes, Encrypt=yes",
+        "transform": "DuckDB 1.1+ — CREATE SECRET S3, read_json_auto(), COPY TO Parquet ZSTD",
+        "warehouse": "PostgreSQL 16 OVHcloud Essential-4 GRA",
+        "orchestration": "Managed Airflow OVHcloud — DAG gi_poc_pipeline (à réécrire Phase 1)",
+        "s3": "OVHcloud Object Storage GRA — s3.gra.perf.cloud.ovh.net",
+        "packaging": "uv + hatchling — Python 3.12"
+      },
+      "chemins_s3": {
+        "bronze": "s3://gi-poc-bronze/raw_{table}/{YYYY/MM/DD}/batch_{id}_{chunk:04d}.json",
+        "silver": "s3://gi-poc-silver/slv_{domaine}/{table}/**/*.parquet",
+        "gold": "PostgreSQL — gld_commercial / gld_staffing / gld_performance / gld_clients / gld_operationnel / gld_shared",
+        "ops": "ops.pipeline_watermarks (PostgreSQL)"
+      },
+      "commandes_live": {
+        "bronze_agences": "$env:RUN_MODE='live'; uv run .\\scripts\\bronze_agences.py",
+        "bronze_interimaires": "$env:RUN_MODE='live'; uv run .\\scripts\\bronze_interimaires.py",
+        "bronze_clients": "$env:RUN_MODE='live'; uv run .\\scripts\\bronze_clients.py",
+        "bronze_missions": "$env:RUN_MODE='live'; uv run .\\scripts\\bronze_missions.py",
+        "silver_probe": "$env:RUN_MODE='probe'; uv run .\\scripts\\silver_agences_light.py",
+        "verifier_s3": "aws s3 ls s3://gi-poc-bronze/ --endpoint-url $env:OVH_S3_ENDPOINT",
+        "verifier_watermarks": "psql -c 'SELECT * FROM ops.pipeline_watermarks ORDER BY updated_at DESC LIMIT 20'"
+      }
+    },
+
+    "fichiers_modifies_v3": [
+      {
+        "fichier": "shared.py",
+        "changement": "filter_tables() : ValueError→debug log non-bloquant (support TABLE_FILTER sur tables FULL depuis script avec TABLES_DELTA non-vide)"
+      },
+      {
+        "fichier": "bronze_missions.py",
+        "changement": "WTRHDON reclassé TABLES_FULL (RHD_DATED = date métier, pas DATEMODIF)"
+      },
+      {
+        "fichier": "bronze_clients.py",
+        "changement": "WTCOEF + WTUGAG retirés TABLES_FULL (tables vides confirmées probe 2026-03-12)"
+      },
+      {
+        "fichier": "README.md",
+        "changement": "Créé — documentation complète projet (architecture, stack, S3, watermarks, RGPD, FinOps, dette technique)"
+      }
     ]
   }
 }

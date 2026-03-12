@@ -65,9 +65,20 @@ def build_dim_agences(ddb, cfg: Config) -> list[tuple]:
 
 def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
     silver = f"s3://{cfg.bucket_silver}"
+    # siret calculé depuis siren(9) + nic(5) — pas de colonne siret en Silver
+    # naf_libelle / effectif_tranche : absents Silver → NULL en attendant référentiel NAF Phase 2
     return ddb.execute(f"""
-        SELECT client_sk, tie_id, raison_sociale, siren, siret,
-               naf_code, naf_libelle, ville, code_postal, statut_client, effectif_tranche
+        SELECT
+            client_sk, tie_id, raison_sociale,
+            NULLIF(TRIM(siren), '')                                 AS siren,
+            nic,
+            CASE WHEN LENGTH(NULLIF(TRIM(siren), '')) = 9
+                      AND LENGTH(nic) = 5
+                 THEN TRIM(siren) || nic ELSE NULL END              AS siret,
+            naf_code,
+            NULL::VARCHAR                                           AS naf_libelle,
+            ville, code_postal, statut_client,
+            NULL::VARCHAR                                           AS effectif_tranche
         FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
         WHERE is_current = true
     """).fetchall()
@@ -120,7 +131,7 @@ DIMENSIONS = {
         "builder": "agences",
     },
     "dim_clients": {
-        "cols": ["client_sk", "tie_id", "raison_sociale", "siren", "siret",
+        "cols": ["client_sk", "tie_id", "raison_sociale", "siren", "nic", "siret",
                  "naf_code", "naf_libelle", "ville", "code_postal", "statut_client", "effectif_tranche"],
         "builder": "clients",
     },

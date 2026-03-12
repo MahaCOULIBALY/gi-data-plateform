@@ -5,6 +5,9 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 #   PYETABLISSEMENT : ETA_SIRET/ETA_DATEMODIF absent → FULL-LOAD, ETA_ADR2_COMP (extra)
 #   WTUG (ajouté)   : UG_CLOTURE→UG_CLOTURE_DATE, UG_PILOTE→PIL_ID, UG_GPS_LAT/LNG→UG_GPS,
 #                     UG_NOM/UG_DATEMODIF absent → FULL-LOAD. Nom agence via PYREGROUPCNT.
+# CORRECTIONS DDL (2026-03-11) — DDL_EVOLIA_FILTERED confirmé :
+#   PYREGROUPECNT   : +DATE_CLOTURE (source de vérité is_cloture agence)
+#                     RGPCNT_VILLE/EMAIL/GPS_LAT/GPS_LON ABSENTS DDL — colonnes fantômes supprimées Silver
 """
 import json
 import time
@@ -13,9 +16,10 @@ from datetime import datetime, timezone
 import pyodbc
 
 from shared import (
-    Config, Stats, TableConfig, RunMode,
+    Config, Stats, TableConfig, RunMode, _CHUNK_SIZE,
     generate_batch_id, today_s3_prefix,
     get_evolia_connection, get_pg_connection, upload_to_s3, logger,
+    filter_tables,
 )
 from pipeline_utils import WatermarkStore, with_retry
 
@@ -23,36 +27,30 @@ PIPELINE = "bronze_agences"
 FALLBACK_SINCE = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
 TABLES_DELTA: list[TableConfig] = [
-    TableConfig("PYREGROUPCNT", "RGPCNT_DATEMODIF", ["RGPCNT_ID"]),
-    TableConfig("PYENTREPRISE", "ENT_DATEMODIF", ["ENT_ID"]),
+    # PYREGROUPCNT absent DDL → table réelle = PYREGROUPECNT (sans RGPCNT_DATEMODIF → full-load)
+    # TableConfig("PYENTREPRISE", "ENT_DATEMODIF", ["ENT_ID"]),
 ]
 
-# PYETABLISSEMENT : ETA_DATEMODIF absent DDL → full-load
-# WTUG : UG_DATEMODIF absent DDL → full-load
+# Toutes autres : aucune colonne delta DDL confirmée → full-load
 TABLES_FULL: list[TableConfig] = [
+    # PYREGROUPCNT absent DDL → PYREGROUPECNT
+    TableConfig("PYREGROUPECNT", "", ["RGPCNT_ID"]),
+    TableConfig("PYENTREPRISE", "", ["ENT_ID"]),
     TableConfig("PYETABLISSEMENT", "", ["ETA_ID"]),
     TableConfig("WTUG", "", ["RGPCNT_ID"]),
-    TableConfig("PYOSPETA", "", ["RGPCNT_ID", "ETA_ID"]),
+    TableConfig("PYDOSPETA", "", ["RGPCNT_ID", "ETA_ID"]),
 ]
 
 _COLS: dict[str, str] = {
-    "PYREGROUPCNT": (
-        "RGPCNT_ID,RGPCNT_LIBELLE,RGPCNT_CODE,RGPCNT_ADR1,RGPCNT_ADR2,"
-        "RGPCNT_CODPOS,RGPCNT_VILLE,RGPCNT_EMAIL,RGPCNT_GPS_LAT,RGPCNT_GPS_LON,"
-        "RGPCNT_ACTIF,RGPCNT_DATEMODIF"
-    ),
-    "PYENTREPRISE": (
-        "ENT_ID,ENT_RAISON,ENT_SIREN,ENT_ADR1,ENT_ADR2,ENT_CODPOS,ENT_VILLE,ENT_DATEMODIF"
-    ),
-    # ETA_SIRET absent DDL → supprimé. ETA_ADR2_COMP extra → ajouté.
+    # DATE_CLOTURE ajouté (DDL confirmé 2026-03-11) — source de vérité is_active agence
+    "PYREGROUPECNT": "RGPCNT_ID,RGPCNT_CODE,RGPCNT_LIBELLE,DOS_ID,ENT_ID,DATE_CLOTURE",
+    "PYENTREPRISE": "ENT_ID,ENT_SIREN,ENT_RAISON,ENT_APE,ENT_ETT,RGPCNT_ID, ENT_MONOETAB",
     "PYETABLISSEMENT": (
-        "ETA_ID,ENT_ID,ETA_NIC,ETA_ADR1,ETA_ADR2,ETA_ADR2_COMP,ETA_CODPOS,ETA_VILLE,"
-        "ETA_NAF,ETA_COMMUNE,ETA_ACTIVITE"
+        "ETA_ID,ENT_ID,ETA_ACTIVITE,ETA_COMMUNE,ETA_ADR2_COMP,"
+        "ETA_ADR2_VOIE,ETA_ADR2_CP,ETA_ADR2_VILLE,ETA_PSEUDO_SIRET, ETA_DATE_CESACT"
     ),
-    # UG_NOM absent → nom vient de PYREGROUPCNT.RGPCNT_LIBELLE (join Silver)
-    # UG_CLOTURE→UG_CLOTURE_DATE, UG_PILOTE→PIL_ID, UG_GPS_LAT/LNG→UG_GPS (champ combiné)
-    "WTUG": "RGPCNT_ID,UG_GPS,UG_CLOTURE_DATE,UG_CLOTURE_USER,PIL_ID",
-    "PYOSPETA": "RGPCNT_ID,ETA_ID",
+    "WTUG": "RGPCNT_ID,ETA_ID,UG_GPS,UG_CLOTURE_DATE,UG_CLOTURE_USER,PIL_ID,UG_EMAIL",
+    "PYDOSPETA": "RGPCNT_ID,ETA_ID",
 }
 
 
@@ -74,42 +72,44 @@ def _extract_full(conn: pyodbc.Connection, tc: TableConfig) -> list[dict]:
 
 @with_retry(max_attempts=3, base_delay=2.0, backoff=2.0)
 def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
-            batch_id: str, since: datetime | None, stats: Stats) -> None:
+            batch_id: str, since: datetime | None, stats: Stats) -> int:
+    """Extrait, enrichit et charge une table vers S3 Bronze. Retourne le nombre de lignes ingérées."""
     t0 = time.monotonic()
-    rows = _extract_delta(
-        conn, tc, since) if since else _extract_full(conn, tc)
+    rows = _extract_delta(conn, tc, since) if since else _extract_full(conn, tc)
     if not rows:
-        logger.info(json.dumps(
-            {"table": tc.name, "rows": 0, "status": "empty"}))
-        return
-    enriched = [
-        {"_loaded_at": datetime.now(timezone.utc).isoformat(),
-         "_batch_id": batch_id, "_source_table": tc.name, **r}
-        for r in rows
-    ]
-    key = f"raw_{tc.name.lower()}/{today_s3_prefix()}/batch_{batch_id}.json"
-    upload_to_s3(cfg, enriched, cfg.bucket_bronze, key, stats)
+        logger.info(json.dumps({"table": tc.name, "rows": 0, "status": "empty"}))
+        return 0
+    loaded_at = datetime.now(timezone.utc).isoformat()
+    enriched = [{"_loaded_at": loaded_at, "_batch_id": batch_id,
+                 "_source_table": tc.name, **r} for r in rows]
+    # Chunking : 1 fichier S3 par tranche de _CHUNK_SIZE lignes (évite EntityTooLarge OVH)
+    chunks = [enriched[i:i + _CHUNK_SIZE] for i in range(0, len(enriched), _CHUNK_SIZE)]
+    prefix = f"raw_{tc.name.lower()}/{today_s3_prefix()}"
+    for idx, chunk in enumerate(chunks):
+        key = f"{prefix}/batch_{batch_id}_{idx:04d}.json"
+        upload_to_s3(cfg, chunk, cfg.bucket_bronze, key, stats)
     stats.tables_processed += 1
     stats.rows_ingested += len(rows)
     logger.info(json.dumps({
-        "table": tc.name, "rows": len(rows),
+        "table": tc.name, "rows": len(rows), "chunks": len(chunks),
         "mode": "full" if not since else "delta",
         "duration_s": round(time.monotonic() - t0, 2),
     }))
+    return len(rows)
 
 
 def run(cfg: Config) -> dict:
     stats = Stats()
     batch_id = generate_batch_id()
     if cfg.mode == RunMode.OFFLINE:
-        for tc in TABLES_DELTA + TABLES_FULL:
+        for tc in filter_tables(TABLES_DELTA + TABLES_FULL, cfg):
             logger.info(json.dumps({"mode": "offline", "table": tc.name}))
         return stats.finish()
 
     with get_pg_connection(cfg) as pg_conn:
         wm = WatermarkStore(pg_conn, PIPELINE)
         with get_evolia_connection(cfg) as conn:
-            for tc in TABLES_DELTA:
+            for tc in filter_tables(TABLES_DELTA, cfg):
                 since = wm.get(tc.name) or FALLBACK_SINCE
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
@@ -122,25 +122,29 @@ def run(cfg: Config) -> dict:
                     stats.tables_processed += 1
                     continue
                 try:
-                    _ingest(cfg, conn, tc, batch_id, since, stats)
-                    wm.set(tc.name, datetime.now(timezone.utc), stats)
+                    n = _ingest(cfg, conn, tc, batch_id, since, stats)
+                    wm.set(tc.name, datetime.now(timezone.utc), n)
                 except Exception as e:
-                    logger.exception(json.dumps(
-                        {"table": tc.name, "error": str(e)}))
+                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
 
-            if cfg.mode != RunMode.PROBE:
-                for tc in TABLES_FULL:
-                    try:
-                        _ingest(cfg, conn, tc, batch_id, None, stats)
-                        wm.set(tc.name, datetime.now(timezone.utc), stats)
-                    except Exception as e:
-                        logger.exception(json.dumps(
-                            {"table": tc.name, "error": str(e)}))
-                        wm.mark_failed(tc.name, str(e))
-                        stats.errors.append(
-                            {"table": tc.name, "error": str(e)})
+            for tc in filter_tables(TABLES_FULL, cfg):
+                if cfg.mode == RunMode.PROBE:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT COUNT(*) FROM {tc.name}")
+                        row = cur.fetchone()
+                        logger.info(json.dumps({"mode": "probe", "table": tc.name,
+                                                "count": row[0] if row else 0, "load": "full"}))
+                    stats.tables_processed += 1
+                    continue
+                try:
+                    n = _ingest(cfg, conn, tc, batch_id, None, stats) or 0
+                    wm.set(tc.name, datetime.now(timezone.utc), n)
+                except Exception as e:
+                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                    wm.mark_failed(tc.name, str(e))
+                    stats.errors.append({"table": tc.name, "error": str(e)})
 
     return stats.finish()
 

@@ -2,20 +2,24 @@
 Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # FinOps (2026-03-05) : lecture partitionnée Bronze ({cfg.date_partition})
 # CORRECTIONS DDL (probe 2026-03-05) :
-#   WTTIESERV : TIES_RS/TIES_SIREN/TIES_SIRET/TIES_NAF absent DDL → supprimés
-#               Raison sociale : TIES_RAISOC (confirmé en bronze _COLS)
-#               Adresse : TIES_ADR1/ADR2/CODPOS/VILLE confirmés, NUMVOIE/TYPVOIE/VOIE absent
-#   WTCLPT    : CLPT_CAPOT→CLPT_CAESTIME, CLPT_DATEMODIF/ACTIF/EFFECTIF absent
-#               CLPT_STATUT absent → CLPT_PROSPEC utilisé comme proxy statut
-#               CLPT_DATECREA → CLPT_DATCREA (bronze _COLS)
+#   WTTIESERV : TIES_RS→TIES_RAISOC→TIES_DESIGNATION (confirmé bronze_clients v2)
+#               TIES_CODPOS→TIES_CODEP (confirmé bronze_clients v2)
+#               TIES_SIRET absent DDL → siren via TIES_SIREN, naf via NAF/NAF2008 (sans préfixe TIES_)
+#               Adresse : TIES_ADR1/ADR2/CODEP/VILLE confirmés
+#   WTCLPT    : CLPT_PROSPEC→CLPT_PROS, CLPT_CAESTIME→CLPT_CAPT,
+#               CLPT_DATCREA→CLPT_DCREA (confirmés bronze_clients v2)
+# CORRECTIONS DDL (2026-03-11) :
+#   Alignement colonnes WTTIESERV/WTCLPT sur Bronze v2 (state card silver_required)
 """
 import hashlib
 from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, logger, s3_bronze
+from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, logger
 
-SCD2_TRACKED_COLS = ("raison_sociale", "adresse_complete", "ville",
-                     "code_postal", "statut_client", "ca_potentiel")
+# TIES_SIREN/NIC et naf_code ajoutés au tracking SCD2 (NIC ajouté 2026-03-11)
+SCD2_TRACKED_COLS = ("raison_sociale", "siren", "nic", "naf_code",
+                     "adresse_complete", "ville", "code_postal",
+                     "statut_client", "ca_potentiel")
 
 
 def build_staging_query(cfg: Config) -> str:
@@ -23,23 +27,25 @@ def build_staging_query(cfg: Config) -> str:
     return f"""
     WITH raw_ties AS (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY TIE_ID, TIES_SERV ORDER BY _loaded_at DESC) AS rn
-        FROM read_json_auto('{b}/raw_wttieserv/{cfg.date_partition}/*.json', union_by_name=true, hive_partitioning=false)
+        FROM read_json_auto('{b}/raw_wttieserv/{cfg.date_partition}/*.json',
+                            union_by_name=true, hive_partitioning=false)
     ),
     raw_clpt AS (
-        SELECT * FROM read_json_auto('{b}/raw_wtclpt/{cfg.date_partition}/*.json', union_by_name=true, hive_partitioning=false)
+        SELECT * FROM read_json_auto('{b}/raw_wtclpt/{cfg.date_partition}/*.json',
+                                     union_by_name=true, hive_partitioning=false)
     )
     SELECT
         t.TIE_ID::INT                                               AS tie_id,
-        TRIM(t.TIES_RAISOC)                                         AS raison_sociale,
-        NULL::VARCHAR                                               AS siren,
-        NULL::VARCHAR                                               AS siret,
-        NULL::VARCHAR                                               AS naf_code,
-        CONCAT_WS(' ', t.TIES_ADR1, t.TIES_ADR2, t.TIES_CODPOS, t.TIES_VILLE) AS adresse_complete,
+        TRIM(t.TIES_DESIGNATION)                                    AS raison_sociale,
+        TRIM(COALESCE(t.TIES_SIREN, ''))                            AS siren,
+        CASE WHEN LEN(TRIM(t.TIES_NIC)) = 5 THEN TRIM(t.TIES_NIC) ELSE NULL END AS nic,
+        TRIM(COALESCE(t.NAF, COALESCE(t.NAF2008, '')))              AS naf_code,
+        CONCAT_WS(' ', t.TIES_ADR1, t.TIES_ADR2, t.TIES_CODEP, t.TIES_VILLE) AS adresse_complete,
         TRIM(t.TIES_VILLE)                                          AS ville,
-        TRIM(t.TIES_CODPOS)                                         AS code_postal,
-        COALESCE(TRIM(c.CLPT_PROSPEC::VARCHAR), 'INCONNU')         AS statut_client,
-        TRY_CAST(c.CLPT_CAESTIME AS DECIMAL(18,2))                 AS ca_potentiel,
-        TRY_CAST(c.CLPT_DATCREA AS DATE)                           AS date_creation_fiche,
+        TRIM(t.TIES_CODEP)                                          AS code_postal,
+        TRIM(COALESCE(c.CLPT_PROS::VARCHAR, 'INCONNU'))             AS statut_client,
+        TRY_CAST(c.CLPT_CAPT AS DECIMAL(18,2))                     AS ca_potentiel,
+        TRY_CAST(c.CLPT_DCREA AS DATE)                             AS date_creation_fiche,
         t._batch_id                                                  AS _source_raw_id
     FROM raw_ties t
     LEFT JOIN raw_clpt c ON c.TIE_ID::INT = t.TIE_ID::INT
@@ -95,9 +101,9 @@ def run(cfg: Config) -> dict:
                 "tie_id": tie_id,
                 "change_hash": new_hash,
                 "raison_sociale": rd.get("raison_sociale", ""),
-                "siren": None,
-                "siret": None,
-                "naf_code": None,
+                "siren": rd.get("siren") or None,
+                "nic": rd.get("nic") or None,
+                "naf_code": rd.get("naf_code") or None,
                 "adresse_complete": rd.get("adresse_complete", ""),
                 "ville": rd.get("ville", ""),
                 "code_postal": rd.get("code_postal", ""),
