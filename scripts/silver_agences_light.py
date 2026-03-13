@@ -66,32 +66,34 @@ def run(cfg: Config) -> dict:
         FROM raw WHERE rn = 1 AND ID_UG IS NOT NULL
         """
 
-        # Initialisés avant le try — élimine l'UnboundLocalError si l'exception
-        # se produit entre les deux assignations (ex: c1 OK, c2 échoue)
         c1, c2 = 0, 0
+        # dim_agences — obligatoire
+        if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+            row1 = ddb.execute(f"SELECT COUNT(*) FROM ({q_agences})").fetchone()
+            c1 = row1[0] if row1 else 0
+        else:
+            ddb.execute(
+                f"COPY ({q_agences}) TO '{silver_dim}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+            c1 = ddb.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{silver_dim}/**/*.parquet')").fetchone()[0]
+
+        # hierarchie_territoriale — optionnel (raw_secteurs = référentiel externe non garanti)
         try:
             if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                row1 = ddb.execute(f"SELECT COUNT(*) FROM ({q_agences})").fetchone()
-                c1 = row1[0] if row1 else 0
                 row2 = ddb.execute(f"SELECT COUNT(*) FROM ({q_hier})").fetchone()
                 c2 = row2[0] if row2 else 0
-                logger.info(json.dumps({"mode": cfg.mode.value,
-                                        "dim_agences": c1, "hierarchie": c2}))
             else:
                 ddb.execute(
-                    f"COPY ({q_agences}) TO '{silver_dim}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
-                ddb.execute(
                     f"COPY ({q_hier}) TO '{silver_hier}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
-                # COUNT via read_parquet — évite de ré-exécuter la transformation
-                c1 = ddb.execute(
-                    f"SELECT COUNT(*) FROM read_parquet('{silver_dim}/**/*.parquet')").fetchone()[0]
                 c2 = ddb.execute(
                     f"SELECT COUNT(*) FROM read_parquet('{silver_hier}/**/*.parquet')").fetchone()[0]
-                logger.info(json.dumps({"dim_agences": c1, "hierarchie": c2}))
         except Exception as e:
-            logger.warning(json.dumps(
-                {"warning": "silver_agences error", "error": str(e)}))
-            raise
+            # raw_secteurs absent (référentiel externe) → hiérarchie ignorée ce run
+            logger.warning(json.dumps({"warning": "hierarchie_territoriale skipped — raw_secteurs absent",
+                                       "error": str(e)}))
+
+        logger.info(json.dumps({"mode": cfg.mode.value if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE) else "live",
+                                "dim_agences": c1, "hierarchie": c2}))
 
     stats.tables_processed = 2
     stats.rows_transformed = c1 + c2

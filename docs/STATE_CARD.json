@@ -1,0 +1,87 @@
+{
+  "meta": {
+    "projet": "gi-data-platform",
+    "version": "3.2",
+    "date": "2026-03-13",
+    "phase": "Phase 2 — Complète | Phase 3 — Déploiement & Validation"
+  },
+
+  "décisions_prises": [
+    "Architecture mono-serveur : FRDC1PIPELINE01 uniquement — OVH S3 + PostgreSQL managés",
+    "Phase 2 complète (2026-03-13) : 9 actions Bronze/Silver/Gold implémentées",
+    "CMD_ID ajouté WTMISS Bronze — float Evolia, TRY_CAST obligatoire dans Silver",
+    "WTPINT enrichi : PINT_PREVENDTE/DERVENDTE/MODIFDATE/CREATDTE ajoutés Bronze",
+    "silver_missions.py : pattern sql_fn=Callable[[Config],str] pour WTMISS multi-sources",
+    "WTMISS Silver : statut_dpae (datetime2) + ecart_heures + delai_placement_heures + categorie_delai",
+    "slv_interimaires/fidelisation créé (process_fidelisation via PINT_DERVENDTE proxy SAL_DATESORTIE)",
+    "gold_etp.py créé : fact_etp_hebdo (ETP=heures/35) dans gld_operationnel",
+    "fact_delai_placement + fact_conformite_dpae ajoutés dans gld_operationnel",
+    "fact_fidelisation_interimaires ajouté dans gld_staffing",
+    "fact_concentration_client (Pareto top-20% CA) ajouté dans gld_clients",
+    "gold_operationnel._write_pg corrigé (2026-03-13) : psycopg2.connect direct → get_pg_connection(cfg)",
+    "DATA_MAPPING.md complété : fact_etp_hebdo, fact_fidelisation_interimaires, fact_concentration_client + datasets Superset",
+    "DAGs refactorisés (2026-03-13) : 4 DAGs buggés remplacés par dag_gi_pipeline.py unifié (BashOperator, 5+10+7+2+1 tâches)"
+  ],
+
+  "blockers": [
+    "Probe requis sur Evolia DDL : confirmer PINT_PREVENDTE/DERVENDTE/MODIFDATE/CREATDTE et CMD_ID existent bien",
+    "slv_missions/missions S3 : nouvelles colonnes absentes jusqu'au prochain run Silver → Gold opérationnel bloqué",
+    "slv_interimaires/fidelisation S3 : absent jusqu'au prochain run silver_interimaires_detail → Gold staffing bloqué",
+    "gold_etp.py absent du DAG Airflow — ajout manuel requis sur FRDC1PIPELINE01",
+    "WTCMD.TIE_ID absent DDL → lien client via CCNT_ID uniquement (blocker architectural, non résolu)"
+  ],
+
+  "next_actions": [
+    {
+      "priorité": 1,
+      "couche": "Probe",
+      "fichier": "FRDC1PIPELINE01",
+      "action": "RUN_MODE=probe bronze_interimaires + bronze_missions : vérifier colonnes DDL PINT_PREVENDTE/DERVENDTE/MODIFDATE/CREATDTE et CMD_ID dans Evolia",
+      "effort": "15 min"
+    },
+    {
+      "priorité": 2,
+      "couche": "Bronze → Silver → Gold",
+      "fichier": "FRDC1PIPELINE01",
+      "action": "Run séquencé LIVE : 1) bronze_interimaires + bronze_missions → 2) silver_missions + silver_interimaires_detail → 3) gold_etp + gold_operationnel + gold_staffing + gold_ca_mensuel",
+      "effort": "2h"
+    },
+    {
+      "priorité": 3,
+      "couche": "Airflow",
+      "fichier": "http://frdc1pipeline01:8080",
+      "action": "Déployer dag_gi_pipeline.py : 1) copier dags/ sur FRDC1PIPELINE01, 2) désactiver les 4 anciens DAGs dans l'UI, 3) activer gi_pipeline, 4) valider le graphe (25 tâches attendues)",
+      "effort": "30 min"
+    }
+  ],
+
+  "contexte_minimal": {
+    "stack": "Python 3.12 + uv + DuckDB + boto3 + psycopg2",
+    "sources": "Evolia SQL Server on-prem (SRV-SQL2\\cegi, DB: INTERACTION) via pyodbc ODBC Driver 17",
+    "stockage_bronze": "OVH S3 gi-poc-bronze — JSON newline-delimited, partitionné YYYY/MM/DD",
+    "stockage_silver": "OVH S3 gi-poc-silver — Parquet, partitionné par domaine/table",
+    "stockage_gold": "OVH PostgreSQL managé — base gi_poc_ddi_gold, schémas gld_shared / gld_staffing / gld_commercial / gld_operationnel / gld_performance / gld_clients",
+    "pipeline": "Airflow sur FRDC1PIPELINE01 — http://frdc1pipeline01:8080",
+    "modes_run": "offline | probe (lecture seule, zéro écriture) | live",
+    "pattern_bronze": "_COLS dict dans bronze_*.py — run() appelle _ingest() via WatermarkStore",
+    "pattern_silver": "DuckDB lit S3 via httpfs, écrit Parquet sur S3 — WTMISS utilise sql_fn=Callable",
+    "pattern_gold": "DuckDB lit S3 Parquet + pg_bulk_insert vers PostgreSQL OVH",
+    "rgpd": "PER_NIR pseudonymisé SHA-256+salt — jamais en Gold ni Superset",
+    "anomalie_critique": "WTMISS.CMD_ID est float → TRY_CAST(CMD_ID AS INT) obligatoire pour JOIN WTCMD",
+    "anomalie_dpae": "MISS_FLAGDPAE est datetime2 (date transmission DPAE), pas un booléen",
+    "anomalie_sortie": "SAL_DATESORTIE inexistant DDL Evolia → proxy PINT_DERVENDTE",
+    "bug_corrigé": "gold_operationnel._write_pg : psycopg2.connect direct → get_pg_connection(cfg) (2026-03-13)"
+  },
+
+  "fichiers_modifiés": [
+    "scripts/bronze_missions.py — +CMD_ID dans WTMISS (JOIN WTCMD delai_placement Silver)",
+    "scripts/bronze_interimaires.py — +PINT_PREVENDTE/DERVENDTE/MODIFDATE/CREATDTE dans WTPINT",
+    "scripts/silver_missions.py — WTMISS enrichi : statut_dpae + ecart_heures + delai_placement_heures + categorie_delai (pattern sql_fn)",
+    "scripts/silver_interimaires_detail.py — +process_fidelisation → slv_interimaires/fidelisation",
+    "scripts/gold_etp.py — CRÉATION : fact_etp_hebdo (ETP hebdo par agence)",
+    "scripts/gold_operationnel.py — +fact_delai_placement + fact_conformite_dpae",
+    "scripts/gold_staffing.py — +fact_fidelisation_interimaires",
+    "scripts/gold_ca_mensuel.py — +fact_concentration_client (Pareto top-20% CA)",
+    "docs/STATE_CARD.json — ce fichier"
+  ]
+}

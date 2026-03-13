@@ -1,11 +1,12 @@
-"""bronze_interimaires.py — Bronze · 10 tables intérimaires Evolia → S3.
+"""bronze_interimaires.py — Bronze · 10 tables intérimaires + 3 référentiels compétences Evolia → S3.
 Phase 0 · GI Data Lakehouse · Manifeste v2.0
 # CORRECTIONS DDL (probe 2026-03-05) :
 #   PYPERSONNE  : PER_DATENAIS→PER_NAISSANCE, PER_NATIONALITE→NAT_CODE,
 #                 PER_PAYS→PAYS_CODE, PER_ADRESSE/COMPL/LIEUNAIS absent.
 #                 PER_DATEMODIF absent → FULL-LOAD
 #   PYSALARIE   : SAL_DATEDEBUT→SAL_DATEENTREE, SAL_DATEMODIF absent → FULL-LOAD
-#   WTPINT      : PINT_PLACEMENT/RGPCNT_ID absent, PINT_DATEMODIF absent → FULL-LOAD
+#   WTPINT      : PINT_PLACEMENT/RGPCNT_ID absent → FULL-LOAD
+#                 +PINT_PREVENDTE,PINT_DERVENDTE,PINT_MODIFDATE,PINT_CREATDTE (2026-03-13, fidélisation)
 #   PYCOORDONNEE: TYPTEL→TYPTEL_CODE, COORD_VALEUR→PER_TEL_NTEL,
 #                 COORD_DATEMODIF absent → FULL-LOAD
 #   WTPMET      : ORDRE→PMET_ORDRE, PMET_DATEMODIF absent → FULL-LOAD
@@ -18,6 +19,15 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 #   WTPEVAL     : PEVAL_DATE→PEVAL_DU (delta), PEVAL_NOTE→PEVAL_EVALUATION,
 #                 PEVAL_AGENT→PEVAL_UTL, PEVAL_COMMENTAIRE/RGPCNT_ID absent
 #   WTUGPINT    : UGPINT_DATEMODIF → delta (non modifié)
+# AJOUT RÉFÉRENTIELS (2026-03-12) — DDL confirmé DDL_EVOLIA_FILTERED.sql :
+#   WTMET  : MET_ID (PK), MET_LIBELLE → libellés métiers pour silver_competences
+#   WTTHAB : THAB_ID (PK), THAB_LIBELLE → libellés habilitations
+#   WTTDIP : TDIP_ID (PK), TDIP_LIB (pas TDIP_LIBELLE) → libellés diplômes
+# ENRICHISSEMENT RÉFÉRENTIELS (2026-03-12) :
+#   WTMET  : +NIVQ_ID, +SPE_ID, +PCS_CODE_2003 (classif. INSEE), +DFS_ID, +MET_DELETE (soft-delete)
+#   WTTHAB : +THAB_NBMOIS (durée validité std → calcul date_expir théorique silver)
+#   WTTDIP : +TDIP_REF (catégorie/niveau diplôme)
+#   WTQUA  : AJOUT (TQUA_ID PK, TQUA_CODE, TQUA_LIBELLE) → libellé qualification pour dim_metiers Gold
 """
 import json
 import time
@@ -55,6 +65,11 @@ TABLES_FULL: list[TableConfig] = [
     TableConfig("WTEXP", "", ["PER_ID", "EXP_ORDRE"]),
     # UGPINT_DATEMODIF absent DDL
     TableConfig("WTUGPINT", "", ["PER_ID", "RGPCNT_ID"]),
+    # Référentiels compétences — petites tables statiques, full-load (DDL confirmé 2026-03-12)
+    TableConfig("WTMET", "", ["MET_ID"]),
+    TableConfig("WTTHAB", "", ["THAB_ID"]),
+    TableConfig("WTTDIP", "", ["TDIP_ID"]),
+    TableConfig("WTQUA", "", ["TQUA_ID"]),   # Types de qualification (libellé pour dim_metiers)
 ]
 
 # Noms DDL confirmés par probe 2026-03-05. NIR/PER_TEL_NTEL conservés Bronze,
@@ -65,7 +80,7 @@ _COLS: dict[str, str] = {
         "NAT_CODE,PAYS_CODE,PER_BISVOIE,PER_COMPVOIE,PER_CP,PER_VILLE,PER_COMMUNE"
     ),
     "PYSALARIE": "PER_ID,SAL_MATRICULE,SAL_DATEENTREE,SAL_ACTIF",
-    "WTPINT": "PER_ID,PINT_CANDIDAT,PINT_DOSSIER,PINT_PERMANENT",
+    "WTPINT": "PER_ID,PINT_CANDIDAT,PINT_DOSSIER,PINT_PERMANENT,PINT_PREVENDTE,PINT_DERVENDTE,PINT_MODIFDATE,PINT_CREATDTE",
     # TYPTEL_CODE remplace TYPTEL, PER_TEL_NTEL remplace COORD_VALEUR
     "PYCOORDONNEE": "PER_ID,TYPTEL_CODE,PER_TEL_NTEL,PER_TEL_POSTE",
     "WTPMET": "PER_ID,PMET_ORDRE,MET_ID",
@@ -76,6 +91,12 @@ _COLS: dict[str, str] = {
     # PEVAL_DATE→PEVAL_DU, PEVAL_NOTE→PEVAL_EVALUATION, PEVAL_AGENT→PEVAL_UTL
     "WTPEVAL": "PER_ID,PEVAL_DU,PEVAL_EVALUATION,PEVAL_UTL",
     "WTUGPINT": "PER_ID,RGPCNT_ID,AUG_ORI",  # UGPINT_DATEMODIF absent DDL
+    # Référentiels compétences — DDL confirmé DDL_EVOLIA_FILTERED.sql (2026-03-12)
+    # Enrichissement 2026-03-12 : PCS_CODE_2003/MET_DELETE/NIVQ_ID/SPE_ID/DFS_ID, THAB_NBMOIS, TDIP_REF
+    "WTMET":  "MET_ID,MET_CODE,MET_LIBELLE,TQUA_ID,NIVQ_ID,SPE_ID,PCS_CODE_2003,DFS_ID,MET_DELETE",
+    "WTTHAB": "THAB_ID,THAB_CDE,THAB_LIBELLE,THAB_NBMOIS",   # THAB_NBMOIS = durée validité (mois)
+    "WTTDIP": "TDIP_ID,TDIP_CODE,TDIP_LIB,TDIP_REF",         # TDIP_LIB (pas TDIP_LIBELLE), TDIP_REF = catégorie
+    "WTQUA":  "TQUA_ID,TQUA_CODE,TQUA_LIBELLE",              # Types qualification → libellé pour dim_metiers Gold
 }
 
 _RGPD_SENSITIVE: frozenset[str] = frozenset({"PER_NIR", "PER_TEL_NTEL"})

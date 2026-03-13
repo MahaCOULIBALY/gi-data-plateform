@@ -236,13 +236,19 @@ def get_pg_connection(cfg: Config):
 
 
 def get_duckdb_connection(cfg: Config) -> duckdb.DuckDBPyConnection:
-    """LOAD (pas INSTALL) — httpfs est pré-installé sur le K8s OVH.
+    """INSTALL + LOAD httpfs — idempotent (pas de re-download si déjà installé).
+    Nécessaire à chaque upgrade DuckDB (cache extensions versionnée par ~/.duckdb/extensions/<version>/).
+    En prod K8s OVH : httpfs pré-installé dans l'image → INSTALL est no-op.
     Credentials via CREATE SECRET (DuckDB ≥ 0.10) — évite les credentials en clair
     dans les logs SET et gère les apostrophes défensivement.
     """
     conn = duckdb.connect()
-    conn.execute("LOAD httpfs;")
-    endpoint = cfg.s3_endpoint.replace("https://", "").replace("http://", "")
+    conn.execute("INSTALL httpfs; LOAD httpfs;")
+    # Strip scheme + trailing slash — DuckDB duplique le bucket si trailing slash présent
+    endpoint = cfg.s3_endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+    # Dérive la région depuis le pattern OVH : s3.{region}.io.cloud.ovh.net
+    # DuckDB v1.4+ exige REGION même pour un endpoint custom (sinon HTTP 400)
+    region = endpoint.split(".")[1] if endpoint.startswith("s3.") else "us-east-1"
 
     # Échappement défensif — les clés S3 sont alphanumériques mais on ne présume pas
     def _q(s: str) -> str:
@@ -254,6 +260,7 @@ def get_duckdb_connection(cfg: Config) -> duckdb.DuckDBPyConnection:
             KEY_ID '{_q(cfg.s3_access_key)}',
             SECRET '{_q(cfg.s3_secret_key)}',
             ENDPOINT '{_q(endpoint)}',
+            REGION '{_q(region)}',
             URL_STYLE 'path',
             USE_SSL true
         )

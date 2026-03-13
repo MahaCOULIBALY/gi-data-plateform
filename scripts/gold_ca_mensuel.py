@@ -146,26 +146,97 @@ def validate_vs_pyramid(pg_conn, stats: Stats) -> list[dict]:
     return report
 
 
+def build_concentration_query(cfg: Config) -> str:
+    """Concentration CA client par agence/mois (indice Pareto).
+    nb_clients_top20 = clients représentant les 20% premiers par CA.
+    taux_concentration = part du CA portée par ces clients.
+    """
+    silver = f"s3://{cfg.bucket_silver}"
+    return f"""
+    WITH factures AS (
+        SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet',
+                                   hive_partitioning=true)
+        WHERE date_facture IS NOT NULL AND rgpcnt_id IS NOT NULL
+    ),
+    lignes AS (
+        SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht
+        FROM read_parquet('{silver}/slv_facturation/lignes_factures/**/*.parquet',
+                          hive_partitioning=true)
+        GROUP BY fac_num
+    ),
+    base AS (
+        SELECT
+            f.rgpcnt_id::INT                                        AS agence_id,
+            DATE_TRUNC('month', TRY_CAST(f.date_facture AS DATE))::DATE AS mois,
+            f.tie_id::INT                                           AS tie_id,
+            COALESCE(SUM(CASE WHEN f.type_facture = 'F' THEN l.montant_ht ELSE 0 END), 0)
+            - COALESCE(SUM(CASE WHEN f.type_facture = 'A' THEN l.montant_ht ELSE 0 END), 0)
+                                                                   AS ca_net_ht
+        FROM factures f
+        LEFT JOIN lignes l ON l.fac_num = f.efac_num
+        GROUP BY 1, 2, 3
+    ),
+    totals AS (
+        SELECT agence_id, mois, SUM(ca_net_ht) AS ca_total
+        FROM base GROUP BY 1, 2
+    ),
+    ranked AS (
+        SELECT b.*,
+               t.ca_total,
+               PERCENT_RANK() OVER (
+                   PARTITION BY b.agence_id, b.mois
+                   ORDER BY b.ca_net_ht DESC
+               ) AS pct_rank
+        FROM base b JOIN totals t ON t.agence_id = b.agence_id AND t.mois = b.mois
+    )
+    SELECT
+        agence_id,
+        mois,
+        COUNT(DISTINCT tie_id)                                     AS nb_clients,
+        COUNT(DISTINCT tie_id) FILTER (WHERE pct_rank <= 0.2)      AS nb_clients_top20,
+        MAX(ca_total)::DECIMAL(18,2)                               AS ca_net_total,
+        COALESCE(SUM(ca_net_ht) FILTER (WHERE pct_rank <= 0.2),
+                 0)::DECIMAL(18,2)                                 AS ca_net_top20,
+        ROUND(
+            COALESCE(SUM(ca_net_ht) FILTER (WHERE pct_rank <= 0.2), 0)
+            / NULLIF(MAX(ca_total), 0),
+        4)::DECIMAL(8,4)                                           AS taux_concentration
+    FROM ranked
+    WHERE mois IS NOT NULL
+    GROUP BY 1, 2
+    ORDER BY 2 DESC, 1
+    """
+
+
 def run(cfg: Config) -> dict:
     stats = Stats()
-    columns = [
+    ca_columns = [
         "client_sk", "tie_id", "mois", "ca_ht", "avoir_ht", "ca_net_ht",
         "nb_factures", "nb_missions_facturees", "nb_heures_facturees",
         "taux_moyen_fact", "agence_principale",
     ]
+    concentration_columns = [
+        "agence_id", "mois", "nb_clients", "nb_clients_top20",
+        "ca_net_total", "ca_net_top20", "taux_concentration",
+    ]
 
     with get_duckdb_connection(cfg) as ddb:
-        rows = ddb.execute(build_ca_mensuel_query(cfg)).fetchall()
-        logger.info(f"fact_ca_mensuel_client: {len(rows)} rows computed")
-        stats.rows_transformed = len(rows)
+        ca_rows = ddb.execute(build_ca_mensuel_query(cfg)).fetchall()
+        concentration_rows = ddb.execute(build_concentration_query(cfg)).fetchall()
+        logger.info(f"fact_ca_mensuel_client: {len(ca_rows)} rows | "
+                    f"fact_concentration_client: {len(concentration_rows)} rows")
+        stats.rows_transformed = len(ca_rows) + len(concentration_rows)
 
     with get_pg_connection(cfg) as pg_conn:
         pg_bulk_insert(cfg, pg_conn, "gld_commercial",
-                       "fact_ca_mensuel_client", columns, rows, stats)
+                       "fact_ca_mensuel_client", ca_columns, ca_rows, stats)
+        pg_bulk_insert(cfg, pg_conn, "gld_clients",
+                       "fact_concentration_client", concentration_columns,
+                       concentration_rows, stats)
         if not cfg.dry_run:
             validate_vs_pyramid(pg_conn, stats)
 
-    stats.tables_processed = 1
+    stats.tables_processed = 2
     return stats.finish()
 
 

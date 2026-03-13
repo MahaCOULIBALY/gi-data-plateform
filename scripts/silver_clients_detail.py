@@ -182,7 +182,12 @@ def run(cfg: Config) -> dict:
         stats.extra["sites_mission"] = process_sites_mission(ddb, cfg, stats)
         stats.extra["contacts"] = process_contacts(ddb, cfg, stats)
         stats.extra["encours_credit"] = process_encours_credit(ddb, cfg, stats)
-        stats.extra["coefficients"] = process_coefficients(ddb, cfg, stats)
+        try:
+            stats.extra["coefficients"] = process_coefficients(ddb, cfg, stats)
+        except Exception as e:
+            # WTCOEF vide en source → bronze n'écrit aucun fichier S3 → 0 coefficients
+            logger.warning(json.dumps({"warning": "coefficients skipped", "error": str(e)}))
+            stats.extra["coefficients"] = 0
         stats.tables_processed = 4
         stats.rows_transformed = sum(stats.extra.values())
     return stats.finish()

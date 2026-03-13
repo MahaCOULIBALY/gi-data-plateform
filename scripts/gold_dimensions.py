@@ -9,6 +9,10 @@ PRÉREQUIS : Silver dim_clients, dim_interimaires, dim_agences doivent exister.
 - build_dim_metiers: MET_SPE → SPE_ID (probe DDL: MET_SPECIALITE absent)
 - build_dim_metiers: MET_NIVEAU → NIVQ_ID (probe DDL: MET_NIVEAU absent)
 - Silver dim_clients/dim_interimaires/dim_agences: lowercase aliases OK
+=== ENRICHISSEMENT RÉFÉRENTIELS (2026-03-12) ===
+- build_dim_metiers: raw_ref_metiers → raw_wtmet (WTMET intégré dans bronze_interimaires)
+- build_dim_metiers: raw_ref_qualifications → raw_wtqua (WTQUA ajouté bronze_interimaires 2026-03-12)
+- build_dim_metiers: +pcs_code (PCS_CODE_2003 INSEE), filtre MET_DELETE actif
 """
 import sys
 import logging
@@ -97,12 +101,12 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
 
 
 def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
-    """Lit Bronze ref_metiers + ref_qualifications (pas de Silver pour les référentiels)."""
+    """Lit Bronze raw_wtmet + raw_wtqua (via bronze_interimaires depuis 2026-03-12)."""
     bronze = f"s3://{cfg.bucket_bronze}"
     return ddb.execute(f"""
         WITH met AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY MET_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{bronze}/raw_ref_metiers/**/*.json', union_by_name=true, hive_partitioning=false)
+            FROM read_json_auto('{bronze}/raw_wtmet/**/*.json', union_by_name=true, hive_partitioning=false)
         )
         SELECT
             MD5(MET_ID::VARCHAR) AS metier_sk,
@@ -111,11 +115,14 @@ def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
             TRIM(COALESCE(MET_LIBELLE, '')) AS libelle_metier,
             TRIM(COALESCE(q.TQUA_LIBELLE, '')) AS qualification,
             TRIM(COALESCE(CAST(m.SPE_ID AS VARCHAR), '')) AS specialite,
-            TRIM(COALESCE(CAST(m.NIVQ_ID AS VARCHAR), '')) AS niveau
+            TRIM(COALESCE(CAST(m.NIVQ_ID AS VARCHAR), '')) AS niveau,
+            NULLIF(TRIM(COALESCE(m.PCS_CODE_2003::VARCHAR, '')), '') AS pcs_code
         FROM met m
-        LEFT JOIN read_json_auto('{bronze}/raw_ref_qualifications/**/*.json', union_by_name=true, hive_partitioning=false) q
+        LEFT JOIN read_json_auto('{bronze}/raw_wtqua/**/*.json', union_by_name=true, hive_partitioning=false) q
             ON q.TQUA_ID = m.TQUA_ID
-        WHERE m.rn = 1 AND m.MET_ID IS NOT NULL
+        WHERE m.rn = 1
+          AND m.MET_ID IS NOT NULL
+          AND COALESCE(TRY_CAST(m.MET_DELETE AS INT), 0) = 0
     """).fetchall()
 
 
@@ -143,7 +150,7 @@ DIMENSIONS = {
     },
     "dim_metiers": {
         "cols": ["metier_sk", "met_id", "code_metier", "libelle_metier",
-                 "qualification", "specialite", "niveau"],
+                 "qualification", "specialite", "niveau", "pcs_code"],
         "builder": "metiers",
     },
 }

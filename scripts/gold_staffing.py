@@ -124,6 +124,29 @@ def build_missions_detail_query(cfg: Config) -> str:
     """
 
 
+def build_fidelisation_query(cfg: Config) -> str:
+    """Fidélisation intérimaires par agence/catégorie.
+    Source : slv_interimaires/fidelisation (priorité 5) + slv_interimaires/portefeuille_agences.
+    """
+    silver = f"s3://{cfg.bucket_silver}"
+    return f"""
+    SELECT
+        p.rgpcnt_id::INT                                           AS agence_id,
+        f.categorie_fidelisation,
+        COUNT(DISTINCT f.per_id)                                   AS nb_interimaires,
+        ROUND(AVG(f.anciennete_jours), 1)::DECIMAL(10,1)           AS anciennete_moy_jours,
+        ROUND(AVG(f.jours_depuis_derniere_vente), 1)::DECIMAL(10,1) AS jours_inactivite_moyen
+    FROM read_parquet('{silver}/slv_interimaires/fidelisation/**/*.parquet',
+                      hive_partitioning=true) f
+    LEFT JOIN read_parquet('{silver}/slv_interimaires/portefeuille_agences/**/*.parquet',
+                           hive_partitioning=true) p
+        ON p.per_id = f.per_id
+    WHERE p.rgpcnt_id IS NOT NULL
+    GROUP BY 1, 2
+    ORDER BY 1, 2
+    """
+
+
 def run(cfg: Config) -> dict:
     stats = Stats()
     activite_cols = ["interimaire_sk", "per_id", "mois", "nb_missions", "nb_agences",
@@ -131,24 +154,31 @@ def run(cfg: Config) -> dict:
     missions_cols = ["mission_sk", "per_id", "cnt_id", "tie_id", "agence_id", "metier_id",
                      "date_debut", "date_fin", "duree_jours", "taux_horaire_paye", "taux_horaire_fact",
                      "marge_horaire", "heures_totales", "ca_mission", "cout_mission", "marge_mission", "taux_marge"]
+    fidelisation_cols = ["agence_id", "categorie_fidelisation", "nb_interimaires",
+                         "anciennete_moy_jours", "jours_inactivite_moyen"]
 
     with get_duckdb_connection(cfg) as ddb:
         activite_rows = ddb.execute(build_activite_query(cfg)).fetchall()
-        missions_rows = ddb.execute(
-            build_missions_detail_query(cfg)).fetchall()
+        missions_rows = ddb.execute(build_missions_detail_query(cfg)).fetchall()
+        fidelisation_rows = ddb.execute(build_fidelisation_query(cfg)).fetchall()
         logger.info(
-            f"fact_activite_int: {len(activite_rows)} rows | fact_missions_detail: {len(missions_rows)} rows")
+            f"fact_activite_int: {len(activite_rows)} rows | "
+            f"fact_missions_detail: {len(missions_rows)} rows | "
+            f"fact_fidelisation_interimaires: {len(fidelisation_rows)} rows")
 
     with get_pg_connection(cfg) as pg:
         pg_bulk_insert(cfg, pg, "gld_staffing", "fact_activite_int",
                        activite_cols, activite_rows, stats)
         pg_bulk_insert(cfg, pg, "gld_staffing", "fact_missions_detail",
                        missions_cols, missions_rows, stats)
+        pg_bulk_insert(cfg, pg, "gld_staffing", "fact_fidelisation_interimaires",
+                       fidelisation_cols, fidelisation_rows, stats)
 
-    stats.tables_processed = 2
-    stats.rows_transformed = len(activite_rows) + len(missions_rows)
+    stats.tables_processed = 3
+    stats.rows_transformed = len(activite_rows) + len(missions_rows) + len(fidelisation_rows)
     stats.extra["activite_rows"] = len(activite_rows)
     stats.extra["missions_rows"] = len(missions_rows)
+    stats.extra["fidelisation_rows"] = len(fidelisation_rows)
     return stats.finish()
 
 

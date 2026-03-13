@@ -49,7 +49,7 @@ _COLS: dict[str, str] = {
         "ETA_ID,ENT_ID,ETA_ACTIVITE,ETA_COMMUNE,ETA_ADR2_COMP,"
         "ETA_ADR2_VOIE,ETA_ADR2_CP,ETA_ADR2_VILLE,ETA_PSEUDO_SIRET, ETA_DATE_CESACT"
     ),
-    "WTUG": "RGPCNT_ID,ETA_ID,UG_GPS,UG_CLOTURE_DATE,UG_CLOTURE_USER,PIL_ID,UG_EMAIL",
+    "WTUG": "RGPCNT_ID,ETA_ID,CAST(UG_GPS AS NVARCHAR(MAX)) AS UG_GPS,UG_CLOTURE_DATE,UG_CLOTURE_USER,PIL_ID,UG_EMAIL",
     "PYDOSPETA": "RGPCNT_ID,ETA_ID",
 }
 
@@ -128,6 +128,10 @@ def run(cfg: Config) -> dict:
                     logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
+                    try:
+                        getattr(conn, "cancel", lambda: None)()
+                    except Exception:
+                        pass
 
             for tc in filter_tables(TABLES_FULL, cfg):
                 if cfg.mode == RunMode.PROBE:
@@ -145,6 +149,10 @@ def run(cfg: Config) -> dict:
                     logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
+                    try:
+                        getattr(conn, "cancel", lambda: None)()
+                    except Exception:
+                        pass
 
     return stats.finish()
 

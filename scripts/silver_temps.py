@@ -57,7 +57,7 @@ _TABLES: list[_Table] = [
             SELECT
                 CAST(PRH_BTS            AS INTEGER)         AS prh_bts,
                 CAST(RHD_LIGNE          AS INTEGER)         AS rhd_ligne,
-                TRIM(RHD_ORIRUB)                            AS rubrique,
+                TRIM(RHD_ORIRUB::VARCHAR)                   AS rubrique,
                 CAST(RHD_BASEP          AS DECIMAL(10,2))   AS base_paye,
                 CAST(RHD_TAUXP          AS DECIMAL(10,4))   AS taux_paye,
                 CAST(RHD_BASEF          AS DECIMAL(10,2))   AS base_fact,

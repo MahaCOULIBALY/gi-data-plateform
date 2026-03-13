@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # API OVHcloud (monitoring, gestion ressources)
     "ovh>=1.0.0",
+    "httpfs>=0.0.1",
 ]
 
 [project.optional-dependencies]

@@ -6,6 +6,11 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 #   WTPDIP      : PDIP_DATE confirmé (remplace PDIP_ANNEE)
 #   WTEXP       : ORDRE→EXP_ORDRE, EXP_POSTE absent, EXP_ENTREPRISE→EXP_NOM,
 #                 EXP_DUREE absent, EXP_DATEDEBUT→EXP_DEBUT, EXP_DATEFIN→EXP_FIN
+# ENRICHISSEMENT RÉFÉRENTIELS (2026-03-12) :
+#   WTMET  : is_active basé sur MET_DELETE (vs hardcode true) + pcs_code (PCS_CODE_2003 INSEE)
+#   WTTHAB : date_expiration = COALESCE(PHAB_EXPIR, PHAB_DELIVR + THAB_NBMOIS mois)
+#            is_active recalculé sur date_expiration composite
+#   WTTDIP : niveau = TDIP_REF (catégorie/niveau diplôme)
 """
 import json
 from shared import Config, RunMode, Stats, get_duckdb_connection, logger
@@ -25,14 +30,17 @@ def build_competences_query(cfg: Config) -> str:
             NULL::VARCHAR AS niveau,
             NULL::DATE AS date_obtention,
             NULL::DATE AS date_expiration,
-            true AS is_active,
+            -- MET_DELETE : 1 = supprimé logiquement, NULL/0 = actif
+            COALESCE(TRY_CAST(r.MET_DELETE AS INT), 0) = 0 AS is_active,
+            NULLIF(TRIM(r.PCS_CODE_2003::VARCHAR), '') AS pcs_code,
             'WTPMET' AS _source_table,
             m._loaded_at
         FROM read_json_auto('{b}/raw_wtpmet/**/*.json', union_by_name=true, hive_partitioning=false) m
-        LEFT JOIN read_json_auto('{b}/raw_ref_metiers/**/*.json', union_by_name=true, hive_partitioning=false) r
+        LEFT JOIN read_json_auto('{b}/raw_wtmet/**/*.json', union_by_name=true, hive_partitioning=false) r
             ON r.MET_ID = m.MET_ID
     ),
     habilitations AS (
+        -- date_expiration = PHAB_EXPIR explicite OU date théorique (PHAB_DELIVR + THAB_NBMOIS mois)
         SELECT
             MD5(CONCAT(PER_ID::VARCHAR, '|HABILITATION|', THAB_ID::VARCHAR)) AS competence_id,
             PER_ID::INT AS per_id,
@@ -41,15 +49,27 @@ def build_competences_query(cfg: Config) -> str:
             COALESCE(TRIM(r.THAB_LIBELLE), 'Habilitation inconnue') AS libelle,
             '' AS niveau,
             TRY_CAST(h.PHAB_DELIVR AS DATE) AS date_obtention,
-            TRY_CAST(h.PHAB_EXPIR  AS DATE) AS date_expiration,
-            CASE WHEN TRY_CAST(h.PHAB_EXPIR AS DATE) IS NULL
-                      OR TRY_CAST(h.PHAB_EXPIR AS DATE) > CURRENT_DATE
-                 THEN true ELSE false END AS is_active,
+            exp AS date_expiration,
+            CASE WHEN exp IS NULL OR exp > CURRENT_DATE THEN true ELSE false END AS is_active,
+            NULL::VARCHAR AS pcs_code,
             'WTPHAB' AS _source_table,
             h._loaded_at
-        FROM read_json_auto('{b}/raw_wtphab/**/*.json', union_by_name=true, hive_partitioning=false) h
-        LEFT JOIN read_json_auto('{b}/raw_ref_habilitations/**/*.json', union_by_name=true, hive_partitioning=false) r
-            ON r.THAB_ID = h.THAB_ID
+        FROM (
+            SELECT
+                h.*,
+                r.THAB_LIBELLE,
+                COALESCE(
+                    TRY_CAST(h.PHAB_EXPIR AS DATE),
+                    CASE WHEN TRY_CAST(r.THAB_NBMOIS AS INT) IS NOT NULL
+                              AND TRY_CAST(h.PHAB_DELIVR AS DATE) IS NOT NULL
+                         THEN TRY_CAST(h.PHAB_DELIVR AS DATE)
+                              + MAKE_INTERVAL(months := TRY_CAST(r.THAB_NBMOIS AS INT))
+                         ELSE NULL END
+                ) AS exp
+            FROM read_json_auto('{b}/raw_wtphab/**/*.json', union_by_name=true, hive_partitioning=false) h
+            LEFT JOIN read_json_auto('{b}/raw_wtthab/**/*.json', union_by_name=true, hive_partitioning=false) r
+                ON r.THAB_ID = h.THAB_ID
+        )
     ),
     diplomes AS (
         SELECT
@@ -57,15 +77,17 @@ def build_competences_query(cfg: Config) -> str:
             PER_ID::INT AS per_id,
             'DIPLOME' AS type_competence,
             COALESCE(TDIP_ID::VARCHAR, '') AS code,
-            COALESCE(TRIM(r.TDIP_LIBELLE), 'Diplôme inconnu') AS libelle,
-            '' AS niveau,
+            COALESCE(TRIM(r.TDIP_LIB), 'Diplôme inconnu') AS libelle,
+            -- TDIP_REF = catégorie/niveau diplôme (référentiel)
+            NULLIF(TRY_CAST(r.TDIP_REF AS VARCHAR), '') AS niveau,
             TRY_CAST(d.PDIP_DATE AS DATE) AS date_obtention,
             NULL::DATE AS date_expiration,
             true AS is_active,
+            NULL::VARCHAR AS pcs_code,
             'WTPDIP' AS _source_table,
             d._loaded_at
         FROM read_json_auto('{b}/raw_wtpdip/**/*.json', union_by_name=true, hive_partitioning=false) d
-        LEFT JOIN read_json_auto('{b}/raw_ref_diplomes/**/*.json', union_by_name=true, hive_partitioning=false) r
+        LEFT JOIN read_json_auto('{b}/raw_wttdip/**/*.json', union_by_name=true, hive_partitioning=false) r
             ON r.TDIP_ID = d.TDIP_ID
     ),
     experiences AS (
@@ -79,6 +101,7 @@ def build_competences_query(cfg: Config) -> str:
             TRY_CAST(e.EXP_DEBUT AS DATE) AS date_obtention,
             TRY_CAST(e.EXP_FIN   AS DATE) AS date_expiration,
             true AS is_active,
+            NULL::VARCHAR AS pcs_code,
             'WTEXP' AS _source_table,
             e._loaded_at
         FROM read_json_auto('{b}/raw_wtexp/**/*.json', union_by_name=true, hive_partitioning=false) e
@@ -94,7 +117,7 @@ def build_competences_query(cfg: Config) -> str:
         FROM all_comp
     )
     SELECT competence_id, per_id, type_competence, code, libelle, niveau,
-           date_obtention, date_expiration, is_active, _source_table,
+           date_obtention, date_expiration, is_active, pcs_code, _source_table,
            CURRENT_TIMESTAMP AS _loaded_at
     FROM dedup WHERE rn = 1 AND per_id IS NOT NULL
     """

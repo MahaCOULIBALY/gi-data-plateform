@@ -6,6 +6,7 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 #   WTCMD      : CMD_DATE→CMD_DTE (extra DDL) + full-load (CMD_DATEMODIF absent)
 #   WTPLAC     : PLAC_DATE→PLAC_DTEEDI (extra DDL) + full-load (PLAC_DATEMODIF absent)
 #   WTLFAC     : LFAC_LIBELLE→LFAC_LIB (extra DDL) + full-load (pas de delta col)
+# AJOUT CMD_ID (2026-03-13) : CMD_ID ajouté WTMISS → JOIN WTCMD pour delai_placement Silver
 # AJOUT (2026-03-11) :
 #   PYCONTRAT  : PK=PER_ID+CNT_ID, delta_col=CNT_DATEFIN (datetime2)
 #                allow_null_delta=True → contrats actifs (CNT_DATEFIN IS NULL) toujours capturés
@@ -28,6 +29,13 @@ from pipeline_utils import WatermarkStore, with_retry
 
 PIPELINE = "bronze_missions"
 FALLBACK_SINCE = datetime(2023, 1, 1, tzinfo=timezone.utc)
+# WTRHDON : 49.6M lignes total, ~759K depuis 2024-01-01 (probe 2026-03-12).
+# RHD_DATED = date métier (début rubrique paie), pas un timestamp technique.
+# Limitation documentée : corrections rétroactives pré-2024 non capturées.
+# Évolution prévue : delta via WTPRH.PRH_MODIFDATE (relation PRH_BTS FK).
+FALLBACK_SINCE_OVERRIDE: dict[str, datetime] = {
+    "WTRHDON": datetime(2024, 1, 1, tzinfo=timezone.utc),
+}
 
 # Tables avec colonne delta confirmée DDL
 TABLES_DELTA: list[TableConfig] = [
@@ -35,9 +43,10 @@ TABLES_DELTA: list[TableConfig] = [
     TableConfig("WTCNTI", "CNTI_CREATE", ["PER_ID", "CNT_ID", "CNTI_ORDRE"]),
     TableConfig("WTEFAC", "EFAC_DTEEDI", ["EFAC_NUM"]),
     TableConfig("WTPRH", "PRH_MODIFDATE", ["PRH_BTS"]),
-    # RHD_DATED = date métier (début rubrique), pas de DATEMODIF en DDL → full-load (probe 2026-03-12)
     # allow_null_delta=True : contrats actifs ont CNT_DATEFIN IS NULL → capturés à chaque run
     TableConfig("PYCONTRAT", "CNT_DATEFIN", ["PER_ID", "CNT_ID"], allow_null_delta=True),
+    # RHD_DATED = date métier paie — utilisé comme proxy delta, horizon 2024-01-01 (voir FALLBACK_SINCE_OVERRIDE)
+    TableConfig("WTRHDON", "RHD_DATED", ["RINT_ID", "RHD_LIGNE"]),
 ]
 
 # Tables sans delta col DDL → full-load à chaque run
@@ -47,8 +56,6 @@ TABLES_FULL: list[TableConfig] = [
     TableConfig("WTLFAC", "", ["FAC_NUM", "LFAC_ORD"]),
     # FACINFO_DATEMODIF absent DDL
     TableConfig("WTFACINFO", "", ["CNT_ID", "FAC_NUM"]),
-    # RHD_DATED = date métier, pas DATEMODIF — full-load (reclassé depuis TABLES_DELTA 2026-03-12)
-    TableConfig("WTRHDON", "", ["RINT_ID", "RHD_LIGNE"]),
 ]
 
 _COLS: dict[str, str] = {
@@ -56,7 +63,7 @@ _COLS: dict[str, str] = {
         "PER_ID,CNT_ID,TIE_ID,MISS_TIEID,TIES_SERV,MISS_CODE,MISS_JUSTIFICATION,"
         "MISS_DPAE,MISS_ETRANGER,MISS_QUAL,MISS_PERFERM,RGPCNT_ID,MISS_NDPAE,"
         "CNTI_CREATE,FINMISS_CODE,MISS_SAISIE_DTFIN,MISS_TRANSDATE,MISS_MODIFDATE,"
-        "MISS_FLAGDPAE,MISS_BTP,MISS_TYPCOEF,MISS_LOGIN"
+        "MISS_FLAGDPAE,MISS_BTP,MISS_TYPCOEF,MISS_LOGIN,CMD_ID"
     ),
     "WTCNTI": (
         "PER_ID,CNT_ID,CNTI_ORDRE,TIE_ID,MET_ID,CNTI_CREATE,CNTI_DATEFFET,"
@@ -154,7 +161,7 @@ def run(cfg: Config) -> dict:
         wm = WatermarkStore(pg_conn, PIPELINE)
         with get_evolia_connection(cfg) as conn:
             for tc in filter_tables(TABLES_DELTA, cfg):
-                since = wm.get(tc.name) or FALLBACK_SINCE
+                since = wm.get(tc.name) or FALLBACK_SINCE_OVERRIDE.get(tc.name, FALLBACK_SINCE)
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
                         null_clause = f" OR {tc.delta_col} IS NULL" if tc.allow_null_delta else ""

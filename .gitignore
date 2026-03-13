@@ -115,3 +115,5 @@ benchmark_costs*.csv
 # ─── Windows ──────────────────────────────────────────────────────────────────
 $RECYCLE.BIN/
 System Volume Information/
+# ─── Claude Code (état session, non versionnable) ───
+.claude/
