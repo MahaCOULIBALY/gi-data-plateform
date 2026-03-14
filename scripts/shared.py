@@ -97,43 +97,28 @@ def get_run_mode() -> RunMode:
 
 @dataclass
 class Config:
-    """Configuration centralisée — secrets chargés une seule fois au démarrage."""
-    evolia_server: str = field(
-        default_factory=lambda: os.environ["EVOLIA_SERVER"])
-    evolia_db: str = field(default_factory=lambda: os.environ["EVOLIA_DB"])
-    evolia_user: str = field(default_factory=lambda: os.environ["EVOLIA_USER"])
-    evolia_password: str = field(
-        default_factory=lambda: os.environ["EVOLIA_PASSWORD"])
-    evolia_odbc_driver: str = field(
-        default_factory=lambda: os.environ["EVOLIA_ODBC_DRIVER"])
-    evolia_port: int = field(
-        default_factory=lambda: int(os.environ.get("EVOLIA_PORT", "1433")))
-    s3_endpoint: str = field(
-        default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
-    s3_access_key: str = field(
-        default_factory=lambda: os.environ["OVH_S3_ACCESS_KEY"])
-    s3_secret_key: str = field(
-        default_factory=lambda: os.environ["OVH_S3_SECRET_KEY"])
-    bucket_bronze: str = "gi-poc-bronze"
-    bucket_silver: str = "gi-poc-silver"
-    bucket_gold: str = "gi-poc-gold"
-    ovh_pg_host: str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
-    ovh_pg_port: int = field(default_factory=lambda: int(
-        os.environ.get("OVH_PG_PORT", "20184")))
-    ovh_pg_database: str = field(
-        default_factory=lambda: os.environ.get("OVH_PG_DATABASE", "gi_poc_ddi_gold"))
-    ovh_pg_user: str = field(
-        default_factory=lambda: os.environ.get("OVH_PG_USER", ""))
-    ovh_pg_password: str = field(
-        default_factory=lambda: os.environ.get("OVH_PG_PASSWORD", ""))
-    rgpd_salt: str = field(default_factory=lambda: os.environ.get(
-        "RGPD_SALT", _RGPD_SALT_SENTINEL))
-    alert_email: str = field(default_factory=lambda: os.environ.get(
-        "ALERT_EMAIL", "data-team@groupe-interaction.fr"))
-    mode: RunMode = field(default_factory=get_run_mode)
-    # FinOps — partition Silver : lit uniquement la partition Bronze du jour (pas full-scan S3)
-    # Override via env SILVER_DATE_PARTITION=2026/03/05 pour rejeu / backfill
-    date_partition: str = field(
+    """Configuration centralisée. EVOLIA_SERVER format : 'host,port' (pymssql)."""
+    evolia_server:   str = field(default_factory=lambda: os.environ["EVOLIA_SERVER"])
+    evolia_db:       str = field(default_factory=lambda: os.environ["EVOLIA_DB"])
+    evolia_user:     str = field(default_factory=lambda: os.environ["EVOLIA_USER"])
+    evolia_password: str = field(default_factory=lambda: os.environ["EVOLIA_PASSWORD"])
+    # evolia_odbc_driver retiré — plus utilisé avec pymssql.
+    # Pour pipeline_dayack et projets pyodbc : DB_DRIVER dans leur propre .env
+    s3_endpoint:     str = field(default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
+    s3_access_key:   str = field(default_factory=lambda: os.environ["OVH_S3_ACCESS_KEY"])
+    s3_secret_key:   str = field(default_factory=lambda: os.environ["OVH_S3_SECRET_KEY"])
+    bucket_bronze:   str = "gi-poc-bronze"
+    bucket_silver:   str = "gi-poc-silver"
+    bucket_gold:     str = "gi-poc-gold"
+    ovh_pg_host:     str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
+    ovh_pg_port:     int = field(default_factory=lambda: int(os.environ.get("OVH_PG_PORT", "20184")))
+    ovh_pg_database: str = field(default_factory=lambda: os.environ.get("OVH_PG_DATABASE", "gi_poc_ddi_gold"))
+    ovh_pg_user:     str = field(default_factory=lambda: os.environ.get("OVH_PG_USER", ""))
+    ovh_pg_password: str = field(default_factory=lambda: os.environ.get("OVH_PG_PASSWORD", ""))
+    rgpd_salt:       str = field(default_factory=lambda: os.environ.get("RGPD_SALT", _RGPD_SALT_SENTINEL))
+    alert_email:     str = field(default_factory=lambda: os.environ.get("ALERT_EMAIL", "data-team@groupe-interaction.fr"))
+    mode:            RunMode = field(default_factory=get_run_mode)
+    date_partition:  str = field(
         default_factory=lambda: os.environ.get(
             "SILVER_DATE_PARTITION",
             datetime.now(timezone.utc).strftime("%Y/%m/%d"),
@@ -152,7 +137,17 @@ class Config:
     def dry_run(self) -> bool:
         """Rétrocompatibilité — True si mode != LIVE."""
         return self.mode != RunMode.LIVE
+    
+    @property
+    def evolia_host(self) -> str:
+        """Hôte SQL Server extrait de EVOLIA_SERVER (format 'host,port' ou 'host')."""
+        return self.evolia_server.split(",")[0].strip()
 
+    @property
+    def evolia_port(self) -> int:
+        """Port SQL Server extrait de EVOLIA_SERVER, défaut 1433."""
+        parts = self.evolia_server.split(",")
+        return int(parts[1].strip()) if len(parts) > 1 else 1433
 
 @dataclass
 class Stats:
@@ -234,16 +229,14 @@ def get_evolia_connection(cfg: Config):
     pymssql (FreeTDS) utilise un mécanisme TLS différent qui fonctionne avec
     cette version du serveur.
     """
-    host, _, port_str = cfg.evolia_server.partition(",")
-    port = int(port_str) if port_str else cfg.evolia_port
     conn = pymssql.connect(
-        server=host,
-        port=port,
+        server=cfg.evolia_host,
+        port=cfg.evolia_port,
         database=cfg.evolia_db,
         user=cfg.evolia_user,
         password=cfg.evolia_password,
         login_timeout=30,
-        tds_version="7.4",   # TDS 7.4 = SQL Server 2012-2019
+        tds_version="7.4",    # TDS 7.4 = SQL Server 2012–2019
         autocommit=True,
     )
     return conn

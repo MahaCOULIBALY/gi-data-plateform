@@ -77,7 +77,7 @@ def _extract_delta(conn: pyodbc.Connection, tc: TableConfig, since: datetime) ->
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT {_COLS[tc.name]} FROM {tc.name} WHERE {tc.delta_col} >= ?", since_str)
+            f"SELECT {_COLS[tc.name]} FROM {tc.name} WHERE {tc.delta_col} >= %s", since_str)
         h = [d[0] for d in cur.description]
         return [dict(zip(h, row)) for row in cur.fetchall()]
 
@@ -133,7 +133,7 @@ def run(cfg: Config) -> dict:
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
                         cur.execute(
-                            f"SELECT COUNT(*) FROM {tc.name} WHERE {tc.delta_col} >= ?",
+                            f"SELECT COUNT(*) FROM {tc.name} WHERE {tc.delta_col} >= %s",
                             since.strftime("%Y-%m-%d %H:%M:%S"))
                         row = cur.fetchone()
                         logger.info(json.dumps({

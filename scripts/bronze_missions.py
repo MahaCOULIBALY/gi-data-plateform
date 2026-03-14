@@ -111,7 +111,7 @@ def _extract_delta(conn: pyodbc.Connection, tc: TableConfig, since: datetime) ->
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT {_COLS[tc.name]} FROM {tc.name} "
-            f"WHERE {tc.delta_col} >= ?{null_clause}", since_str)
+            f"WHERE {tc.delta_col} >= %s{null_clause}", since_str)
         h = [d[0] for d in cur.description]
         return [dict(zip(h, row)) for row in cur.fetchall()]
 
@@ -167,7 +167,7 @@ def run(cfg: Config) -> dict:
                         null_clause = f" OR {tc.delta_col} IS NULL" if tc.allow_null_delta else ""
                         cur.execute(
                             f"SELECT COUNT(*) FROM {tc.name} "
-                            f"WHERE {tc.delta_col} >= ?{null_clause}",
+                            f"WHERE {tc.delta_col} >= %s{null_clause}",
                             since.strftime("%Y-%m-%d %H:%M:%S"))
                         row = cur.fetchone()
                         logger.info(json.dumps({"mode": "probe", "table": tc.name,
