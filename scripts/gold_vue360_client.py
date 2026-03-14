@@ -21,7 +21,10 @@ def build_vue360_query(cfg: Config) -> str:
     DuckDB lit PostgreSQL via postgres_scan (extension native, zéro dépendance supplémentaire).
     """
     silver = f"s3://{cfg.bucket_silver}"
-    pg_dsn = f"host={cfg.pg_host} port={cfg.pg_port} dbname={cfg.pg_db} user={cfg.pg_user} password={cfg.pg_password}"
+    pg_dsn = (
+        f"host={cfg.ovh_pg_host} port={cfg.ovh_pg_port} "
+        f"dbname={cfg.ovh_pg_database} user={cfg.ovh_pg_user} password={cfg.ovh_pg_password}"
+    )
     return f"""
     WITH dim_c AS (
         SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet')

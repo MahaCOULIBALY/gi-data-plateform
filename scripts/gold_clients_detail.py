@@ -8,6 +8,8 @@ RGPD : contacts (email/tel) restent Silver-only — jamais en Gold
 #   Bug #1  : cfg.pg_* → cfg.ovh_pg_* (noms réels dans shared.Config)
 #   Perf #13: row-by-row cur.execute → psycopg2.extras.execute_batch (batch de 500)
 #   Perf    : connexion PG unique dans run() — réutilisée par _fetch_pg_ca et _write_pg
+# CORRECTIONS (2026-03-13) :
+#   psycopg2.connect manuel → get_pg_connection (cohérence shared.py)
 """
 import json
 from datetime import datetime, timezone
@@ -15,7 +17,7 @@ from datetime import datetime, timezone
 import psycopg2
 import psycopg2.extras
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, logger
 
 DOMAIN = "gld_clients"
 
@@ -195,11 +197,8 @@ def run(cfg: Config) -> dict:
             stats.tables_processed += 1
         return stats.finish()
 
-    # Connexion PG unique — réutilisée par _fetch_pg_ca et _write_pg (évite 3 ouvertures TCP)
-    with psycopg2.connect(
-        host=cfg.ovh_pg_host, port=cfg.ovh_pg_port, dbname=cfg.ovh_pg_database,
-        user=cfg.ovh_pg_user, password=cfg.ovh_pg_password, sslmode="require"
-    ) as pg_conn:
+    # Connexion PG unique via get_pg_connection — cohérence shared.py (ssl, keepalives, pool)
+    with get_pg_connection(cfg) as pg_conn:
         pg_ca_rows = _fetch_pg_ca(pg_conn)
         logger.info(json.dumps({"step": "fetch_pg_ca", "rows": len(pg_ca_rows)}))
 

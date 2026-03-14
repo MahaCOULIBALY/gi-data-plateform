@@ -40,6 +40,7 @@ def _build_wtmiss_sql(cfg: Config) -> str:
     """WTMISS enrichi : statut_dpae + ecart_heures + delai_placement_heures + categorie_delai.
     JOIN WTCNTI (min CNTI_DATEFFET = premier début contrat) + JOIN WTCMD (CMD_DTE).
     Anomalie CMD_ID : stocké float dans Evolia → TRY_CAST obligatoire.
+    date_debut = MIN(CNTI_DATEFFET) — MISS_DATEDEBUT absent DDL, CNTI_DATEFFET est la source de vérité.
     """
     b = cfg.bucket_bronze
     dp = cfg.date_partition
@@ -64,7 +65,7 @@ def _build_wtmiss_sql(cfg: Config) -> str:
         CAST(src.TIE_ID             AS INTEGER)       AS tie_id,
         CAST(src.TIES_SERV          AS INTEGER)       AS ties_serv,
         CAST(src.RGPCNT_ID          AS INTEGER)       AS rgpcnt_id,
-        NULL::DATE                                    AS date_debut,
+        TRY_CAST(cnti.CNTI_DATEFFET AS DATE)          AS date_debut,
         CAST(src.MISS_SAISIE_DTFIN  AS DATE)          AS date_fin,
         NULL::VARCHAR                                 AS motif,
         TRIM(src.FINMISS_CODE)                        AS code_fin,

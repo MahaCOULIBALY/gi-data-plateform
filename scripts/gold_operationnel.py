@@ -6,6 +6,8 @@ Note : fact_anomalies_rh — reporté Phase 1 (données WTRHECART non encore en 
 """
 import json
 
+import psycopg2.extras
+
 from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
 
 DOMAIN = "gld_operationnel"
@@ -109,14 +111,13 @@ def _aggregate(ddb, name: str) -> list[tuple]:
     return ddb.execute(SQL[name]).fetchall()
 
 
-def _write_pg(cfg: Config, name: str, rows: list[tuple], stats: Stats) -> None:
-    with get_pg_connection(cfg) as conn:
-        with conn.cursor() as cur:
-            cur.execute("CREATE SCHEMA IF NOT EXISTS gld_operationnel")
-            cur.execute(DDL[name])
-            for row in rows:
-                cur.execute(UPSERT[name], row)
-        conn.commit()
+def _write_pg(pg_conn, name: str, rows: list[tuple], stats: Stats) -> None:
+    """Upsert via execute_batch (lot 500) — connexion partagée par run(), pas de re-ouverture TCP."""
+    with pg_conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS gld_operationnel")
+        cur.execute(DDL[name])
+        psycopg2.extras.execute_batch(cur, UPSERT[name], rows, page_size=500)
+    pg_conn.commit()
     stats.tables_processed += 1
     stats.rows_ingested += len(rows)
 
@@ -182,35 +183,35 @@ def run(cfg: Config) -> dict:
             stats.errors.append({"step": "register_views", "error": str(e)})
             return stats.finish()
 
-        for name in ("fact_heures_hebdo", "fact_commandes_pipeline"):
-            try:
-                rows = _aggregate(ddb, name)
-                if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                    logger.info(json.dumps(
-                        {"mode": cfg.mode.value, "table": name, "rows": len(rows)}))
-                    stats.tables_processed += 1
-                    continue
-                _write_pg(cfg, name, rows, stats)
-                logger.info(json.dumps(
-                    {"table": name, "rows": len(rows), "status": "ok"}))
-            except Exception as e:
-                logger.exception(json.dumps({"table": name, "error": str(e)}))
-                stats.errors.append({"table": name, "error": str(e)})
-
-        # Priorité 7 : fact_delai_placement + fact_conformite_dpae
-        _new_tables = {
-            "fact_delai_placement": (
-                build_delai_placement_query(cfg),
-                ["agence_id", "semaine_debut", "categorie_delai",
-                 "nb_missions", "delai_moyen_heures", "delai_median_heures"],
-            ),
-            "fact_conformite_dpae": (
-                build_conformite_dpae_query(cfg),
-                ["agence_id", "mois", "nb_missions", "nb_dpae_transmises",
-                 "nb_dpae_manquantes", "taux_conformite_dpae", "ecart_moyen_heures"],
-            ),
-        }
         with get_pg_connection(cfg) as pg:
+            for name in ("fact_heures_hebdo", "fact_commandes_pipeline"):
+                try:
+                    rows = _aggregate(ddb, name)
+                    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+                        logger.info(json.dumps(
+                            {"mode": cfg.mode.value, "table": name, "rows": len(rows)}))
+                        stats.tables_processed += 1
+                        continue
+                    _write_pg(pg, name, rows, stats)
+                    logger.info(json.dumps(
+                        {"table": name, "rows": len(rows), "status": "ok"}))
+                except Exception as e:
+                    logger.exception(json.dumps({"table": name, "error": str(e)}))
+                    stats.errors.append({"table": name, "error": str(e)})
+
+            # Priorité 7 : fact_delai_placement + fact_conformite_dpae
+            _new_tables = {
+                "fact_delai_placement": (
+                    build_delai_placement_query(cfg),
+                    ["agence_id", "semaine_debut", "categorie_delai",
+                     "nb_missions", "delai_moyen_heures", "delai_median_heures"],
+                ),
+                "fact_conformite_dpae": (
+                    build_conformite_dpae_query(cfg),
+                    ["agence_id", "mois", "nb_missions", "nb_dpae_transmises",
+                     "nb_dpae_manquantes", "taux_conformite_dpae", "ecart_moyen_heures"],
+                ),
+            }
             for name, (query, cols) in _new_tables.items():
                 try:
                     rows = ddb.execute(query).fetchall()

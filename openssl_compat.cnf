@@ -1,0 +1,18 @@
+openssl_conf = default_conf
+
+[default_conf]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+# SQL Server 2016 SP2 + Windows Server 2016 Schannel ne supporte pas TLS 1.3 :
+# le ClientHello avec les extensions TLS 1.3 (key_share, psk_key_exchange_modes)
+# provoque un RST immédiat → erreur 0x2746 (ECONNRESET).
+# MaxProtocol=TLSv1.2 empêche OpenSSL d'inclure ces extensions dans le ClientHello.
+# CipherString SECLEVEL=1 abaisse le niveau de sécurité pour accepter les suites
+# de chiffrement AES-128-CBC qu'utilise SQL Server 2016 (SHA-1 intermédiaire).
+MinProtocol = TLSv1.2
+MaxProtocol = TLSv1.2
+CipherString = DEFAULT:@SECLEVEL=1

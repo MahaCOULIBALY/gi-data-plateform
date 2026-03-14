@@ -89,6 +89,7 @@ terraform/.terraform.lock.hcl
 .DS_Store
 Thumbs.db
 desktop.ini
+tmp/
 
 # ─── Docker ───────────────────────────────────────────────────────────────────
 .dockerignore

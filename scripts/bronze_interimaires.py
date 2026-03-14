@@ -32,8 +32,7 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 import json
 import time
 from datetime import datetime, timezone
-
-import pyodbc
+from typing import Any
 
 from shared import (
     Config, Stats, TableConfig, RunMode, _CHUNK_SIZE,
@@ -69,7 +68,8 @@ TABLES_FULL: list[TableConfig] = [
     TableConfig("WTMET", "", ["MET_ID"]),
     TableConfig("WTTHAB", "", ["THAB_ID"]),
     TableConfig("WTTDIP", "", ["TDIP_ID"]),
-    TableConfig("WTQUA", "", ["TQUA_ID"]),   # Types de qualification (libellé pour dim_metiers)
+    # Types de qualification (libellé pour dim_metiers)
+    TableConfig("WTQUA", "", ["TQUA_ID"]),
 ]
 
 # Noms DDL confirmés par probe 2026-03-05. NIR/PER_TEL_NTEL conservés Bronze,
@@ -93,25 +93,28 @@ _COLS: dict[str, str] = {
     "WTUGPINT": "PER_ID,RGPCNT_ID,AUG_ORI",  # UGPINT_DATEMODIF absent DDL
     # Référentiels compétences — DDL confirmé DDL_EVOLIA_FILTERED.sql (2026-03-12)
     # Enrichissement 2026-03-12 : PCS_CODE_2003/MET_DELETE/NIVQ_ID/SPE_ID/DFS_ID, THAB_NBMOIS, TDIP_REF
-    "WTMET":  "MET_ID,MET_CODE,MET_LIBELLE,TQUA_ID,NIVQ_ID,SPE_ID,PCS_CODE_2003,DFS_ID,MET_DELETE",
-    "WTTHAB": "THAB_ID,THAB_CDE,THAB_LIBELLE,THAB_NBMOIS",   # THAB_NBMOIS = durée validité (mois)
-    "WTTDIP": "TDIP_ID,TDIP_CODE,TDIP_LIB,TDIP_REF",         # TDIP_LIB (pas TDIP_LIBELLE), TDIP_REF = catégorie
-    "WTQUA":  "TQUA_ID,TQUA_CODE,TQUA_LIBELLE",              # Types qualification → libellé pour dim_metiers Gold
+    "WTMET": "MET_ID,MET_CODE,MET_LIBELLE,TQUA_ID,NIVQ_ID,SPE_ID,PCS_CODE_2003,DFS_ID,MET_DELETE",
+    # THAB_NBMOIS = durée validité (mois)
+    "WTTHAB": "THAB_ID,THAB_CDE,THAB_LIBELLE,THAB_NBMOIS",
+    # TDIP_LIB (pas TDIP_LIBELLE), TDIP_REF = catégorie
+    "WTTDIP": "TDIP_ID,TDIP_CODE,TDIP_LIB,TDIP_REF",
+    # Types qualification → libellé pour dim_metiers Gold
+    "WTQUA": "TQUA_ID,TQUA_CODE,TQUA_LIBELLE",
 }
 
 _RGPD_SENSITIVE: frozenset[str] = frozenset({"PER_NIR", "PER_TEL_NTEL"})
 
 
-def _extract_delta(conn: pyodbc.Connection, tc: TableConfig, since: datetime) -> list[dict]:
+def _extract_delta(conn: Any, tc: TableConfig, since: datetime) -> list[dict]:
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT {_COLS[tc.name]} FROM {tc.name} WHERE {tc.delta_col} >= ?", since_str)
+            f"SELECT {_COLS[tc.name]} FROM {tc.name} WHERE {tc.delta_col} >= %s", since_str)
         h = [d[0] for d in cur.description]
         return [dict(zip(h, row)) for row in cur.fetchall()]
 
 
-def _extract_full(conn: pyodbc.Connection, tc: TableConfig) -> list[dict]:
+def _extract_full(conn: Any, tc: TableConfig) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(f"SELECT {_COLS[tc.name]} FROM {tc.name}")
         h = [d[0] for d in cur.description]
@@ -119,13 +122,15 @@ def _extract_full(conn: pyodbc.Connection, tc: TableConfig) -> list[dict]:
 
 
 @with_retry(max_attempts=3, base_delay=2.0, backoff=2.0)
-def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
+def _ingest(cfg: Config, conn: Any, tc: TableConfig,
             batch_id: str, since: datetime | None, stats: Stats) -> int:
     """Extrait, enrichit et charge une table vers S3 Bronze. Retourne le nombre de lignes ingérées."""
     t0 = time.monotonic()
-    rows = _extract_delta(conn, tc, since) if since else _extract_full(conn, tc)
+    rows = _extract_delta(
+        conn, tc, since) if since else _extract_full(conn, tc)
     if not rows:
-        logger.info(json.dumps({"table": tc.name, "rows": 0, "status": "empty"}))
+        logger.info(json.dumps(
+            {"table": tc.name, "rows": 0, "status": "empty"}))
         return 0
     detected = [c for c in rows[0] if c in _RGPD_SENSITIVE]
     if detected:
@@ -142,7 +147,8 @@ def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
         for r in rows
     ]
     # Chunking : 1 fichier S3 par tranche de _CHUNK_SIZE lignes (évite EntityTooLarge OVH)
-    chunks = [enriched[i:i + _CHUNK_SIZE] for i in range(0, len(enriched), _CHUNK_SIZE)]
+    chunks = [enriched[i:i + _CHUNK_SIZE]
+              for i in range(0, len(enriched), _CHUNK_SIZE)]
     prefix = f"raw_{tc.name.lower()}/{today_s3_prefix()}"
     for idx, chunk in enumerate(chunks):
         key = f"{prefix}/batch_{batch_id}_{idx:04d}.json"
@@ -173,7 +179,7 @@ def run(cfg: Config) -> dict:
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
                         cur.execute(
-                            f"SELECT COUNT(*) FROM {tc.name} WHERE {tc.delta_col} >= ?",
+                            f"SELECT COUNT(*) FROM {tc.name} WHERE {tc.delta_col} >= %s",
                             since.strftime("%Y-%m-%d %H:%M:%S"))
                         row = cur.fetchone()
                         logger.info(json.dumps({
@@ -185,7 +191,8 @@ def run(cfg: Config) -> dict:
                     n = _ingest(cfg, conn, tc, batch_id, since, stats) or 0
                     wm.set(tc.name, datetime.now(timezone.utc), n)
                 except Exception as e:
-                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                    logger.exception(json.dumps(
+                        {"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
 
@@ -202,7 +209,8 @@ def run(cfg: Config) -> dict:
                     n = _ingest(cfg, conn, tc, batch_id, None, stats) or 0
                     wm.set(tc.name, datetime.now(timezone.utc), n)
                 except Exception as e:
-                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                    logger.exception(json.dumps(
+                        {"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
 

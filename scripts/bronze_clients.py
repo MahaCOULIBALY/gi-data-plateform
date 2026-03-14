@@ -148,6 +148,10 @@ def run(cfg: Config) -> dict:
                     logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
+                    try:
+                        getattr(conn, "cancel", lambda: None)()
+                    except Exception:
+                        pass
 
             for tc in filter_tables(TABLES_FULL, cfg):
                 if cfg.mode == RunMode.PROBE:
@@ -165,6 +169,10 @@ def run(cfg: Config) -> dict:
                     logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
+                    try:
+                        getattr(conn, "cancel", lambda: None)()
+                    except Exception:
+                        pass
 
     return stats.finish()
 

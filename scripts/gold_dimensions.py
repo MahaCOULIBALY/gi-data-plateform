@@ -101,12 +101,21 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
 
 
 def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
-    """Lit Bronze raw_wtmet + raw_wtqua (via bronze_interimaires depuis 2026-03-12)."""
+    """Lit Bronze raw_wtmet + raw_wtqua (via bronze_interimaires depuis 2026-03-12).
+    Utilise cfg.date_partition pour éviter le full-scan S3 multi-batchs.
+    WTQUA dédupliqué par ROW_NUMBER pour éviter doublons si plusieurs batchs journaliers.
+    """
     bronze = f"s3://{cfg.bucket_bronze}"
+    dp = cfg.date_partition
     return ddb.execute(f"""
         WITH met AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY MET_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{bronze}/raw_wtmet/**/*.json', union_by_name=true, hive_partitioning=false)
+            FROM read_json_auto('{bronze}/raw_wtmet/{dp}/*.json', union_by_name=true, hive_partitioning=false)
+        ),
+        qua AS (
+            SELECT TQUA_ID, TQUA_LIBELLE,
+                   ROW_NUMBER() OVER (PARTITION BY TQUA_ID ORDER BY _loaded_at DESC) AS rn
+            FROM read_json_auto('{bronze}/raw_wtqua/{dp}/*.json', union_by_name=true, hive_partitioning=false)
         )
         SELECT
             MD5(MET_ID::VARCHAR) AS metier_sk,
@@ -118,8 +127,7 @@ def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
             TRIM(COALESCE(CAST(m.NIVQ_ID AS VARCHAR), '')) AS niveau,
             NULLIF(TRIM(COALESCE(m.PCS_CODE_2003::VARCHAR, '')), '') AS pcs_code
         FROM met m
-        LEFT JOIN read_json_auto('{bronze}/raw_wtqua/**/*.json', union_by_name=true, hive_partitioning=false) q
-            ON q.TQUA_ID = m.TQUA_ID
+        LEFT JOIN qua q ON q.TQUA_ID = m.TQUA_ID AND q.rn = 1
         WHERE m.rn = 1
           AND m.MET_ID IS NOT NULL
           AND COALESCE(TRY_CAST(m.MET_DELETE AS INT), 0) = 0

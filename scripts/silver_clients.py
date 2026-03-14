@@ -58,6 +58,56 @@ def _hash(row: dict) -> str:
     return hashlib.md5(parts.encode()).hexdigest()
 
 
+def _apply_scd2(
+    staging: list[dict],
+    existing: list[dict],
+    now: "datetime",
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Logique SCD Type 2 pure — sans I/O, testable unitairement.
+    Retourne (new_records, closed_records, unchanged_current).
+    """
+    current_by_id: dict[int, dict] = {
+        int(r["tie_id"]): r for r in existing if r.get("is_current")}
+    historical = [r for r in existing if not r.get("is_current")]
+    new_records: list[dict] = []
+    closed_records: list[dict] = []
+
+    for rd in staging:
+        tie_id = int(rd["tie_id"])
+        new_hash = _hash(rd)
+        if tie_id in current_by_id and current_by_id[tie_id].get("change_hash") == new_hash:
+            continue
+        if tie_id in current_by_id:
+            old = dict(current_by_id[tie_id])
+            old["valid_to"] = now.isoformat()
+            old["is_current"] = False
+            closed_records.append(old)
+        new_records.append({
+            "client_sk": hash_sk(tie_id, now.isoformat()),
+            "tie_id": tie_id,
+            "change_hash": new_hash,
+            "raison_sociale": rd.get("raison_sociale", ""),
+            "siren": rd.get("siren") or None,
+            "nic": rd.get("nic") or None,
+            "naf_code": rd.get("naf_code") or None,
+            "adresse_complete": rd.get("adresse_complete", ""),
+            "ville": rd.get("ville", ""),
+            "code_postal": rd.get("code_postal", ""),
+            "statut_client": rd.get("statut_client", "INCONNU"),
+            "ca_potentiel": rd.get("ca_potentiel"),
+            "date_creation_fiche": rd.get("date_creation_fiche"),
+            "is_current": True,
+            "valid_from": now.isoformat(),
+            "valid_to": None,
+            "_source_raw_id": rd.get("_source_raw_id", ""),
+            "_loaded_at": now.isoformat(),
+        })
+
+    changed_ids = {int(r["tie_id"]) for r in new_records}
+    unchanged_current = [r for pid, r in current_by_id.items() if pid not in changed_ids]
+    return new_records, closed_records, unchanged_current
+
+
 def run(cfg: Config) -> dict:
     stats = Stats()
     now = datetime.now(timezone.utc)
@@ -80,50 +130,11 @@ def run(cfg: Config) -> dict:
         except Exception:
             logger.info("No existing Silver dim_clients — first run")
 
-        current_by_id: dict[int, dict] = {
-            int(r["tie_id"]): r for r in existing if r.get("is_current")}
         historical = [r for r in existing if not r.get("is_current")]
-        new_records: list[dict] = []
-        closed_records: list[dict] = []
-
-        for rd in staging:
-            tie_id = int(rd["tie_id"])
-            new_hash = _hash(rd)
-            if tie_id in current_by_id and current_by_id[tie_id].get("change_hash") == new_hash:
-                continue
-            if tie_id in current_by_id:
-                old = dict(current_by_id[tie_id])
-                old["valid_to"] = now.isoformat()
-                old["is_current"] = False
-                closed_records.append(old)
-            new_records.append({
-                "client_sk": hash_sk(tie_id, now.isoformat()),
-                "tie_id": tie_id,
-                "change_hash": new_hash,
-                "raison_sociale": rd.get("raison_sociale", ""),
-                "siren": rd.get("siren") or None,
-                "nic": rd.get("nic") or None,
-                "naf_code": rd.get("naf_code") or None,
-                "adresse_complete": rd.get("adresse_complete", ""),
-                "ville": rd.get("ville", ""),
-                "code_postal": rd.get("code_postal", ""),
-                "statut_client": rd.get("statut_client", "INCONNU"),
-                "ca_potentiel": rd.get("ca_potentiel"),
-                "date_creation_fiche": rd.get("date_creation_fiche"),
-                "is_current": True,
-                "valid_from": now.isoformat(),
-                "valid_to": None,
-                "_source_raw_id": rd.get("_source_raw_id", ""),
-                "_loaded_at": now.isoformat(),
-            })
-
-        changed_ids = {int(r["tie_id"]) for r in new_records}
-        unchanged = [r for pid, r in current_by_id.items()
-                     if pid not in changed_ids]
-        all_records = historical + closed_records + unchanged + new_records
+        new_records, closed_records, unchanged_current = _apply_scd2(staging, existing, now)
+        all_records = historical + closed_records + unchanged_current + new_records
         stats.rows_transformed = len(new_records)
-        stats.extra = {"records_written": len(
-            all_records), "closed": len(closed_records)}
+        stats.extra = {"records_written": len(all_records), "closed": len(closed_records)}
 
         if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
             logger.info(

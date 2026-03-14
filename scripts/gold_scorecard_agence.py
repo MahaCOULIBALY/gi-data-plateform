@@ -18,6 +18,7 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 import sys
 import logging
 from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+from gold_helpers import cte_montants_factures, cte_heures_par_contrat
 
 
 def build_scorecard_query(cfg: Config) -> str:
@@ -26,14 +27,7 @@ def build_scorecard_query(cfg: Config) -> str:
     WITH factures AS (
         SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
     ),
-    lignes AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/lignes_factures/**/*.parquet', hive_partitioning=true)
-    ),
-    -- B-02: reconstituer montant HT depuis lignes factures
-    montants AS (
-        SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht_calc
-        FROM lignes GROUP BY fac_num
-    ),
+    {cte_montants_factures(silver)},
     missions AS (
         SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
     ),
@@ -80,24 +74,30 @@ def build_scorecard_query(cfg: Config) -> str:
         SELECT
             m.rgpcnt_id::INT AS agence_id,
             DATE_TRUNC('month', TRY_CAST(m.date_debut AS DATE)) AS mois,
-            COALESCE(SUM(h.h_fact * c.taux_horaire_fact::DECIMAL(10,4)), 0) AS ca_missions,
-            COALESCE(SUM(h.h_paye * c.taux_horaire_paye::DECIMAL(10,4)), 0) AS cout_missions
+            COALESCE(SUM(hc.h_paye * c.taux_horaire_paye::DECIMAL(10,4)), 0) AS cout_missions,
+            COALESCE(SUM(hc.h_fact * c.taux_horaire_fact::DECIMAL(10,4)), 0) AS ca_missions
         FROM missions m
         LEFT JOIN contrats c ON c.per_id=m.per_id AND c.cnt_id=m.cnt_id
-        LEFT JOIN releves r ON r.per_id=m.per_id AND r.cnt_id=m.cnt_id
-        LEFT JOIN heures h ON h.prh_bts=r.prh_bts
+        -- DT-09: pré-agréger heures par (per_id, cnt_id) pour éviter doublons de relevés
+        LEFT JOIN (
+            SELECT r.per_id, r.cnt_id,
+                   SUM(h.h_paye) AS h_paye, SUM(h.h_fact) AS h_fact
+            FROM releves r
+            LEFT JOIN heures h ON h.prh_bts = r.prh_bts
+            GROUP BY r.per_id, r.cnt_id
+        ) hc ON hc.per_id = m.per_id AND hc.cnt_id = m.cnt_id
         WHERE m.date_debut IS NOT NULL
         GROUP BY 1, 2
     ),
     base_transfo AS (
         SELECT
             cmd.rgpcnt_id::INT AS agence_id,
-            DATE_TRUNC('month', TRY_CAST(cmd.cmd_date AS DATE)) AS mois,
+            DATE_TRUNC('month', TRY_CAST(cmd.cmd_dte AS DATE)) AS mois,
             COUNT(*) AS nb_commandes,
-            -- statut NULL (absent DDL) → TODO: trouver alternative
+            -- statut NULL (absent DDL WTCMD) → taux_transformation sera NULL, documenté
             COUNT(CASE WHEN cmd.statut IN ('P','C') THEN 1 END) AS nb_pourvues
         FROM commandes cmd
-        WHERE cmd.cmd_date IS NOT NULL
+        WHERE cmd.cmd_dte IS NOT NULL
         GROUP BY 1, 2
     )
     SELECT

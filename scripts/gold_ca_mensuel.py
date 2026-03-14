@@ -20,6 +20,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+from gold_helpers import cte_montants_factures
 
 PYRAMID_VALIDATION_FILE = Path("data/validation/pyramid_ca_mensuel.csv")
 TOLERANCE_PCT = 0.5
@@ -35,22 +36,13 @@ def build_ca_mensuel_query(cfg: Config) -> str:
     WITH factures AS (
         SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
     ),
-    lignes AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/lignes_factures/**/*.parquet', hive_partitioning=true)
-    ),
-    -- B-02 fix: reconstituer montant HT depuis lignes factures
-    montants AS (
+    {cte_montants_factures(silver)},
+    -- nb_missions_facturees via WTFACINFO (fac_num ↔ per_id) — évite JOIN missions × factures
+    facinfo AS (
         SELECT fac_num,
-               COALESCE(SUM(lfac_base * lfac_taux), 0)  AS montant_ht_calc,
-               COALESCE(SUM(lfac_mnt), 0)                AS montant_mnt_total
-        FROM lignes
+               COUNT(DISTINCT per_id::INT || '|' || cnt_id::INT) AS nb_missions_fac
+        FROM read_parquet('{silver}/slv_missions/facinfo/**/*.parquet', hive_partitioning=true)
         GROUP BY fac_num
-    ),
-    heures AS (
-        SELECT * FROM read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true)
-    ),
-    missions AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
     ),
     dim_clients AS (
         SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
@@ -63,16 +55,13 @@ def build_ca_mensuel_query(cfg: Config) -> str:
             DATE_TRUNC('month', TRY_CAST(f.date_facture AS DATE)) AS mois,
             f.type_facture                                        AS type_facture,
             -- B-02: utiliser montant reconstitué depuis lignes
-            COALESCE(mt.montant_mnt_total, 0)::DECIMAL(18,2)     AS montant_ht,
+            COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2)     AS montant_ht,
             f.efac_num,
             f.rgpcnt_id::INT                                      AS rgpcnt_id,
-            h.base_fact::DECIMAL(10,2)                            AS base_fact,
-            m.per_id::VARCHAR || '|' || m.cnt_id::VARCHAR         AS mission_key
+            COALESCE(fi.nb_missions_fac, 0)                       AS nb_missions_fac
         FROM factures f
-        -- B-02: JOIN lignes factures pour reconstituer montant HT
         LEFT JOIN montants mt ON mt.fac_num = f.efac_num
-        LEFT JOIN heures h ON h.fac_num = f.efac_num
-        LEFT JOIN missions m ON m.tie_id = f.tie_id
+        LEFT JOIN facinfo fi ON fi.fac_num = f.efac_num
         LEFT JOIN dim_clients c ON c.tie_id = f.tie_id::INT
         WHERE f.date_facture IS NOT NULL
     )
@@ -85,13 +74,9 @@ def build_ca_mensuel_query(cfg: Config) -> str:
         COALESCE(SUM(CASE WHEN type_facture = 'F' THEN montant_ht ELSE 0 END), 0)
         - COALESCE(SUM(CASE WHEN type_facture = 'A' THEN montant_ht ELSE 0 END), 0)   AS ca_net_ht,
         COUNT(DISTINCT CASE WHEN type_facture = 'F' THEN efac_num END)                 AS nb_factures,
-        COUNT(DISTINCT mission_key)                                                     AS nb_missions_facturees,
-        COALESCE(SUM(base_fact), 0)                                                    AS nb_heures_facturees,
-        CASE WHEN SUM(base_fact) > 0
-            THEN ROUND((SUM(CASE WHEN type_facture='F' THEN montant_ht ELSE 0 END)
-                  - SUM(CASE WHEN type_facture='A' THEN montant_ht ELSE 0 END))
-                  / SUM(base_fact), 2)
-            ELSE NULL END                                                              AS taux_moyen_fact,
+        COALESCE(SUM(nb_missions_fac), 0)                                               AS nb_missions_facturees,
+        NULL::DECIMAL(10,2)                                                             AS nb_heures_facturees,
+        NULL::DECIMAL(10,2)                                                             AS taux_moyen_fact,
         MODE(rgpcnt_id)                                                                AS agence_principale
     FROM base
     WHERE mois IS NOT NULL

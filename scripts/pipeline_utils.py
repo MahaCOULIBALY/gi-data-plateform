@@ -179,6 +179,6 @@ def with_retry(
                     if attempt < max_attempts:
                         time.sleep(delay)
                         delay *= backoff
-            raise last_exc  # type: ignore[misc]
+            raise last_exc  # type: ignore[misc]  # contexte original préservé (dernier except)
         return wrapper  # type: ignore[return-value]
     return decorator

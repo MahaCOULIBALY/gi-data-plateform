@@ -26,11 +26,17 @@ def build_activite_query(cfg: Config) -> str:
     WITH missions AS (
         SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
     ),
-    heures AS (
-        SELECT * FROM read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true)
-    ),
-    releves AS (
-        SELECT * FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet', hive_partitioning=true)
+    -- DT-09: pré-agréger heures par (per_id, cnt_id) avant JOIN pour éviter doublons de relevés
+    heures_par_contrat AS (
+        SELECT r.per_id, r.cnt_id,
+               SUM(h.base_paye::DECIMAL(10,2)) AS base_paye,
+               SUM(h.base_fact::DECIMAL(10,2)) AS base_fact,
+               MAX(h.taux_fact::DECIMAL(10,4)) AS taux_fact
+        FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet', hive_partitioning=true) r
+        LEFT JOIN read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true) h
+            ON h.prh_bts = r.prh_bts
+        WHERE r.per_id IS NOT NULL AND r.cnt_id IS NOT NULL
+        GROUP BY r.per_id, r.cnt_id
     ),
     dim_int AS (
         SELECT * FROM read_parquet('{silver}/slv_interimaires/dim_interimaires/**/*.parquet', hive_partitioning=true)
@@ -48,12 +54,11 @@ def build_activite_query(cfg: Config) -> str:
             m.cnt_id::INT AS cnt_id,
             m.tie_id::INT AS tie_id,
             m.rgpcnt_id::INT AS rgpcnt_id,
-            h.base_paye::DECIMAL(10,2)                           AS base_paye,
-            h.base_fact::DECIMAL(10,2)                           AS base_fact,
-            h.taux_fact::DECIMAL(10,4)                           AS taux_fact
+            hc.base_paye,
+            hc.base_fact,
+            hc.taux_fact
         FROM missions m
-        LEFT JOIN releves r ON r.per_id = m.per_id AND r.cnt_id = m.cnt_id
-        LEFT JOIN heures h ON h.prh_bts = r.prh_bts
+        LEFT JOIN heures_par_contrat hc ON hc.per_id = m.per_id AND hc.cnt_id = m.cnt_id
         LEFT JOIN dim_int di ON di.per_id = m.per_id::INT
         WHERE m.per_id IS NOT NULL AND m.date_debut IS NOT NULL
     )

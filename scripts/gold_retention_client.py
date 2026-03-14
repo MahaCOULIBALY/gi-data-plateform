@@ -16,6 +16,7 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 import sys
 import logging
 from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+from gold_helpers import cte_montants_factures, cte_heures_par_contrat, cte_missions_distinct
 
 
 def build_retention_query(cfg: Config) -> str:
@@ -25,13 +26,7 @@ def build_retention_query(cfg: Config) -> str:
     WITH factures AS (
         SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
     ),
-    lignes AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/lignes_factures/**/*.parquet', hive_partitioning=true)
-    ),
-    montants AS (
-        SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht_calc
-        FROM lignes GROUP BY fac_num
-    ),
+    {cte_montants_factures(silver)},
     missions AS (
         SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
     ),
@@ -46,13 +41,15 @@ def build_retention_query(cfg: Config) -> str:
             DATE_TRUNC('quarter', TRY_CAST(f.date_facture AS DATE)) AS trimestre,
             SUM(CASE WHEN f.type_facture='F' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END)
             - SUM(CASE WHEN f.type_facture='A' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END) AS ca_net,
-            COUNT(DISTINCT m.per_id||'|'||m.cnt_id) AS nb_missions,
+            COUNT(DISTINCT m.per_id::VARCHAR||'|'||m.cnt_id::VARCHAR) AS nb_missions,
             COUNT(DISTINCT f.efac_num) AS nb_factures,
             MAX(TRY_CAST(f.date_facture AS DATE)) AS derniere_facture
         FROM factures f
         LEFT JOIN montants mt ON mt.fac_num = f.efac_num
         LEFT JOIN dim_clients c ON c.tie_id = f.tie_id::INT
-        LEFT JOIN missions m ON m.tie_id = f.tie_id AND m.rgpcnt_id = f.rgpcnt_id
+        -- jointure missions sans cnt_id pour compter les missions uniques du client (pas de doublons heures ici)
+        LEFT JOIN (SELECT DISTINCT per_id, cnt_id, tie_id, rgpcnt_id FROM missions) m
+            ON m.tie_id = f.tie_id AND m.rgpcnt_id = f.rgpcnt_id
         WHERE f.date_facture IS NOT NULL
         GROUP BY 1, 2, 3
     ),
@@ -110,29 +107,15 @@ def build_rentabilite_query(cfg: Config) -> str:
     WITH factures AS (
         SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
     ),
-    lignes AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/lignes_factures/**/*.parquet', hive_partitioning=true)
-    ),
-    montants AS (
-        SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht_calc
-        FROM lignes GROUP BY fac_num
-    ),
+    {cte_montants_factures(silver)},
     missions AS (
         SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
     ),
     contrats AS (
         SELECT * FROM read_parquet('{silver}/slv_missions/contrats/**/*.parquet', hive_partitioning=true)
     ),
-    releves AS (
-        SELECT * FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet', hive_partitioning=true)
-    ),
-    heures AS (
-        SELECT prh_bts,
-               SUM(base_paye::DECIMAL(10,2)) AS h_paye,
-               SUM(base_fact::DECIMAL(10,2)) AS h_fact
-        FROM read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true)
-        GROUP BY prh_bts
-    ),
+    -- DT-09: heures pré-agrégées par (per_id, cnt_id) pour éviter doublons sur multi-relevés
+    {cte_heures_par_contrat(silver)},
     dim_clients AS (
         SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
         WHERE is_current = true
@@ -144,16 +127,16 @@ def build_rentabilite_query(cfg: Config) -> str:
             EXTRACT(YEAR FROM TRY_CAST(f.date_facture AS DATE))::INT AS annee,
             SUM(CASE WHEN f.type_facture='F' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END)
             - SUM(CASE WHEN f.type_facture='A' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END) AS ca_net,
-            COALESCE(SUM(h.h_fact * c.taux_horaire_fact::DECIMAL(10,4)), 0) AS ca_missions,
-            COALESCE(SUM(h.h_paye * c.taux_horaire_paye::DECIMAL(10,4)), 0) AS cout_paye,
+            COALESCE(SUM(hc.h_fact * c.taux_horaire_fact::DECIMAL(10,4)), 0) AS ca_missions,
+            COALESCE(SUM(hc.h_paye * c.taux_horaire_paye::DECIMAL(10,4)), 0) AS cout_paye,
             COUNT(DISTINCT m.per_id) AS nb_interimaires,
             SUM(CASE WHEN f.type_facture='F' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END) * 0.05 AS cout_gestion_estime
         FROM factures f
         LEFT JOIN montants mt ON mt.fac_num = f.efac_num
-        LEFT JOIN missions m ON m.tie_id = f.tie_id AND m.rgpcnt_id = f.rgpcnt_id
+        LEFT JOIN (SELECT DISTINCT per_id, cnt_id, tie_id, rgpcnt_id FROM missions) m
+            ON m.tie_id = f.tie_id AND m.rgpcnt_id = f.rgpcnt_id
         LEFT JOIN contrats c ON c.per_id = m.per_id AND c.cnt_id = m.cnt_id
-        LEFT JOIN releves r ON r.per_id = m.per_id AND r.cnt_id = m.cnt_id
-        LEFT JOIN heures h ON h.prh_bts = r.prh_bts
+        LEFT JOIN heures_par_contrat hc ON hc.per_id = m.per_id AND hc.cnt_id = m.cnt_id
         LEFT JOIN dim_clients dc ON dc.tie_id = f.tie_id::INT
         WHERE f.date_facture IS NOT NULL
         GROUP BY 1, 2, 3
