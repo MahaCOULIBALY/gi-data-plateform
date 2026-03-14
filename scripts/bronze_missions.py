@@ -12,6 +12,9 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 #                allow_null_delta=True → contrats actifs (CNT_DATEFIN IS NULL) toujours capturés
 #                Colonnes Gold : PER_ID,CNT_ID,ETA_ID,RGPCNT_ID,CNT_DATEDEB/FIN/FINPREVU,
 #                LOTPAYE_CODE,TYPCOT_CODE,CNT_AVT_ORDRE,CNT_INI_ORDRE
+# WTLFAC (2026-03-14) : 26M lignes, pas de delta col propre.
+#   Filtré via JOIN WTEFAC ON FAC_NUM → EFAC_DTEEDI >= 2024-01-01 (horizon fixe, non avançant).
+#   Limitation : lignes WTLFAC liées à des factures pré-2024 non capturées.
 """
 import json
 import time
@@ -35,6 +38,8 @@ FALLBACK_SINCE = datetime(2023, 1, 1, tzinfo=timezone.utc)
 # Évolution prévue : delta via WTPRH.PRH_MODIFDATE (relation PRH_BTS FK).
 FALLBACK_SINCE_OVERRIDE: dict[str, datetime] = {
     "WTRHDON": datetime(2024, 1, 1, tzinfo=timezone.utc),
+    # WTLFAC : 26M lignes, filtre via JOIN WTEFAC.EFAC_DTEEDI — horizon fixe (non avançant).
+    "WTLFAC": datetime(2024, 1, 1, tzinfo=timezone.utc),
 }
 
 # Tables avec colonne delta confirmée DDL
@@ -123,12 +128,32 @@ def _extract_full(conn: pyodbc.Connection, tc: TableConfig) -> list[dict]:
         return [dict(zip(h, row)) for row in cur.fetchall()]
 
 
+def _extract_wtlfac_filtered(conn: pyodbc.Connection, since: datetime) -> list[dict]:
+    """WTLFAC n'a pas de colonne date propre.
+    Filtre via JOIN WTEFAC sur FAC_NUM → EFAC_DTEEDI >= since.
+    Horizon fixe : FALLBACK_SINCE_OVERRIDE["WTLFAC"] = 2024-01-01 (non avançant).
+    """
+    since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {_COLS['WTLFAC']} FROM WTLFAC l "
+            f"INNER JOIN WTEFAC e ON l.FAC_NUM = e.EFAC_NUM "
+            f"WHERE e.EFAC_DTEEDI >= %s",
+            since_str,
+        )
+        h = [d[0] for d in cur.description]
+        return [dict(zip(h, row)) for row in cur.fetchall()]
+
+
 @with_retry(max_attempts=3, base_delay=2.0, backoff=2.0)
 def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
-            batch_id: str, since: datetime | None, stats: Stats) -> int:
-    """Extrait, enrichit et charge une table vers S3 Bronze. Retourne le nombre de lignes ingérées."""
+            batch_id: str, since: datetime | None, stats: Stats,
+            rows: list[dict] | None = None) -> int:
+    """Extrait, enrichit et charge une table vers S3 Bronze. Retourne le nombre de lignes ingérées.
+    Si rows est fourni, l'extraction est ignorée (cas WTLFAC filtrée par JOIN externe).
+    """
     t0 = time.monotonic()
-    rows = _extract_delta(conn, tc, since) if since else _extract_full(conn, tc)
+    rows = rows if rows is not None else (_extract_delta(conn, tc, since) if since else _extract_full(conn, tc))
     if not rows:
         logger.info(json.dumps({"table": tc.name, "rows": 0, "status": "empty"}))
         return 0
@@ -182,6 +207,32 @@ def run(cfg: Config) -> dict:
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
             for tc in filter_tables(TABLES_FULL, cfg):
+                if tc.name == "WTLFAC":
+                    since = FALLBACK_SINCE_OVERRIDE["WTLFAC"]
+                    if cfg.mode == RunMode.PROBE:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT COUNT(*) FROM WTLFAC l "
+                                "INNER JOIN WTEFAC e ON l.FAC_NUM = e.EFAC_NUM "
+                                "WHERE e.EFAC_DTEEDI >= %s",
+                                since.strftime("%Y-%m-%d %H:%M:%S"),
+                            )
+                            row = cur.fetchone()
+                            logger.info(json.dumps({"mode": "probe", "table": tc.name,
+                                                    "count": row[0] if row else 0,
+                                                    "load": "filtered_full",
+                                                    "since": since.date().isoformat()}))
+                        stats.tables_processed += 1
+                        continue
+                    try:
+                        rows = _extract_wtlfac_filtered(conn, since)
+                        n = _ingest(cfg, conn, tc, batch_id, None, stats, rows=rows) or 0
+                        wm.set(tc.name, datetime.now(timezone.utc), n)
+                    except Exception as e:
+                        logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                        wm.mark_failed(tc.name, str(e))
+                        stats.errors.append({"table": tc.name, "error": str(e)})
+                    continue
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
                         cur.execute(f"SELECT COUNT(*) FROM {tc.name}")

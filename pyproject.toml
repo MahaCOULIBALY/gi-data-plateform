@@ -21,6 +21,7 @@ dependencies = [
     # API OVHcloud (monitoring, gestion ressources)
     "ovh>=1.0.0",
     "httpfs>=0.0.1",
+    "pymssql>=2.3.13",
 ]
 
 [project.optional-dependencies]
