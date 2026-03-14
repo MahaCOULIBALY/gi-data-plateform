@@ -154,8 +154,8 @@ _TABLES: list[_Table] = [
                 CAST(RGPCNT_ID      AS INTEGER)     AS rgpcnt_id,
                 CAST(CMD_DTE        AS DATE)        AS cmd_date,
                 CAST(CMD_NBSALS     AS INTEGER)     AS nb_sal,
-                TRIM(COALESCE(STAT_CODE, ''))       AS stat_code,
-                TRIM(COALESCE(STAT_TYPE, ''))       AS stat_type,
+                TRIM(COALESCE(STAT_CODE::VARCHAR, ''))       AS stat_code,
+                TRIM(COALESCE(STAT_TYPE::VARCHAR, ''))       AS stat_type,
                 _batch_id,
                 CAST(_loaded_at     AS TIMESTAMP)   AS _loaded_at
             FROM src

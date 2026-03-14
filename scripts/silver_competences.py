@@ -69,7 +69,7 @@ def build_competences_query(cfg: Config) -> str:
             FROM read_json_auto('{b}/raw_wtphab/**/*.json', union_by_name=true, hive_partitioning=false) h
             LEFT JOIN read_json_auto('{b}/raw_wtthab/**/*.json', union_by_name=true, hive_partitioning=false) r
                 ON r.THAB_ID = h.THAB_ID
-        )
+        ) h
     ),
     diplomes AS (
         SELECT
@@ -126,21 +126,26 @@ def build_competences_query(cfg: Config) -> str:
 def run(cfg: Config) -> dict:
     stats = Stats()
     silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/competences"
-
-    with get_duckdb_connection(cfg) as ddb:
-        q = build_competences_query(cfg)
-        if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-            count = ddb.execute(f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
-            logger.info(json.dumps(
-                {"mode": cfg.mode.value, "table": "competences", "rows": count}))
-            stats.rows_transformed = count
-        else:
-            ddb.execute(
-                f"COPY ({q}) TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
-            count = ddb.execute(f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
-            stats.rows_transformed = count
-            logger.info(json.dumps({"table": "competences", "rows": count}))
-
+    try:
+        with get_duckdb_connection(cfg) as ddb:
+            q = build_competences_query(cfg)
+            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+                count = ddb.execute(
+                    f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
+                logger.info(json.dumps(
+                    {"mode": cfg.mode.value, "table": "competences", "rows": count}))
+                stats.rows_transformed = count
+            else:
+                ddb.execute(
+                    f"COPY ({q}) TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+                count = ddb.execute(
+                    f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
+                stats.rows_transformed = count
+                logger.info(json.dumps(
+                    {"table": "competences", "rows": count}))
+    except Exception as e:
+        logger.exception(json.dumps({"table": "competences", "error": str(e)}))
+        stats.errors.append({"table": "competences", "error": str(e)})
     stats.tables_processed = 1
     return stats.finish()
 
