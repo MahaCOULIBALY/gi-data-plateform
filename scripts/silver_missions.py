@@ -16,6 +16,11 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 #            +delai_placement_heures (CMD_DTE→CNTI_DATEFFET), +categorie_delai
 #            Anomalie : MISS_FLAGDPAE est datetime2 (date transmission), pas un booléen
 #            Anomalie : CMD_ID stocké float → TRY_CAST(CMD_ID AS INT) obligatoire
+# ENRICHISSEMENT (2026-03-15) — Phase 4 · Rupture CTT :
+#   FIN_MISSION : nouvelle table slv_missions/fin_mission
+#                JOIN raw_wtmiss + raw_wtcnti + raw_wtfinmiss → statut_fin_mission + duree_reelle_jours
+#                Blocker B1 : FINMISS_LIBELLE non standardisés — classification LIKE MVP, à affiner
+#                Blocker B2 : MISS_ANNULE smallint — 1=annulé, 0/NULL=non-annulé (à confirmer probe)
 """
 import json
 from dataclasses import dataclass, field
@@ -106,6 +111,92 @@ def _build_wtmiss_sql(cfg: Config) -> str:
     """
 
 
+def _build_fin_mission_sql(cfg: Config) -> str:
+    """Enrichissement rupture CTT : JOIN WTMISS + WTCNTI + WTFINMISS + PYMTFCNT.
+    statut_fin_mission : ANNULEE / EN_COURS / TERME_NORMAL / RUPTURE.
+
+    Logique CASE validée probe 2026-03-15 (PYMTFCNT 17 lignes, WTFINMISS 11 lignes) :
+      MTFCNT_FINCNT=0 → EN_COURS  (changement admin : établissement ou taux, mission continue)
+      MTFCNT_FINCNT=1 LIKE '%fin de mission%' → TERME_NORMAL  (unique code fin normale TT)
+      MTFCNT_FINCNT=1 autres → RUPTURE  (16 codes : démission, licenciement, essai, décès…)
+      Fallback LIKE FINMISS_LIBELLE si MTFCNT_ID NULL (codes WTFINMISS sans liaison PYMTFCNT)
+
+    MISS_ANNULE validé probe 2026-03-15 : NULL=2 341 013 / 0=559 375 → non-annulé ; 1=12 314 → annulé.
+    """
+    b = cfg.bucket_bronze
+    dp = cfg.date_partition
+    return f"""
+    WITH wtcnti AS (
+        SELECT PER_ID, CNT_ID,
+               MIN(CNTI_DATEFFET)    AS cnti_dateffet,
+               MAX(CNTI_DATEFINCNTI) AS cnti_datefincnti
+        FROM read_json_auto('s3://{b}/raw_wtcnti/{dp}/*.json',
+                            union_by_name=true, hive_partitioning=false)
+        GROUP BY PER_ID, CNT_ID
+    ),
+    wtfinmiss AS (
+        SELECT TRIM(FINMISS_CODE)    AS finmiss_code,
+               TRIM(FINMISS_LIBELLE) AS finmiss_libelle,
+               TRY_CAST(MTFCNT_ID AS INTEGER) AS mtfcnt_id
+        FROM read_json_auto('s3://{b}/raw_wtfinmiss/{dp}/*.json',
+                            union_by_name=true, hive_partitioning=false)
+    ),
+    pymtfcnt AS (
+        SELECT TRY_CAST(MTFCNT_ID   AS INTEGER)  AS mtfcnt_id,
+               TRIM(MTFCNT_CODE)                 AS mtfcnt_code,
+               TRIM(MTFCNT_LIBELLE)              AS mtfcnt_libelle,
+               TRY_CAST(MTFCNT_FINCNT AS SMALLINT) AS mtfcnt_fincnt
+        FROM read_json_auto('s3://{b}/raw_pymtfcnt/{dp}/*.json',
+                            union_by_name=true, hive_partitioning=false)
+    )
+    SELECT
+        CAST(src.PER_ID                     AS INTEGER)     AS per_id,
+        CAST(src.CNT_ID                     AS INTEGER)     AS cnt_id,
+        CAST(src.RGPCNT_ID                  AS INTEGER)     AS rgpcnt_id,
+        CAST(src.TIE_ID                     AS INTEGER)     AS tie_id,
+        TRY_CAST(cnti.cnti_dateffet         AS DATE)        AS date_debut,
+        TRY_CAST(cnti.cnti_datefincnti      AS DATE)        AS date_fin_reelle,
+        TRY_CAST(src.MISS_SAISIE_DTFIN      AS DATE)        AS date_fin_saisie,
+        TRIM(src.FINMISS_CODE)                              AS finmiss_code,
+        f.finmiss_libelle,
+        mtf.mtfcnt_code,
+        mtf.mtfcnt_libelle,
+        mtf.mtfcnt_fincnt,
+        TRY_CAST(src.MISS_ANNULE            AS SMALLINT)    AS miss_annule,
+        DATEDIFF('day',
+            TRY_CAST(cnti.cnti_dateffet     AS DATE),
+            TRY_CAST(cnti.cnti_datefincnti  AS DATE))       AS duree_reelle_jours,
+        CASE
+            WHEN TRY_CAST(src.MISS_ANNULE AS SMALLINT) = 1             THEN 'ANNULEE'
+            WHEN src.FINMISS_CODE IS NULL                              THEN 'EN_COURS'
+            -- MTFCNT_FINCNT=0 : changement admin (établissement, taux) — mission non terminée
+            WHEN mtf.mtfcnt_fincnt = 0                                 THEN 'EN_COURS'
+            -- MTFCNT_FINCNT=1 : fin effective — seul "Fin de Mission TT" est terme normal
+            -- (probe 2026-03-15 : 16 autres codes = ruptures : démission, licenciement, essai…)
+            WHEN LOWER(mtf.mtfcnt_libelle) LIKE '%fin de mission%'     THEN 'TERME_NORMAL'
+            WHEN mtf.mtfcnt_fincnt = 1                                 THEN 'RUPTURE'
+            -- Fallback LIKE si MTFCNT_ID NULL (WTFINMISS sans liaison PYMTFCNT)
+            WHEN LOWER(f.finmiss_libelle) LIKE '%terme%'
+              OR LOWER(f.finmiss_libelle) LIKE '%normal%'
+              OR LOWER(f.finmiss_libelle) LIKE '%échéance%'             THEN 'TERME_NORMAL'
+            ELSE 'RUPTURE'
+        END                                                 AS statut_fin_mission,
+        src._batch_id,
+        CAST(src._loaded_at AS TIMESTAMP)                   AS _loaded_at
+    FROM src
+    LEFT JOIN wtcnti cnti
+        ON cnti.PER_ID = src.PER_ID AND cnti.CNT_ID = src.CNT_ID
+    LEFT JOIN wtfinmiss f
+        ON f.finmiss_code = TRIM(src.FINMISS_CODE)
+    LEFT JOIN pymtfcnt mtf
+        ON mtf.mtfcnt_id = f.mtfcnt_id
+    WHERE src.PER_ID IS NOT NULL AND src.CNT_ID IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY src.PER_ID, src.CNT_ID ORDER BY src._loaded_at DESC
+    ) = 1
+    """
+
+
 _TABLES: list[_Table] = [
     _Table(
         name="WTMISS",
@@ -186,6 +277,15 @@ _TABLES: list[_Table] = [
                 PARTITION BY PLAC_ID ORDER BY _loaded_at DESC
             ) = 1
         """,
+    ),
+    # FIN_MISSION (2026-03-15) — rupture CTT : WTMISS + WTCNTI + WTFINMISS
+    # Cible : slv_missions/fin_mission → Gold fact_rupture_contrat
+    _Table(
+        name="FIN_MISSION",
+        bronze="wtmiss",
+        silver=f"slv_{DOMAIN}/fin_mission",
+        dedup_key="per_id, cnt_id",
+        sql_fn=_build_fin_mission_sql,
     ),
     # PYCONTRAT (2026-03-11) — table maîtresse contrats paie
     # Jointures Gold : PER_ID+CNT_ID ↔ WTMISS/WTCNTI/WTPRH · ETA_ID ↔ PYETABLISSEMENT

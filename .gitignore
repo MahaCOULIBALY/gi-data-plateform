@@ -13,6 +13,7 @@ terraform.tfvars          # Contient les vraies valeurs — utiliser .example
 .terraform/
 .terraform.lock.hcl
 
+
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -118,3 +119,4 @@ $RECYCLE.BIN/
 System Volume Information/
 # ─── Claude Code (état session, non versionnable) ───
 .claude/
+CLAUDE.md

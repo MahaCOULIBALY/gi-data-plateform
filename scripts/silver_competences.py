@@ -22,7 +22,7 @@ def build_competences_query(cfg: Config) -> str:
     WITH metiers AS (
         SELECT
             MD5(CONCAT(PER_ID::VARCHAR, '|METIER|',
-                COALESCE(MET_ID::VARCHAR, PMET_ORDRE::VARCHAR))) AS competence_id,
+                COALESCE(r.MET_ID::VARCHAR, PMET_ORDRE::VARCHAR))) AS competence_id,
             PER_ID::INT AS per_id,
             'METIER' AS type_competence,
             COALESCE(m.MET_ID::VARCHAR, '') AS code,
@@ -46,7 +46,7 @@ def build_competences_query(cfg: Config) -> str:
             PER_ID::INT AS per_id,
             'HABILITATION' AS type_competence,
             COALESCE(THAB_ID::VARCHAR, '') AS code,
-            COALESCE(TRIM(r.THAB_LIBELLE), 'Habilitation inconnue') AS libelle,
+            COALESCE(TRIM(h.THAB_LIBELLE), 'Habilitation inconnue') AS libelle,
             '' AS niveau,
             TRY_CAST(h.PHAB_DELIVR AS DATE) AS date_obtention,
             exp AS date_expiration,
@@ -63,7 +63,7 @@ def build_competences_query(cfg: Config) -> str:
                     CASE WHEN TRY_CAST(r.THAB_NBMOIS AS INT) IS NOT NULL
                               AND TRY_CAST(h.PHAB_DELIVR AS DATE) IS NOT NULL
                          THEN TRY_CAST(h.PHAB_DELIVR AS DATE)
-                              + MAKE_INTERVAL(months := TRY_CAST(r.THAB_NBMOIS AS INT))
+                              + (TRY_CAST(r.THAB_NBMOIS AS INT) * INTERVAL '1 month')
                          ELSE NULL END
                 ) AS exp
             FROM read_json_auto('{b}/raw_wtphab/**/*.json', union_by_name=true, hive_partitioning=false) h
@@ -73,10 +73,10 @@ def build_competences_query(cfg: Config) -> str:
     ),
     diplomes AS (
         SELECT
-            MD5(CONCAT(PER_ID::VARCHAR, '|DIPLOME|', TDIP_ID::VARCHAR)) AS competence_id,
+            MD5(CONCAT(PER_ID::VARCHAR, '|DIPLOME|', d.TDIP_ID::VARCHAR)) AS competence_id,
             PER_ID::INT AS per_id,
             'DIPLOME' AS type_competence,
-            COALESCE(TDIP_ID::VARCHAR, '') AS code,
+            COALESCE(d.TDIP_ID::VARCHAR, '') AS code,
             COALESCE(TRIM(r.TDIP_LIB), 'Diplôme inconnu') AS libelle,
             -- TDIP_REF = catégorie/niveau diplôme (référentiel)
             NULLIF(TRY_CAST(r.TDIP_REF AS VARCHAR), '') AS niveau,

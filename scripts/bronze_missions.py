@@ -61,6 +61,10 @@ TABLES_FULL: list[TableConfig] = [
     TableConfig("WTLFAC", "", ["FAC_NUM", "LFAC_ORD"]),
     # FACINFO_DATEMODIF absent DDL
     TableConfig("WTFACINFO", "", ["CNT_ID", "FAC_NUM"]),
+    # Référentiel fin de mission (~20 lignes, quasi-statique) — full-load sans impact perf
+    TableConfig("WTFINMISS", "", ["FINMISS_CODE"]),
+    # Référentiel motif fin contrat — FK depuis WTFINMISS.MTFCNT_ID → MTFCNT_FINCNT = flag terme normal
+    TableConfig("PYMTFCNT", "", ["MTFCNT_ID"]),
 ]
 
 _COLS: dict[str, str] = {
@@ -68,7 +72,7 @@ _COLS: dict[str, str] = {
         "PER_ID,CNT_ID,TIE_ID,MISS_TIEID,TIES_SERV,MISS_CODE,MISS_JUSTIFICATION,"
         "MISS_DPAE,MISS_ETRANGER,MISS_QUAL,MISS_PERFERM,RGPCNT_ID,MISS_NDPAE,"
         "CNTI_CREATE,FINMISS_CODE,MISS_SAISIE_DTFIN,MISS_TRANSDATE,MISS_MODIFDATE,"
-        "MISS_FLAGDPAE,MISS_BTP,MISS_TYPCOEF,MISS_LOGIN,CMD_ID"
+        "MISS_FLAGDPAE,MISS_BTP,MISS_TYPCOEF,MISS_LOGIN,CMD_ID,MISS_ANNULE"
     ),
     "WTCNTI": (
         "PER_ID,CNT_ID,CNTI_ORDRE,TIE_ID,MET_ID,CNTI_CREATE,CNTI_DATEFFET,"
@@ -101,6 +105,11 @@ _COLS: dict[str, str] = {
     "WTLFAC": "FAC_NUM,LFAC_ORD,LFAC_LIB,LFAC_BASE,LFAC_TAUX,LFAC_MNT",
     # WTFACINFO : EFAC_NUM et RGPCNT_ID absents DDL — colonnes DDL confirmées seulement
     "WTFACINFO": "CNT_ID,FAC_NUM,PER_ID,TIE_ID",
+    # Référentiel codes fin de mission — MTFCNT_ID ajouté (2026-03-15) : FK → PYMTFCNT.MTFCNT_FINCNT
+    "WTFINMISS": "FINMISS_CODE,FINMISS_LIBELLE,FINMISS_IFM,FINMISS_CP,MTFCNT_ID",
+    # Référentiel motif fin contrat — MTFCNT_FINCNT=1 → terme normal (à confirmer probe)
+    # MTDADS_ID/MTASSEDIC_ID FK vers tables non ingérées — non inclus
+    "PYMTFCNT": "MTFCNT_ID,MTFCNT_CODE,MTFCNT_LIBELLE,MTFCNT_FINCNT,MTFCNT_DADS",
     # PYCONTRAT : table maîtresse contrats paie — colonnes Gold utiles (DDL confirmé 2026-03-11)
     "PYCONTRAT": (
         "PER_ID,CNT_ID,ETA_ID,RGPCNT_ID,CNT_DATEDEB,CNT_DATEFIN,CNT_FINPREVU,"

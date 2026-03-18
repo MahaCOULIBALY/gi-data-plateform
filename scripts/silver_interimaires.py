@@ -8,6 +8,9 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 #   SAL_DATESORTIE absent DDL → NULL::DATE
 """
 import hashlib
+import json
+import os
+import tempfile
 from datetime import datetime, timezone
 
 from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, pseudonymize_nir, logger, s3_bronze
@@ -79,7 +82,7 @@ def run(cfg: Config) -> dict:
         existing: list[dict] = []
         try:
             res2 = ddb.execute(
-                f"SELECT * FROM read_parquet('{silver_path}/**/*.parquet')")
+                f"SELECT * FROM read_parquet('{silver_path}/*.parquet')")
             cols2 = [d[0] for d in res2.description]
             existing = [dict(zip(cols2, row)) for row in res2.fetchall()]
         except Exception:
@@ -142,11 +145,16 @@ def run(cfg: Config) -> dict:
             logger.info(
                 f"[{cfg.mode.value}] Would write {len(all_records)} rows to {silver_path}")
         elif all_records:
-            ddb.execute(
-                "CREATE OR REPLACE TABLE _scd2 AS SELECT * FROM ?", [all_records])
-            ddb.execute(
-                f"COPY _scd2 TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
-            ddb.execute("DROP TABLE _scd2")
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+                for r in all_records:
+                    f.write(json.dumps(r, default=str) + "\n")
+                tmp = f.name
+            try:
+                ddb.execute(
+                    f"COPY (SELECT * FROM read_json_auto('{tmp}', union_by_name=true)) "
+                    f"TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+            finally:
+                os.unlink(tmp)
 
     return stats.finish()
 

@@ -60,10 +60,8 @@ def process_sites_mission(ddb, cfg: Config, stats: Stats) -> int:
         logger.info(json.dumps({"mode": cfg.mode.value,
                     "table": "sites_mission", "rows": count}))
         return count
-    ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
     count = ddb.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{silver}/**/*.parquet')").fetchone()[0]
+        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)").fetchone()[0]
     logger.info(json.dumps({"table": "sites_mission", "rows": count}))
     return count
 
@@ -94,10 +92,8 @@ def process_contacts(ddb, cfg: Config, stats: Stats) -> int:
         logger.info(json.dumps({"mode": cfg.mode.value,
                     "table": "contacts", "rows": count}))
         return count
-    ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
     count = ddb.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{silver}/**/*.parquet')").fetchone()[0]
+        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)").fetchone()[0]
     logger.info(json.dumps({"table": "contacts", "rows": count}))
     return count
 
@@ -109,7 +105,7 @@ def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
     WITH raw AS (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY ENCGRP_ID ORDER BY _loaded_at DESC) AS rn
         FROM read_json_auto('{b}/raw_wtencoursg/{cfg.date_partition}/*.json',
-                            union_by_name=true, hive_partitioning=false)
+                            union_by_name=true, hive_partitioning=false, ignore_errors=true)
     )
     SELECT
         CAST(ENCGRP_ID AS INT)                        AS encours_id,
@@ -117,7 +113,7 @@ def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
         NULL::DECIMAL(18,2)                           AS montant_encours,
         NULL::DECIMAL(18,2)                           AS limite_credit,
         NULL::DATE                                    AS date_decision,
-        TRIM(COALESCE(ENCG_DECISIONLIB, ''))          AS decision_libelle,
+        TRIM(COALESCE(ENCG_DECISIONLIB::VARCHAR, ''))  AS decision_libelle,
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND ENCGRP_ID IS NOT NULL
     """
@@ -126,53 +122,9 @@ def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
         logger.info(json.dumps({"mode": cfg.mode.value,
                     "table": "encours_credit", "rows": count}))
         return count
-    ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
     count = ddb.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{silver}/**/*.parquet')").fetchone()[0]
+        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)").fetchone()[0]
     logger.info(json.dumps({"table": "encours_credit", "rows": count}))
-    return count
-
-
-def process_coefficients(ddb, cfg: Config, stats: Stats) -> int:
-    """Grilles de facturation par qualification, agence, client.
-    WTCOEF : RGPCNT_ID, TIE_ID confirmés bronze_clients v2 (full-load).
-    Clé naturelle = TQUA_ID (renommé depuis TQUA dans bronze_clients v2).
-    """
-    b = f"s3://{cfg.bucket_bronze}"
-    silver = f"s3://{cfg.bucket_silver}/slv_clients/coefficients"
-    # full-load → dédup sur clé naturelle (TQUA_ID, RGPCNT_ID, TIE_ID)
-    query = f"""
-    WITH raw AS (
-        SELECT *,
-               ROW_NUMBER() OVER (
-                   PARTITION BY TQUA_ID, RGPCNT_ID, TIE_ID
-                   ORDER BY _loaded_at DESC
-               ) AS rn
-        FROM read_json_auto('{b}/raw_wtcoef/{cfg.date_partition}/*.json',
-                            union_by_name=true, hive_partitioning=false)
-    )
-    SELECT
-        MD5(CONCAT(TRIM(TQUA_ID::VARCHAR), '|', CAST(RGPCNT_ID AS VARCHAR), '|',
-                   CAST(TIE_ID AS VARCHAR)))          AS coef_id,
-        CAST(RGPCNT_ID AS INT)                        AS rgpcnt_id,
-        CAST(TIE_ID AS INT)                           AS tie_id,
-        TRIM(TQUA_ID::VARCHAR)                        AS qualification_code,
-        TRY_CAST(COEF_VAL AS DECIMAL(10,4))           AS coefficient,
-        TRY_CAST(COEF_DEFF AS DATE)                   AS date_effet,
-        CURRENT_TIMESTAMP                             AS _loaded_at
-    FROM raw WHERE rn = 1 AND TQUA_ID IS NOT NULL AND RGPCNT_ID IS NOT NULL
-    """
-    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
-        logger.info(json.dumps({"mode": cfg.mode.value,
-                    "table": "coefficients", "rows": count}))
-        return count
-    ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
-    count = ddb.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{silver}/**/*.parquet')").fetchone()[0]
-    logger.info(json.dumps({"table": "coefficients", "rows": count}))
     return count
 
 
@@ -182,12 +134,12 @@ def run(cfg: Config) -> dict:
         stats.extra["sites_mission"] = process_sites_mission(ddb, cfg, stats)
         stats.extra["contacts"] = process_contacts(ddb, cfg, stats)
         stats.extra["encours_credit"] = process_encours_credit(ddb, cfg, stats)
-        try:
-            stats.extra["coefficients"] = process_coefficients(ddb, cfg, stats)
-        except Exception as e:
-            # WTCOEF vide en source → bronze n'écrit aucun fichier S3 → 0 coefficients
-            logger.warning(json.dumps({"warning": "coefficients skipped", "error": str(e)}))
-            stats.extra["coefficients"] = 0
+        # try:
+        #     stats.extra["coefficients"] = process_coefficients(ddb, cfg, stats)
+        # except Exception as e:
+        #     # WTCOEF vide en source → bronze n'écrit aucun fichier S3 → 0 coefficients
+        #     logger.warning(json.dumps({"warning": "coefficients skipped", "error": str(e)}))
+        #     stats.extra["coefficients"] = 0
         stats.tables_processed = 4
         stats.rows_transformed = sum(stats.extra.values())
     return stats.finish()
