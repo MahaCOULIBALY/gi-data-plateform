@@ -144,14 +144,13 @@ _UPSERT_BATCH_SIZE = 500
 
 
 def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
-    """Enregistre les vues Silver S3 + injecte fact_ca_mensuel_client depuis PostgreSQL (évite Gold→Gold)."""
-    b = cfg.bucket_silver
+    """Enregistre les vues Silver Iceberg + injecte fact_ca_mensuel_client depuis PostgreSQL (évite Gold→Gold)."""
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_clients AS SELECT * FROM read_parquet('s3://{b}/slv_clients/dim_clients/**/*.parquet')")
+        f"CREATE OR REPLACE VIEW silver_clients AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('clients', 'dim_clients')}')")
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_sites   AS SELECT * FROM read_parquet('s3://{b}/slv_clients/sites_mission/**/*.parquet')")
+        f"CREATE OR REPLACE VIEW silver_sites   AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('clients', 'sites_mission')}')")
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_enc     AS SELECT * FROM read_parquet('s3://{b}/slv_clients/encours_credit/**/*.parquet')")
+        f"CREATE OR REPLACE VIEW silver_enc     AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('clients', 'encours_credit')}')")
     # Gold CA injecté depuis PostgreSQL — pas de lecture S3 Gold (anti-pattern corrigé B1)
     ddb.execute("""
         CREATE OR REPLACE TABLE silver_ca AS

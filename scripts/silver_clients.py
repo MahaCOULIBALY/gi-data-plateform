@@ -1,4 +1,4 @@
-"""silver_clients.py — Bronze → Silver dim_clients SCD Type 2.
+"""silver_clients.py — Bronze → Iceberg OVH · dim_clients SCD Type 2.
 Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # FinOps (2026-03-05) : lecture partitionnée Bronze ({cfg.date_partition})
 # CORRECTIONS DDL (probe 2026-03-05) :
@@ -17,7 +17,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, logger
+from shared import Config, Stats, get_duckdb_connection, hash_sk, write_silver_iceberg, logger
 
 # TIES_SIREN/NIC et naf_code ajoutés au tracking SCD2 (NIC ajouté 2026-03-11)
 SCD2_TRACKED_COLS = ("raison_sociale", "siren", "nic", "naf_code",
@@ -114,7 +114,6 @@ def _apply_scd2(
 def run(cfg: Config) -> dict:
     stats = Stats()
     now = datetime.now(timezone.utc)
-    silver_path = f"s3://{cfg.bucket_silver}/slv_clients/dim_clients"
 
     with get_duckdb_connection(cfg) as ddb:
         res = ddb.execute(build_staging_query(cfg))
@@ -125,34 +124,25 @@ def run(cfg: Config) -> dict:
             return stats.finish()
 
         existing: list[dict] = []
-        try:
-            res2 = ddb.execute(
-                f"SELECT * FROM read_parquet('{silver_path}/*.parquet')")
-            cols2 = [d[0] for d in res2.description]
-            existing = [dict(zip(cols2, row)) for row in res2.fetchall()]
-        except Exception:
-            logger.info("No existing Silver dim_clients — first run")
-
         historical = [r for r in existing if not r.get("is_current")]
         new_records, closed_records, unchanged_current = _apply_scd2(staging, existing, now)
         all_records = historical + closed_records + unchanged_current + new_records
-        stats.rows_transformed = len(new_records)
         stats.extra = {"records_written": len(all_records), "closed": len(closed_records)}
 
-        if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-            logger.info(
-                f"[{cfg.mode.value}] Would write {len(all_records)} rows")
-        elif all_records:
+        if all_records:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
                 for r in all_records:
                     f.write(json.dumps(r, default=str) + "\n")
                 tmp = f.name
             try:
-                ddb.execute(
-                    f"COPY (SELECT * FROM read_json_auto('{tmp}', union_by_name=true)) "
-                    f"TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+                write_silver_iceberg(
+                    ddb,
+                    f"SELECT * FROM read_json_auto('{tmp}', union_by_name=true)",
+                    "silver.clients.dim_clients", cfg, stats,
+                )
             finally:
                 os.unlink(tmp)
+        stats.rows_transformed = len(new_records)
 
     return stats.finish()
 

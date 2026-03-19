@@ -8,18 +8,15 @@ from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_b
 
 
 def build_etp_query(cfg: Config) -> str:
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH releves AS (
         SELECT prh_bts, rgpcnt_id, per_id, date_modif
-        FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet',
-                          hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}')
         WHERE valide = true AND rgpcnt_id IS NOT NULL AND date_modif IS NOT NULL
     ),
     heures AS (
         SELECT prh_bts, SUM(base_paye) AS heures_semaine
-        FROM read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet',
-                          hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}')
         GROUP BY prh_bts
     )
     SELECT

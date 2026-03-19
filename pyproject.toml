@@ -22,6 +22,7 @@ dependencies = [
     "ovh>=1.0.0",
     "httpfs>=0.0.1",
     "pymssql>=2.3.13",
+    "pyspark>=4.1.1",
 ]
 
 [project.optional-dependencies]

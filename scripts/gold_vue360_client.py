@@ -20,14 +20,13 @@ def build_vue360_query(cfg: Config) -> str:
     Les tables Gold (fact_ca_mensuel_client, fact_missions_detail) vivent dans PostgreSQL — pg_bulk_insert.
     DuckDB lit PostgreSQL via postgres_scan (extension native, zéro dépendance supplémentaire).
     """
-    silver = f"s3://{cfg.bucket_silver}"
     pg_dsn = (
         f"host={cfg.ovh_pg_host} port={cfg.ovh_pg_port} "
         f"dbname={cfg.ovh_pg_database} user={cfg.ovh_pg_user} password={cfg.ovh_pg_password}"
     )
     return f"""
     WITH dim_c AS (
-        SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet')
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
         WHERE is_current = true
     ),
     ca_mensuel AS (
@@ -66,13 +65,13 @@ def build_vue360_query(cfg: Config) -> str:
         SELECT siren,
                FIRST(montant_encours ORDER BY _loaded_at DESC) AS montant_encours,
                FIRST(limite_credit ORDER BY _loaded_at DESC) AS limite_credit
-        FROM read_parquet('{silver}/slv_clients/encours_credit/**/*.parquet')
+        FROM iceberg_scan('{cfg.iceberg_path("clients", "encours_credit")}')
         GROUP BY siren
     ),
     derniere_fact AS (
         SELECT tie_id::INT AS tie_id,
                MAX(TRY_CAST(date_facture AS DATE)) AS derniere_facture_date
-        FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet')
+        FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
         GROUP BY tie_id
     )
     SELECT

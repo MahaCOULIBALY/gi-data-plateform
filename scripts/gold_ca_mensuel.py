@@ -31,21 +31,20 @@ def build_ca_mensuel_query(cfg: Config) -> str:
     NOTE B-02: montant_ht est NULL en Silver (EFAC_MONTANTHT absent DDL).
     Reconstitution via lignes_factures: SUM(lfac_base * lfac_taux) par facture.
     """
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH factures AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
     ),
-    {cte_montants_factures(silver)},
+    {cte_montants_factures(cfg)},
     -- nb_missions_facturees via WTFACINFO (fac_num ↔ per_id) — évite JOIN missions × factures
     facinfo AS (
         SELECT fac_num,
                COUNT(DISTINCT per_id::INT || '|' || cnt_id::INT) AS nb_missions_fac
-        FROM read_parquet('{silver}/slv_missions/facinfo/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("missions", "facinfo")}')
         GROUP BY fac_num
     ),
     dim_clients AS (
-        SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
         WHERE is_current = true
     ),
     base AS (
@@ -136,17 +135,14 @@ def build_concentration_query(cfg: Config) -> str:
     nb_clients_top20 = clients représentant les 20% premiers par CA.
     taux_concentration = part du CA portée par ces clients.
     """
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH factures AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet',
-                                   hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
         WHERE date_facture IS NOT NULL AND rgpcnt_id IS NOT NULL
     ),
     lignes AS (
         SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht
-        FROM read_parquet('{silver}/slv_facturation/lignes_factures/**/*.parquet',
-                          hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("facturation", "lignes_factures")}')
         GROUP BY fac_num
     ),
     base AS (

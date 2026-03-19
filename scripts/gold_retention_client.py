@@ -21,17 +21,16 @@ from gold_helpers import cte_montants_factures, cte_heures_par_contrat, cte_miss
 
 def build_retention_query(cfg: Config) -> str:
     """Suivi fidélisation par trimestre — ML-ready features."""
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH factures AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
     ),
-    {cte_montants_factures(silver)},
+    {cte_montants_factures(cfg)},
     missions AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
     ),
     dim_clients AS (
-        SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
         WHERE is_current = true
     ),
     quarterly AS (
@@ -102,22 +101,21 @@ def build_retention_query(cfg: Config) -> str:
 
 def build_rentabilite_query(cfg: Config) -> str:
     """Rentabilité nette par client × année."""
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH factures AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
     ),
-    {cte_montants_factures(silver)},
+    {cte_montants_factures(cfg)},
     missions AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
     ),
     contrats AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/contrats/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "contrats")}')
     ),
     -- DT-09: heures pré-agrégées par (per_id, cnt_id) pour éviter doublons sur multi-relevés
-    {cte_heures_par_contrat(silver)},
+    {cte_heures_par_contrat(cfg)},
     dim_clients AS (
-        SELECT * FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
         WHERE is_current = true
     ),
     yearly AS (

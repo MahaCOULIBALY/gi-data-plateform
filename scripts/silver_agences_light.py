@@ -1,4 +1,4 @@
-"""silver_agences_light.py — PYREGROUPECNT + [Agence Gestion] + Secteurs → dim_agences + hierarchie_territoriale.
+"""silver_agences_light.py — PYREGROUPECNT + [Agence Gestion] + Secteurs → Iceberg OVH (dim_agences + hierarchie_territoriale).
 Phase 3 · GI Data Lakehouse · Manifeste v2.0
 # CORRECTIONS DDL (probe 2026-03-05) :
 # Bronze écrit raw_pyregroupecnt (PYREGROUPECNT — E manquant corrigé)
@@ -14,14 +14,12 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 # raw_secteurs et raw_agence_gestion : optionnels (graceful fallback si Bronze absent)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
 
 
 def run(cfg: Config) -> dict:
     stats = Stats()
     b = f"s3://{cfg.bucket_bronze}"
-    silver_dim  = f"s3://{cfg.bucket_silver}/slv_agences/dim_agences"
-    silver_hier = f"s3://{cfg.bucket_silver}/slv_agences/hierarchie_territoriale"
 
     with get_duckdb_connection(cfg) as ddb:
 
@@ -110,17 +108,7 @@ def run(cfg: Config) -> dict:
 
         # ── dim_agences — obligatoire ─────────────────────────────────────────
         try:
-            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                row = ddb.execute(f"SELECT COUNT(*) FROM ({q_agences})").fetchone()
-                c1 = row[0] if row else 0
-            else:
-                ddb.execute(
-                    f"COPY ({q_agences}) TO '{silver_dim}' "
-                    f"(FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE true)"
-                )
-                c1 = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q_agences})"
-                ).fetchone()[0]
+            c1 = write_silver_iceberg(ddb, q_agences, "silver.agences.dim_agences", cfg, stats)
         except Exception as e:
             logger.exception(json.dumps({"table": "dim_agences", "error": str(e)}))
             stats.errors.append({"table": "dim_agences", "error": str(e)})
@@ -128,26 +116,15 @@ def run(cfg: Config) -> dict:
         # ── hierarchie_territoriale — optionnel ───────────────────────────────
         # raw_agence_gestion ou raw_secteurs absents → warning non-bloquant
         try:
-            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                row = ddb.execute(f"SELECT COUNT(*) FROM ({q_hier})").fetchone()
-                c2 = row[0] if row else 0
-            else:
-                ddb.execute(
-                    f"COPY ({q_hier}) TO '{silver_hier}' "
-                    f"(FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE true)"
-                )
-                c2 = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q_hier})"
-                ).fetchone()[0]
+            c2 = write_silver_iceberg(ddb, q_hier, "silver.agences.hierarchie_territoriale", cfg, stats)
         except Exception as e:
             logger.warning(json.dumps({
                 "warning": "hierarchie_territoriale skipped — raw_agence_gestion ou raw_secteurs absent",
                 "error": str(e),
             }))
 
-        mode_label = cfg.mode.value if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE) else "live"
         logger.info(json.dumps({
-            "mode": mode_label,
+            "mode": cfg.mode.value,
             "dim_agences": c1,
             "hierarchie": c2,
         }))

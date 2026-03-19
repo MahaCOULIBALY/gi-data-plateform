@@ -21,10 +21,9 @@ from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_b
 
 
 def build_activite_query(cfg: Config) -> str:
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH missions AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
     ),
     -- DT-09: pré-agréger heures par (per_id, cnt_id) avant JOIN pour éviter doublons de relevés
     heures_par_contrat AS (
@@ -32,14 +31,14 @@ def build_activite_query(cfg: Config) -> str:
                SUM(h.base_paye::DECIMAL(10,2)) AS base_paye,
                SUM(h.base_fact::DECIMAL(10,2)) AS base_fact,
                MAX(h.taux_fact::DECIMAL(10,4)) AS taux_fact
-        FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet', hive_partitioning=true) r
-        LEFT JOIN read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true) h
+        FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}') r
+        LEFT JOIN iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}') h
             ON h.prh_bts = r.prh_bts
         WHERE r.per_id IS NOT NULL AND r.cnt_id IS NOT NULL
         GROUP BY r.per_id, r.cnt_id
     ),
     dim_int AS (
-        SELECT * FROM read_parquet('{silver}/slv_interimaires/dim_interimaires/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("interimaires", "dim_interimaires")}')
         WHERE is_current = true
     ),
     cal AS (
@@ -83,20 +82,19 @@ def build_activite_query(cfg: Config) -> str:
 
 
 def build_missions_detail_query(cfg: Config) -> str:
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH missions AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
     ),
     contrats AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/contrats/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "contrats")}')
     ),
     releves AS (
-        SELECT * FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}')
     ),
     heures AS (
         SELECT prh_bts, SUM(base_paye::DECIMAL(10,2)) AS total_heures
-        FROM read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}')
         GROUP BY prh_bts
     )
     SELECT
@@ -131,9 +129,8 @@ def build_missions_detail_query(cfg: Config) -> str:
 
 def build_fidelisation_query(cfg: Config) -> str:
     """Fidélisation intérimaires par agence/catégorie.
-    Source : slv_interimaires/fidelisation (priorité 5) + slv_interimaires/portefeuille_agences.
+    Source : silver.interimaires.fidelisation + silver.interimaires.portefeuille_agences.
     """
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     SELECT
         p.rgpcnt_id::INT                                           AS agence_id,
@@ -141,10 +138,8 @@ def build_fidelisation_query(cfg: Config) -> str:
         COUNT(DISTINCT f.per_id)                                   AS nb_interimaires,
         ROUND(AVG(f.anciennete_jours), 1)::DECIMAL(10,1)           AS anciennete_moy_jours,
         ROUND(AVG(f.jours_depuis_derniere_vente), 1)::DECIMAL(10,1) AS jours_inactivite_moyen
-    FROM read_parquet('{silver}/slv_interimaires/fidelisation/**/*.parquet',
-                      hive_partitioning=true) f
-    LEFT JOIN read_parquet('{silver}/slv_interimaires/portefeuille_agences/**/*.parquet',
-                           hive_partitioning=true) p
+    FROM iceberg_scan('{cfg.iceberg_path("interimaires", "fidelisation")}') f
+    LEFT JOIN iceberg_scan('{cfg.iceberg_path("interimaires", "portefeuille_agences")}') p
         ON p.per_id = f.per_id
     WHERE p.rgpcnt_id IS NOT NULL
     GROUP BY 1, 2

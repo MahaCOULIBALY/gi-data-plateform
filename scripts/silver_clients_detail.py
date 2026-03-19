@@ -1,4 +1,4 @@
-"""silver_clients_detail.py — Silver · sites_mission + contacts + encours_credit + coefficients.
+"""silver_clients_detail.py — Bronze → Iceberg OVH · sites_mission + contacts + encours_credit.
 Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # CORRECTIONS DDL (probe 2026-03-05) :
 #   WTTIESERV   : TIES_RS→TIES_DESIGNATION, TIES_SIRET→NULL (absent DDL),
@@ -16,12 +16,11 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 #   Partition date appliquée sur toutes les sources Bronze (FinOps — évite full-scan S3)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
 
 
 def process_sites_mission(ddb, cfg: Config, stats: Stats) -> int:
     b = f"s3://{cfg.bucket_bronze}"
-    silver = f"s3://{cfg.bucket_silver}/slv_clients/sites_mission"
     query = f"""
     WITH raw AS (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY TIE_ID, TIES_SERV ORDER BY _loaded_at DESC) AS rn
@@ -55,21 +54,12 @@ def process_sites_mission(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND TIE_ID IS NOT NULL
     """
-    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
-        logger.info(json.dumps({"mode": cfg.mode.value,
-                    "table": "sites_mission", "rows": count}))
-        return count
-    count = ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)").fetchone()[0]
-    logger.info(json.dumps({"table": "sites_mission", "rows": count}))
-    return count
+    return write_silver_iceberg(ddb, query, "silver.clients.sites_mission", cfg, stats)
 
 
 def process_contacts(ddb, cfg: Config, stats: Stats) -> int:
     """RGPD : email/tel Silver-only — jamais exposé en Gold."""
     b = f"s3://{cfg.bucket_bronze}"
-    silver = f"s3://{cfg.bucket_silver}/slv_clients/contacts"
     query = f"""
     WITH raw AS (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY TIE_ID, TIEI_ORDRE ORDER BY _loaded_at DESC) AS rn
@@ -87,20 +77,11 @@ def process_contacts(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND TIE_ID IS NOT NULL
     """
-    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
-        logger.info(json.dumps({"mode": cfg.mode.value,
-                    "table": "contacts", "rows": count}))
-        return count
-    count = ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)").fetchone()[0]
-    logger.info(json.dumps({"table": "contacts", "rows": count}))
-    return count
+    return write_silver_iceberg(ddb, query, "silver.clients.contacts", cfg, stats)
 
 
 def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
     b = f"s3://{cfg.bucket_bronze}"
-    silver = f"s3://{cfg.bucket_silver}/slv_clients/encours_credit"
     query = f"""
     WITH raw AS (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY ENCGRP_ID ORDER BY _loaded_at DESC) AS rn
@@ -117,15 +98,7 @@ def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND ENCGRP_ID IS NOT NULL
     """
-    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
-        logger.info(json.dumps({"mode": cfg.mode.value,
-                    "table": "encours_credit", "rows": count}))
-        return count
-    count = ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)").fetchone()[0]
-    logger.info(json.dumps({"table": "encours_credit", "rows": count}))
-    return count
+    return write_silver_iceberg(ddb, query, "silver.clients.encours_credit", cfg, stats)
 
 
 def run(cfg: Config) -> dict:

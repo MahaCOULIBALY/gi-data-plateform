@@ -52,7 +52,6 @@ def build_dim_calendrier(ddb) -> list[tuple]:
 
 
 def build_dim_agences(ddb, cfg: Config) -> list[tuple]:
-    silver = f"s3://{cfg.bucket_silver}"
     return ddb.execute(f"""
         SELECT
             a.agence_sk, a.rgpcnt_id, a.nom, a.marque, a.branche,
@@ -61,14 +60,13 @@ def build_dim_agences(ddb, cfg: Config) -> list[tuple]:
             COALESCE(h.zone_geo, '') AS zone_geo,
             COALESCE(a.ville, '') AS ville,
             a.is_active
-        FROM read_parquet('{silver}/slv_agences/dim_agences/**/*.parquet') a
-        LEFT JOIN read_parquet('{silver}/slv_agences/hierarchie_territoriale/**/*.parquet') h
+        FROM iceberg_scan('{cfg.iceberg_path("agences", "dim_agences")}') a
+        LEFT JOIN iceberg_scan('{cfg.iceberg_path("agences", "hierarchie_territoriale")}') h
             ON h.rgpcnt_id = a.rgpcnt_id
     """).fetchall()
 
 
 def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
-    silver = f"s3://{cfg.bucket_silver}"
     # siret calculé depuis siren(9) + nic(5) — pas de colonne siret en Silver
     # naf_libelle / effectif_tranche : absents Silver → NULL en attendant référentiel NAF Phase 2
     return ddb.execute(f"""
@@ -83,19 +81,18 @@ def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
             NULL::VARCHAR                                           AS naf_libelle,
             ville, code_postal, statut_client,
             NULL::VARCHAR                                           AS effectif_tranche
-        FROM read_parquet('{silver}/slv_clients/dim_clients/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
         WHERE is_current = true
     """).fetchall()
 
 
 def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
     """RGPD : pas de NIR, pas de date_naissance, pas d'adresse en Gold."""
-    silver = f"s3://{cfg.bucket_silver}"
     return ddb.execute(f"""
         SELECT interimaire_sk, per_id, matricule, nom, prenom,
                ville, code_postal, date_entree, is_actif, is_candidat,
                is_permanent, agence_rattachement
-        FROM read_parquet('{silver}/slv_interimaires/dim_interimaires/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("interimaires", "dim_interimaires")}')
         WHERE is_current = true
     """).fetchall()
 

@@ -110,6 +110,7 @@ class Config:
     bucket_bronze:   str = "gi-poc-bronze"
     bucket_silver:   str = "gi-poc-silver"
     bucket_gold:     str = "gi-poc-gold"
+    bucket_iceberg:  str = field(default_factory=lambda: os.environ["BUCKET_ICEBERG"])
     ovh_pg_host:     str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
     ovh_pg_port:     int = field(default_factory=lambda: int(os.environ.get("OVH_PG_PORT", "20184")))
     ovh_pg_database: str = field(default_factory=lambda: os.environ.get("OVH_PG_DATABASE", "gi_poc_ddi_gold"))
@@ -124,6 +125,8 @@ class Config:
             datetime.now(timezone.utc).strftime("%Y/%m/%d"),
         )
     )
+    iceberg_uri:     str = field(default_factory=lambda: os.environ.get("OVH_ICEBERG_URI", ""))
+    iceberg_catalog: str = field(default_factory=lambda: os.environ.get("OVH_ICEBERG_CATALOG", "silver"))
 
     def __post_init__(self) -> None:
         # Refus explicite du salt par défaut en LIVE et PROBE (PROBE se connecte à Evolia en production)
@@ -148,6 +151,9 @@ class Config:
         """Port SQL Server extrait de EVOLIA_SERVER, défaut 1433."""
         parts = self.evolia_server.split(",")
         return int(parts[1].strip()) if len(parts) > 1 else 1433
+
+    def iceberg_path(self, namespace: str, table: str) -> str:
+        return f"s3://{self.bucket_iceberg}/iceberg/{namespace}/{table}"
 
 @dataclass
 class Stats:
@@ -267,6 +273,7 @@ def get_duckdb_connection(cfg: Config) -> duckdb.DuckDBPyConnection:
     """
     conn = duckdb.connect()
     conn.execute("INSTALL httpfs; LOAD httpfs;")
+    conn.execute("INSTALL iceberg; LOAD iceberg;")
     # Strip scheme + trailing slash — DuckDB duplique le bucket si trailing slash présent
     endpoint = cfg.s3_endpoint.replace(
         "https://", "").replace("http://", "").rstrip("/")
@@ -364,6 +371,51 @@ def pg_bulk_insert(
         conn.rollback()
         raise
     stats.rows_ingested += len(rows)
+
+
+def write_silver_iceberg(
+    ddb: duckdb.DuckDBPyConnection,
+    query: str,
+    table_id: str,
+    cfg: Config,
+    stats: Stats,
+) -> int:
+    """Écrit le résultat de query dans la table Iceberg table_id via PyIceberg.
+    OFFLINE : no-op. PROBE : compte les lignes sans écrire. LIVE : overwrite.
+    Import pyiceberg lazy — les scripts Bronze n'ont pas pyiceberg installé.
+    """
+    if cfg.mode == RunMode.OFFLINE:
+        logger.info(f"[OFFLINE] Would write → {table_id}")
+        return 0
+
+    arrow_table = ddb.execute(query).arrow()
+    count = len(arrow_table)
+
+    if cfg.mode == RunMode.PROBE:
+        logger.info(json.dumps({"table": table_id, "rows": count, "mode": cfg.mode.value}))
+        return count
+
+    # LIVE
+    from pyiceberg.catalog import load_catalog  # noqa: PLC0415
+    catalog = load_catalog(cfg.iceberg_catalog, uri=cfg.iceberg_uri)
+    table = catalog.load_table(table_id)
+    table.overwrite(arrow_table)
+    stats.rows_transformed += count
+    logger.info(json.dumps({"table": table_id, "rows": count, "mode": cfg.mode.value}))
+    return count
+
+
+def count_iceberg(table_id: str, cfg: Config) -> int:
+    """Retourne le nombre de lignes dans la table Iceberg table_id.
+    OFFLINE : retourne 0. PROBE/LIVE : scan via PyIceberg.
+    Import pyiceberg lazy — les scripts Bronze n'ont pas pyiceberg installé.
+    """
+    if cfg.mode == RunMode.OFFLINE:
+        return 0
+
+    from pyiceberg.catalog import load_catalog  # noqa: PLC0415
+    catalog = load_catalog(cfg.iceberg_catalog, uri=cfg.iceberg_uri)
+    return catalog.load_table(table_id).scan().count()
 
 
 def atomic_load_gold(

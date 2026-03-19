@@ -22,30 +22,29 @@ from gold_helpers import cte_montants_factures, cte_heures_par_contrat
 
 
 def build_scorecard_query(cfg: Config) -> str:
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH factures AS (
-        SELECT * FROM read_parquet('{silver}/slv_facturation/factures/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
     ),
-    {cte_montants_factures(silver)},
+    {cte_montants_factures(cfg)},
     missions AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
     ),
     contrats AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/contrats/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "contrats")}')
     ),
     releves AS (
-        SELECT * FROM read_parquet('{silver}/slv_temps/releves_heures/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}')
     ),
     heures AS (
         SELECT prh_bts,
                SUM(base_paye::DECIMAL(10,2)) AS h_paye,
                SUM(base_fact::DECIMAL(10,2)) AS h_fact
-        FROM read_parquet('{silver}/slv_temps/heures_detail/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}')
         GROUP BY prh_bts
     ),
     commandes AS (
-        SELECT * FROM read_parquet('{silver}/slv_missions/commandes/**/*.parquet', hive_partitioning=true)
+        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "commandes")}')
     ),
     base_ca AS (
         SELECT

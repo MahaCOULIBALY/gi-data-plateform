@@ -1,4 +1,4 @@
-"""silver_competences.py — Silver · Union normalisée métiers + habilitations + diplômes + expériences.
+"""silver_competences.py — Bronze → Iceberg OVH · Union normalisée métiers + habilitations + diplômes + expériences.
 Phase 2 · GI Data Lakehouse · Manifeste v2.0
 # CORRECTIONS DDL (probe 2026-03-05) :
 #   WTPMET      : ORDRE→PMET_ORDRE, PMET_NIVEAU absent DDL → NULL
@@ -13,7 +13,7 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 #   WTTDIP : niveau = TDIP_REF (catégorie/niveau diplôme)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
 
 
 def build_competences_query(cfg: Config) -> str:
@@ -125,24 +125,11 @@ def build_competences_query(cfg: Config) -> str:
 
 def run(cfg: Config) -> dict:
     stats = Stats()
-    silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/competences"
     try:
         with get_duckdb_connection(cfg) as ddb:
             q = build_competences_query(cfg)
-            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                count = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
-                logger.info(json.dumps(
-                    {"mode": cfg.mode.value, "table": "competences", "rows": count}))
-                stats.rows_transformed = count
-            else:
-                ddb.execute(
-                    f"COPY ({q}) TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
-                count = ddb.execute(
-                    f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
-                stats.rows_transformed = count
-                logger.info(json.dumps(
-                    {"table": "competences", "rows": count}))
+            count = write_silver_iceberg(ddb, q, "silver.interimaires.competences", cfg, stats)
+            stats.rows_transformed = count
     except Exception as e:
         logger.exception(json.dumps({"table": "competences", "error": str(e)}))
         stats.errors.append({"table": "competences", "error": str(e)})

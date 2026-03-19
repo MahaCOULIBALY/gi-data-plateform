@@ -19,7 +19,6 @@ from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_b
 
 
 def build_rupture_contrat_query(cfg: Config) -> str:
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     SELECT
         sm.rgpcnt_id::INT                                        AS agence_id,
@@ -44,10 +43,7 @@ def build_rupture_contrat_query(cfg: Config) -> str:
             AVG(CASE WHEN sm.statut_fin_mission = 'RUPTURE'
                      THEN sm.duree_reelle_jours END)
         , 1)                                                    AS duree_moy_avant_rupture
-    FROM read_parquet(
-        '{silver}/slv_missions/fin_mission/**/*.parquet',
-        hive_partitioning=true
-    ) sm
+    FROM iceberg_scan('{cfg.iceberg_path("missions", "fin_mission")}') sm
     WHERE sm.date_debut IS NOT NULL
       AND sm.statut_fin_mission != 'EN_COURS'
     GROUP BY 1, 2, 3

@@ -98,13 +98,12 @@ UPSERT = {
 
 
 def _register_views(ddb, cfg: Config) -> None:
-    b = cfg.bucket_silver
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_rh  AS SELECT * FROM read_parquet('s3://{b}/slv_temps/releves_heures/**/*.parquet')")
+        f"CREATE OR REPLACE VIEW silver_rh  AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('temps', 'releves_heures')}')")
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_rd  AS SELECT * FROM read_parquet('s3://{b}/slv_temps/heures_detail/**/*.parquet')")
+        f"CREATE OR REPLACE VIEW silver_rd  AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('temps', 'heures_detail')}')")
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_cmd AS SELECT * FROM read_parquet('s3://{b}/slv_missions/commandes/**/*.parquet')")
+        f"CREATE OR REPLACE VIEW silver_cmd AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('missions', 'commandes')}')")
 
 
 def _aggregate(ddb, name: str) -> list[tuple]:
@@ -126,7 +125,6 @@ def build_delai_placement_query(cfg: Config) -> str:
     """Délai entre commande (CMD_DTE) et début mission (CNTI_DATEFFET) par agence/semaine/catégorie.
     Nécessite WTMISS Silver enrichi (delai_placement_heures, categorie_delai ajoutés 2026-03-13).
     """
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     SELECT
         m.rgpcnt_id                                                AS agence_id,
@@ -136,7 +134,7 @@ def build_delai_placement_query(cfg: Config) -> str:
         ROUND(AVG(m.delai_placement_heures), 2)::DECIMAL(10,2)     AS delai_moyen_heures,
         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY m.delai_placement_heures)
                                                                    ::DECIMAL(10,2) AS delai_median_heures
-    FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true) m
+    FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}') m
     WHERE m.rgpcnt_id IS NOT NULL
       AND m.date_fin IS NOT NULL
       AND m.delai_placement_heures IS NOT NULL
@@ -151,7 +149,6 @@ def build_conformite_dpae_query(cfg: Config) -> str:
     ecart_heures < 0 → DPAE transmise avant début mission (conforme).
     ecart_heures > 0 → DPAE transmise après début mission (non conforme).
     """
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     SELECT
         m.rgpcnt_id                                                AS agence_id,
@@ -165,7 +162,7 @@ def build_conformite_dpae_query(cfg: Config) -> str:
         4)                                                         AS taux_conformite_dpae,
         ROUND(AVG(m.ecart_heures) FILTER (WHERE m.ecart_heures IS NOT NULL),
               2)::DECIMAL(10,2)                                    AS ecart_moyen_heures
-    FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true) m
+    FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}') m
     WHERE m.rgpcnt_id IS NOT NULL AND m.date_fin IS NOT NULL
     GROUP BY 1, 2
     ORDER BY 2 DESC, 1

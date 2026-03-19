@@ -1,4 +1,4 @@
-"""silver_interimaires.py — Bronze → Silver dim_interimaires SCD Type 2 + RGPD NIR.
+"""silver_interimaires.py — Bronze → Iceberg OVH · dim_interimaires SCD Type 2 + RGPD NIR.
 Phase 2 · GI Data Lakehouse · Manifeste v2.0
 # FinOps (2026-03-05) : lecture partitionnée Bronze ({cfg.date_partition})
 # CORRECTIONS DDL (probe 2026-03-05) :
@@ -13,7 +13,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, pseudonymize_nir, logger, s3_bronze
+from shared import Config, Stats, get_duckdb_connection, hash_sk, pseudonymize_nir, write_silver_iceberg, logger
 
 SCD2_TRACKED = ("nom", "prenom", "adresse", "ville", "code_postal",
                 "is_actif", "is_candidat", "is_permanent", "agence_rattachement")
@@ -69,7 +69,6 @@ def run(cfg: Config) -> dict:
     stats = Stats()
     stats.extra = {"nir_pseudonymized": 0, "nir_null": 0, "records_closed": 0}
     now = datetime.now(timezone.utc)
-    silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires"
 
     with get_duckdb_connection(cfg) as ddb:
         res = ddb.execute(build_staging_query(cfg))
@@ -80,14 +79,6 @@ def run(cfg: Config) -> dict:
             return stats.finish()
 
         existing: list[dict] = []
-        try:
-            res2 = ddb.execute(
-                f"SELECT * FROM read_parquet('{silver_path}/*.parquet')")
-            cols2 = [d[0] for d in res2.description]
-            existing = [dict(zip(cols2, row)) for row in res2.fetchall()]
-        except Exception:
-            logger.info("No existing Silver dim_interimaires — first run")
-
         current_by_id: dict[int, dict] = {
             int(r["per_id"]): r for r in existing if r.get("is_current")}
         historical = [r for r in existing if not r.get("is_current")]
@@ -139,22 +130,21 @@ def run(cfg: Config) -> dict:
         all_records = historical + closed_records + unchanged_current + new_records
         stats.extra["records_closed"] = len(closed_records)
         stats.extra["all_records_written"] = len(all_records)
-        stats.rows_transformed = len(new_records)
 
-        if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-            logger.info(
-                f"[{cfg.mode.value}] Would write {len(all_records)} rows to {silver_path}")
-        elif all_records:
+        if all_records:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
                 for r in all_records:
                     f.write(json.dumps(r, default=str) + "\n")
                 tmp = f.name
             try:
-                ddb.execute(
-                    f"COPY (SELECT * FROM read_json_auto('{tmp}', union_by_name=true)) "
-                    f"TO '{silver_path}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+                write_silver_iceberg(
+                    ddb,
+                    f"SELECT * FROM read_json_auto('{tmp}', union_by_name=true)",
+                    "silver.interimaires.dim_interimaires", cfg, stats,
+                )
             finally:
                 os.unlink(tmp)
+        stats.rows_transformed = len(new_records)
 
     return stats.finish()
 

@@ -11,21 +11,20 @@ from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_b
 
 
 def build_competences_dispo_query(cfg: Config) -> str:
-    silver = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH competences AS (
         SELECT per_id, code::INT AS met_id
-        FROM read_parquet('{silver}/slv_interimaires/competences/**/*.parquet')
+        FROM iceberg_scan('{cfg.iceberg_path("interimaires", "competences")}')
         WHERE type_competence = 'METIER' AND is_active = true AND code != ''
     ),
     dim_int AS (
         SELECT per_id, agence_rattachement AS rgpcnt_id, is_actif
-        FROM read_parquet('{silver}/slv_interimaires/dim_interimaires/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("interimaires", "dim_interimaires")}')
         WHERE is_current = true AND is_actif = true
     ),
     missions_actives AS (
         SELECT DISTINCT per_id
-        FROM read_parquet('{silver}/slv_missions/missions/**/*.parquet', hive_partitioning=true)
+        FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
         WHERE TRY_CAST(date_fin AS DATE) >= CURRENT_DATE
               OR date_fin IS NULL
     ),
