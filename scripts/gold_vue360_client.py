@@ -6,6 +6,9 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 - TIE_ID::INT  → tie_id (lowercase, Silver alias) in derniere_fact CTE
 - d.naf_libelle → naf_libelle (NULL — absent DDL, OK as NULL)
 - e.date_decision → # TODO: verify Silver encours_credit schema
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+# postgres_scan (lecture Gold PG) conservé tel quel — architecture cible
 """
 import sys
 import json
@@ -26,7 +29,7 @@ def build_vue360_query(cfg: Config) -> str:
     )
     return f"""
     WITH dim_c AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
     ),
     ca_mensuel AS (
@@ -65,13 +68,13 @@ def build_vue360_query(cfg: Config) -> str:
         SELECT siren,
                FIRST(montant_encours ORDER BY _loaded_at DESC) AS montant_encours,
                FIRST(limite_credit ORDER BY _loaded_at DESC) AS limite_credit
-        FROM iceberg_scan('{cfg.iceberg_path("clients", "encours_credit")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/encours_credit/**/*.parquet')
         GROUP BY siren
     ),
     derniere_fact AS (
         SELECT tie_id::INT AS tie_id,
                MAX(TRY_CAST(date_facture AS DATE)) AS derniere_facture_date
-        FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/factures/**/*.parquet')
         GROUP BY tie_id
     )
     SELECT

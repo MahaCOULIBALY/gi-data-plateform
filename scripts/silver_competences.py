@@ -13,7 +13,7 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 #   WTTDIP : niveau = TDIP_REF (catégorie/niveau diplôme)
 """
 import json
-from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, logger
 
 
 def build_competences_query(cfg: Config) -> str:
@@ -128,7 +128,14 @@ def run(cfg: Config) -> dict:
     try:
         with get_duckdb_connection(cfg) as ddb:
             q = build_competences_query(cfg)
-            count = write_silver_iceberg(ddb, q, "silver.interimaires.competences", cfg, stats)
+            silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/competences/**/*.parquet"
+            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+                count = ddb.execute(f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
+                logger.info(json.dumps({"mode": cfg.mode.value, "table": "competences", "rows": count}))
+            else:
+                ddb.execute(f"COPY ({q}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+                count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+                logger.info(json.dumps({"table": "competences", "rows": count}))
             stats.rows_transformed = count
     except Exception as e:
         logger.exception(json.dumps({"table": "competences", "error": str(e)}))

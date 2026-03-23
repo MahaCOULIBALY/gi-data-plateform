@@ -13,7 +13,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-from shared import Config, Stats, get_duckdb_connection, hash_sk, pseudonymize_nir, write_silver_iceberg, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, pseudonymize_nir, logger
 
 SCD2_TRACKED = ("nom", "prenom", "adresse", "ville", "code_postal",
                 "is_actif", "is_candidat", "is_permanent", "agence_rattachement")
@@ -131,17 +131,22 @@ def run(cfg: Config) -> dict:
         stats.extra["records_closed"] = len(closed_records)
         stats.extra["all_records_written"] = len(all_records)
 
-        if all_records:
+        silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet"
+        if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+            count = len(all_records)
+            logger.info(json.dumps({"mode": cfg.mode.value, "table": "dim_interimaires", "rows": count}))
+        elif all_records:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
                 for r in all_records:
                     f.write(json.dumps(r, default=str) + "\n")
                 tmp = f.name
             try:
-                write_silver_iceberg(
-                    ddb,
-                    f"SELECT * FROM read_json_auto('{tmp}', union_by_name=true)",
-                    "silver.interimaires.dim_interimaires", cfg, stats,
+                ddb.execute(
+                    f"COPY (SELECT * FROM read_json_auto('{tmp}', union_by_name=true)) "
+                    f"TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)"
                 )
+                count = (ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone() or (0,))[0]
+                logger.info(json.dumps({"table": "dim_interimaires", "rows": count}))
             finally:
                 os.unlink(tmp)
         stats.rows_transformed = len(new_records)

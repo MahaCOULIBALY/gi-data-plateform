@@ -39,6 +39,8 @@ class _Table:
     dedup_key: str
     sql: str = ""
     sql_fn: "Callable[[Config], str] | None" = field(default=None)
+    # Colonnes absentes du Bronze à ajouter comme NULL dans src (ex: {"MISS_ANNULE": "SMALLINT"})
+    extra_nulls: "dict[str, str]" = field(default_factory=dict)
 
 
 def _build_wtmiss_sql(cfg: Config) -> str:
@@ -280,12 +282,14 @@ _TABLES: list[_Table] = [
     ),
     # FIN_MISSION (2026-03-15) — rupture CTT : WTMISS + WTCNTI + WTFINMISS
     # Cible : slv_missions/fin_mission → Gold fact_rupture_contrat
+    # MISS_ANNULE absent du Bronze actuel (ingestion 2026-03-14 ne l'extrait pas) → NULL par défaut
     _Table(
         name="FIN_MISSION",
         bronze="wtmiss",
         silver=f"slv_{DOMAIN}/fin_mission",
         dedup_key="per_id, cnt_id",
         sql_fn=_build_fin_mission_sql,
+        extra_nulls={"MISS_ANNULE": "SMALLINT"},
     ),
     # PYCONTRAT (2026-03-11) — table maîtresse contrats paie
     # Jointures Gold : PER_ID+CNT_ID ↔ WTMISS/WTCNTI/WTPRH · ETA_ID ↔ PYETABLISSEMENT
@@ -326,6 +330,19 @@ def _process(ddb, cfg: Config, t: _Table, stats: Stats) -> None:
     try:
         ddb.execute(
             f"CREATE OR REPLACE VIEW src AS SELECT * FROM read_json_auto('{bronze_path}')")
+        if t.extra_nulls:
+            existing = {r[0] for r in ddb.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='src'"
+            ).fetchall()}
+            missing = {col: typ for col, typ in t.extra_nulls.items() if col not in existing}
+            if missing:
+                null_cols = ", ".join(f"NULL::{typ} AS {col}" for col, typ in missing.items())
+                # Recréer depuis le chemin Bronze (pas depuis src — évite la récursion DuckDB)
+                ddb.execute(
+                    f"CREATE OR REPLACE VIEW src AS "
+                    f"SELECT *, {null_cols} "
+                    f"FROM read_json_auto('{bronze_path}')"
+                )
         if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
             row = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()
             count = row[0] if row else 0

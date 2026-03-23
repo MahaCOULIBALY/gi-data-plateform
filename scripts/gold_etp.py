@@ -2,6 +2,8 @@
 Phase 2 · GI Data Lakehouse · Manifeste v2.0
 Source : slv_temps/releves_heures (valide=true) + slv_temps/heures_detail
 ETP = SUM(base_paye) / 35 — agrégation hebdomadaire par agence.
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 """
 import json
 from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
@@ -11,12 +13,12 @@ def build_etp_query(cfg: Config) -> str:
     return f"""
     WITH releves AS (
         SELECT prh_bts, rgpcnt_id, per_id, date_modif
-        FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet')
         WHERE valide = true AND rgpcnt_id IS NOT NULL AND date_modif IS NOT NULL
     ),
     heures AS (
         SELECT prh_bts, SUM(base_paye) AS heures_semaine
-        FROM iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet')
         GROUP BY prh_bts
     )
     SELECT

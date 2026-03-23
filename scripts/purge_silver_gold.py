@@ -112,6 +112,7 @@ class Config:
     s3_endpoint:   str = field(default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
     s3_access_key: str = field(default_factory=lambda: os.environ["OVH_S3_ACCESS_KEY"])
     s3_secret_key: str = field(default_factory=lambda: os.environ["OVH_S3_SECRET_KEY"])
+    s3_region:     str = field(default_factory=lambda: os.environ.get("OVH_S3_REGION", "eu-west-par"))
     bucket_silver: str = field(default_factory=lambda:
                                os.environ.get("SILVER_BUCKET", "gi-poc-silver"))
 
@@ -157,6 +158,7 @@ def _s3_client(cfg: Config):
         endpoint_url=cfg.s3_endpoint,
         aws_access_key_id=cfg.s3_access_key,
         aws_secret_access_key=cfg.s3_secret_key,
+        region_name=cfg.s3_region,
     )
 
 
@@ -230,15 +232,25 @@ def purge_silver_s3(cfg: Config, stats: Stats) -> None:
     for i in range(0, len(objects), BATCH):
         batch = objects[i:i + BATCH]
         try:
-            s3.delete_objects(
+            resp = s3.delete_objects(
                 Bucket=cfg.bucket_silver,
                 Delete={"Objects": [{"Key": o["Key"]} for o in batch]},
             )
-            stats.s3_objects_deleted += len(batch)
-            logger.info(json.dumps({
-                "s3_silver_deleted_batch": len(batch),
-                "total_deleted":          stats.s3_objects_deleted,
-            }))
+            failed = resp.get("Errors", [])
+            deleted = len(batch) - len(failed)
+            stats.s3_objects_deleted += deleted
+            if failed:
+                for err in failed:
+                    stats.errors.append({"step": "delete_s3_silver_object",
+                                         "key": err.get("Key"), "code": err.get("Code"),
+                                         "error": err.get("Message")})
+                logger.error(json.dumps({"s3_silver_partial_failure": len(failed),
+                                         "deleted_in_batch": deleted}))
+            else:
+                logger.info(json.dumps({
+                    "s3_silver_deleted_batch": deleted,
+                    "total_deleted": stats.s3_objects_deleted,
+                }))
         except ClientError as e:
             stats.errors.append({"step": "delete_s3_silver_batch", "error": str(e)})
             logger.error(json.dumps({"step": "delete_s3_silver_batch", "error": str(e)}))

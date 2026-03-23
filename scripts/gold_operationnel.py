@@ -3,41 +3,15 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 Sources Silver : slv_temps/releves_heures, slv_temps/heures_detail, slv_missions/commandes
 Schemas Gold   : gld_operationnel
 Note : fact_anomalies_rh — reporté Phase 1 (données WTRHECART non encore en Bronze)
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+# BUG-3 corrigé : execute_batch → pg_bulk_insert (probe mode désormais respecté, 4 tables unifiées)
 """
 import json
-
-import psycopg2.extras
 
 from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
 
 DOMAIN = "gld_operationnel"
-
-DDL = {
-    "fact_heures_hebdo": """
-        CREATE TABLE IF NOT EXISTS gld_operationnel.fact_heures_hebdo (
-            agence_id       INTEGER,
-            tie_id          INTEGER,
-            semaine_debut   DATE,
-            heures_paye     DECIMAL(12,2),
-            heures_fact     DECIMAL(12,2),
-            nb_releves      INTEGER,
-            _loaded_at      TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (agence_id, tie_id, semaine_debut)
-        )
-    """,
-    "fact_commandes_pipeline": """
-        CREATE TABLE IF NOT EXISTS gld_operationnel.fact_commandes_pipeline (
-            agence_id           INTEGER,
-            semaine_debut       DATE,
-            nb_commandes        INTEGER,
-            nb_pourvues         INTEGER,
-            nb_ouvertes         INTEGER,
-            taux_satisfaction   DECIMAL(6,4),
-            _loaded_at          TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (agence_id, semaine_debut)
-        )
-    """,
-}
 
 SQL = {
     "fact_heures_hebdo": """
@@ -72,53 +46,31 @@ SQL = {
     """,
 }
 
-UPSERT = {
-    "fact_heures_hebdo": """
-        INSERT INTO gld_operationnel.fact_heures_hebdo
-            (agence_id, tie_id, semaine_debut, heures_paye, heures_fact, nb_releves)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (agence_id, tie_id, semaine_debut) DO UPDATE SET
-            heures_paye = EXCLUDED.heures_paye,
-            heures_fact = EXCLUDED.heures_fact,
-            nb_releves  = EXCLUDED.nb_releves,
-            _loaded_at  = NOW()
-    """,
-    "fact_commandes_pipeline": """
-        INSERT INTO gld_operationnel.fact_commandes_pipeline
-            (agence_id, semaine_debut, nb_commandes, nb_pourvues, nb_ouvertes, taux_satisfaction)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (agence_id, semaine_debut) DO UPDATE SET
-            nb_commandes        = EXCLUDED.nb_commandes,
-            nb_pourvues         = EXCLUDED.nb_pourvues,
-            nb_ouvertes         = EXCLUDED.nb_ouvertes,
-            taux_satisfaction   = EXCLUDED.taux_satisfaction,
-            _loaded_at          = NOW()
-    """,
+COLS = {
+    "fact_heures_hebdo": ["agence_id", "tie_id", "semaine_debut",
+                          "heures_paye", "heures_fact", "nb_releves"],
+    "fact_commandes_pipeline": ["agence_id", "semaine_debut", "nb_commandes",
+                                "nb_pourvues", "nb_ouvertes", "taux_satisfaction"],
 }
 
 
 def _register_views(ddb, cfg: Config) -> None:
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_rh  AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('temps', 'releves_heures')}')")
+        f"CREATE OR REPLACE VIEW silver_rh  AS SELECT * FROM read_parquet("
+        f"'s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet')"
+    )
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_rd  AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('temps', 'heures_detail')}')")
+        f"CREATE OR REPLACE VIEW silver_rd  AS SELECT * FROM read_parquet("
+        f"'s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet')"
+    )
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_cmd AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('missions', 'commandes')}')")
+        f"CREATE OR REPLACE VIEW silver_cmd AS SELECT * FROM read_parquet("
+        f"'s3://{cfg.bucket_silver}/slv_missions/commandes/**/*.parquet')"
+    )
 
 
 def _aggregate(ddb, name: str) -> list[tuple]:
     return ddb.execute(SQL[name]).fetchall()
-
-
-def _write_pg(pg_conn, name: str, rows: list[tuple], stats: Stats) -> None:
-    """Upsert via execute_batch (lot 500) — connexion partagée par run(), pas de re-ouverture TCP."""
-    with pg_conn.cursor() as cur:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS gld_operationnel")
-        cur.execute(DDL[name])
-        psycopg2.extras.execute_batch(cur, UPSERT[name], rows, page_size=500)
-    pg_conn.commit()
-    stats.tables_processed += 1
-    stats.rows_ingested += len(rows)
 
 
 def build_delai_placement_query(cfg: Config) -> str:
@@ -134,7 +86,7 @@ def build_delai_placement_query(cfg: Config) -> str:
         ROUND(AVG(m.delai_placement_heures), 2)::DECIMAL(10,2)     AS delai_moyen_heures,
         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY m.delai_placement_heures)
                                                                    ::DECIMAL(10,2) AS delai_median_heures
-    FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}') m
+    FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet') m
     WHERE m.rgpcnt_id IS NOT NULL
       AND m.date_fin IS NOT NULL
       AND m.delai_placement_heures IS NOT NULL
@@ -162,7 +114,7 @@ def build_conformite_dpae_query(cfg: Config) -> str:
         4)                                                         AS taux_conformite_dpae,
         ROUND(AVG(m.ecart_heures) FILTER (WHERE m.ecart_heures IS NOT NULL),
               2)::DECIMAL(10,2)                                    AS ecart_moyen_heures
-    FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}') m
+    FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet') m
     WHERE m.rgpcnt_id IS NOT NULL AND m.date_fin IS NOT NULL
     GROUP BY 1, 2
     ORDER BY 2 DESC, 1
@@ -181,22 +133,18 @@ def run(cfg: Config) -> dict:
             return stats.finish()
 
         with get_pg_connection(cfg) as pg:
+            # fact_heures_hebdo + fact_commandes_pipeline — pg_bulk_insert gère le mode
             for name in ("fact_heures_hebdo", "fact_commandes_pipeline"):
                 try:
                     rows = _aggregate(ddb, name)
-                    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                        logger.info(json.dumps(
-                            {"mode": cfg.mode.value, "table": name, "rows": len(rows)}))
-                        stats.tables_processed += 1
-                        continue
-                    _write_pg(pg, name, rows, stats)
+                    pg_bulk_insert(cfg, pg, DOMAIN, name, COLS[name], rows, stats)
                     logger.info(json.dumps(
                         {"table": name, "rows": len(rows), "status": "ok"}))
                 except Exception as e:
                     logger.exception(json.dumps({"table": name, "error": str(e)}))
                     stats.errors.append({"table": name, "error": str(e)})
 
-            # Priorité 7 : fact_delai_placement + fact_conformite_dpae
+            # fact_delai_placement + fact_conformite_dpae
             _new_tables = {
                 "fact_delai_placement": (
                     build_delai_placement_query(cfg),

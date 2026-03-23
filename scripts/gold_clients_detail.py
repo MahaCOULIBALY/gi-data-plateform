@@ -10,48 +10,25 @@ RGPD : contacts (email/tel) restent Silver-only — jamais en Gold
 #   Perf    : connexion PG unique dans run() — réutilisée par _fetch_pg_ca et _write_pg
 # CORRECTIONS (2026-03-13) :
 #   psycopg2.connect manuel → get_pg_connection (cohérence shared.py)
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+# BUG-2 corrigé : execute_values → pg_bulk_insert (probe mode désormais respecté)
 """
 import json
 from datetime import datetime, timezone
 
-import psycopg2
-import psycopg2.extras
-
-from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
 
 DOMAIN = "gld_clients"
 
-DDL = {
-    "vue_360_client": """
-        CREATE TABLE IF NOT EXISTS gld_clients.vue_360_client (
-            client_sk           INTEGER PRIMARY KEY,
-            siren               VARCHAR(9),
-            raison_sociale      VARCHAR(255),
-            naf_code            VARCHAR(6),
-            ville               VARCHAR(100),
-            nb_sites            INTEGER,
-            ca_ytd              DECIMAL(18,2),
-            ca_n1               DECIMAL(18,2),
-            delta_ca_pct        DECIMAL(8,4),
-            encours_montant     DECIMAL(18,2),
-            encours_limite      DECIMAL(18,2),
-            risque_credit       VARCHAR(20),
-            _loaded_at          TIMESTAMPTZ DEFAULT NOW()
-        )
-    """,
-    "fact_retention_client": """
-        CREATE TABLE IF NOT EXISTS gld_clients.fact_retention_client (
-            client_sk       INTEGER,
-            trimestre       DATE,
-            ca              DECIMAL(18,2),
-            delta_ca        DECIMAL(18,2),
-            nb_missions     INTEGER,
-            risque_churn    VARCHAR(20),
-            _loaded_at      TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (client_sk, trimestre)
-        )
-    """,
-}
+VUE360_COLS = [
+    "client_sk", "siren", "raison_sociale", "naf_code", "ville", "nb_sites",
+    "ca_ytd", "ca_n1", "delta_ca_pct", "encours_montant", "encours_limite", "risque_credit",
+]
+
+RETENTION_COLS = [
+    "client_sk", "trimestre", "ca", "delta_ca", "nb_missions", "risque_churn",
+]
 
 SQL = {
     "vue_360_client": """
@@ -117,40 +94,26 @@ SQL = {
     """,
 }
 
-UPSERT = {
-    "vue_360_client": """
-        INSERT INTO gld_clients.vue_360_client
-            (client_sk, siren, raison_sociale, naf_code, ville, nb_sites,
-             ca_ytd, ca_n1, delta_ca_pct, encours_montant, encours_limite, risque_credit)
-        VALUES %s
-        ON CONFLICT (client_sk) DO UPDATE SET
-            ca_ytd=EXCLUDED.ca_ytd, ca_n1=EXCLUDED.ca_n1,
-            delta_ca_pct=EXCLUDED.delta_ca_pct, encours_montant=EXCLUDED.encours_montant,
-            encours_limite=EXCLUDED.encours_limite, risque_credit=EXCLUDED.risque_credit,
-            nb_sites=EXCLUDED.nb_sites, _loaded_at=NOW()
-    """,
-    "fact_retention_client": """
-        INSERT INTO gld_clients.fact_retention_client
-            (client_sk, trimestre, ca, delta_ca, nb_missions, risque_churn)
-        VALUES %s
-        ON CONFLICT (client_sk, trimestre) DO UPDATE SET
-            ca=EXCLUDED.ca, delta_ca=EXCLUDED.delta_ca,
-            nb_missions=EXCLUDED.nb_missions, risque_churn=EXCLUDED.risque_churn,
-            _loaded_at=NOW()
-    """,
+_COLS_MAP = {
+    "vue_360_client": VUE360_COLS,
+    "fact_retention_client": RETENTION_COLS,
 }
-
-_UPSERT_BATCH_SIZE = 500
 
 
 def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
-    """Enregistre les vues Silver Iceberg + injecte fact_ca_mensuel_client depuis PostgreSQL (évite Gold→Gold)."""
+    """Enregistre les vues Silver Parquet + injecte fact_ca_mensuel_client depuis PostgreSQL."""
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_clients AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('clients', 'dim_clients')}')")
+        f"CREATE OR REPLACE VIEW silver_clients AS SELECT * FROM read_parquet("
+        f"'s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')"
+    )
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_sites   AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('clients', 'sites_mission')}')")
+        f"CREATE OR REPLACE VIEW silver_sites   AS SELECT * FROM read_parquet("
+        f"'s3://{cfg.bucket_silver}/slv_clients/sites_mission/**/*.parquet')"
+    )
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_enc     AS SELECT * FROM iceberg_scan('{cfg.iceberg_path('clients', 'encours_credit')}')")
+        f"CREATE OR REPLACE VIEW silver_enc     AS SELECT * FROM read_parquet("
+        f"'s3://{cfg.bucket_silver}/slv_clients/encours_credit/**/*.parquet')"
+    )
     # Gold CA injecté depuis PostgreSQL — pas de lecture S3 Gold (anti-pattern corrigé B1)
     ddb.execute("""
         CREATE OR REPLACE TABLE silver_ca AS
@@ -163,7 +126,7 @@ def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
         )
 
 
-def _fetch_pg_ca(pg_conn: "psycopg2.connection") -> list[tuple]:
+def _fetch_pg_ca(pg_conn) -> list[tuple]:
     """Charge fact_ca_mensuel_client depuis PostgreSQL → list[tuple] pour injection DuckDB."""
     with pg_conn.cursor() as cur:
         cur.execute("""
@@ -172,19 +135,6 @@ def _fetch_pg_ca(pg_conn: "psycopg2.connection") -> list[tuple]:
             FROM gld_commercial.fact_ca_mensuel_client
         """)
         return cur.fetchall()
-
-
-def _write_pg(pg_conn: "psycopg2.connection", name: str, rows: list[tuple], stats: Stats) -> None:
-    """Écrit les lignes dans PostgreSQL via execute_values (batch upsert — évite N round-trips)."""
-    with pg_conn.cursor() as cur:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS gld_clients")
-        cur.execute(DDL[name])
-        psycopg2.extras.execute_values(
-            cur, UPSERT[name], rows, page_size=_UPSERT_BATCH_SIZE
-        )
-    pg_conn.commit()
-    stats.tables_processed += 1
-    stats.rows_ingested += len(rows)
 
 
 def run(cfg: Config) -> dict:
@@ -213,12 +163,8 @@ def run(cfg: Config) -> dict:
             for name in ("vue_360_client", "fact_retention_client"):
                 try:
                     rows = ddb.execute(SQL[name]).fetchall()
-                    if cfg.mode == RunMode.PROBE:
-                        logger.info(json.dumps(
-                            {"mode": cfg.mode.value, "table": name, "rows": len(rows)}))
-                        stats.tables_processed += 1
-                        continue
-                    _write_pg(pg_conn, name, rows, stats)
+                    pg_bulk_insert(cfg, pg_conn, DOMAIN, name,
+                                   _COLS_MAP[name], rows, stats)
                     logger.info(json.dumps(
                         {"table": name, "rows": len(rows), "status": "ok"}))
                 except Exception as e:

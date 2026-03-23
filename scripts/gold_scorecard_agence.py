@@ -14,6 +14,9 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 - cmd.CMD_DATE     → cmd.cmd_date
 - cmd.CMD_STATUT   → cmd.statut  (NULL — absent DDL)
 - m.PRH_BTS        → jointure via releves (per_id+cnt_id)
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+# gold_helpers (cte_montants_factures, cte_heures_par_contrat) : BUG-4 corrigé
 """
 import sys
 import logging
@@ -24,27 +27,27 @@ from gold_helpers import cte_montants_factures, cte_heures_par_contrat
 def build_scorecard_query(cfg: Config) -> str:
     return f"""
     WITH factures AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/factures/**/*.parquet')
     ),
     {cte_montants_factures(cfg)},
     missions AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
     ),
     contrats AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "contrats")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/contrats/**/*.parquet')
     ),
     releves AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet')
     ),
     heures AS (
         SELECT prh_bts,
                SUM(base_paye::DECIMAL(10,2)) AS h_paye,
                SUM(base_fact::DECIMAL(10,2)) AS h_fact
-        FROM iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet')
         GROUP BY prh_bts
     ),
     commandes AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "commandes")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/commandes/**/*.parquet')
     ),
     base_ca AS (
         SELECT

@@ -107,9 +107,9 @@ class Config:
     s3_endpoint:     str = field(default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
     s3_access_key:   str = field(default_factory=lambda: os.environ["OVH_S3_ACCESS_KEY"])
     s3_secret_key:   str = field(default_factory=lambda: os.environ["OVH_S3_SECRET_KEY"])
-    bucket_bronze:   str = "gi-poc-bronze"
-    bucket_silver:   str = "gi-poc-silver"
-    bucket_gold:     str = "gi-poc-gold"
+    bucket_bronze:   str = field(default_factory=lambda: os.environ.get("OVH_S3_BUCKET_BRONZE", "gi-data-prod-bronze"))
+    bucket_silver:   str = field(default_factory=lambda: os.environ.get("OVH_S3_BUCKET_SILVER", "gi-data-prod-silver"))
+    bucket_gold:     str = field(default_factory=lambda: os.environ.get("OVH_S3_BUCKET_GOLD",   "gi-data-prod-gold"))
     bucket_iceberg:  str = field(default_factory=lambda: os.environ["BUCKET_ICEBERG"])
     ovh_pg_host:     str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
     ovh_pg_port:     int = field(default_factory=lambda: int(os.environ.get("OVH_PG_PORT", "20184")))

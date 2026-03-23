@@ -11,6 +11,9 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 - Jointure heures via WTFACINFO/FAC_NUM au lieu de PRH_BTS direct
 - UPPERCASE → lowercase pour cohérence Silver aliases
 - TODO B-02: montant_ht est NULL en Silver → reconstitution via SUM(lfac_base * lfac_taux)
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+# MIGRÉ : missions.facinfo (inexistant Silver) → sous-requête slv_missions/contrats (D01)
 """
 import sys
 import csv
@@ -30,21 +33,24 @@ def build_ca_mensuel_query(cfg: Config) -> str:
     """Agrégation Silver → fact_ca_mensuel_client.
     NOTE B-02: montant_ht est NULL en Silver (EFAC_MONTANTHT absent DDL).
     Reconstitution via lignes_factures: SUM(lfac_base * lfac_taux) par facture.
+    NOTE facinfo: missions.facinfo inexistant en Silver Parquet →
+    reconstruit depuis slv_missions/contrats (cnt_fac_num).
     """
     return f"""
     WITH factures AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/factures/**/*.parquet')
     ),
     {cte_montants_factures(cfg)},
-    -- nb_missions_facturees via WTFACINFO (fac_num ↔ per_id) — évite JOIN missions × factures
+    -- nb_missions_facturees reconstruit depuis contrats (cnt_fac_num ↔ per_id/cnt_id)
     facinfo AS (
-        SELECT fac_num,
-               COUNT(DISTINCT per_id::INT || '|' || cnt_id::INT) AS nb_missions_fac
-        FROM iceberg_scan('{cfg.iceberg_path("missions", "facinfo")}')
-        GROUP BY fac_num
+        SELECT cnt_fac_num AS fac_num,
+               COUNT(DISTINCT CONCAT(per_id::VARCHAR, '|', cnt_id::VARCHAR)) AS nb_missions_fac
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/contrats/**/*.parquet')
+        WHERE cnt_fac_num IS NOT NULL
+        GROUP BY cnt_fac_num
     ),
     dim_clients AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
     ),
     base AS (
@@ -137,12 +143,12 @@ def build_concentration_query(cfg: Config) -> str:
     """
     return f"""
     WITH factures AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("facturation", "factures")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/factures/**/*.parquet')
         WHERE date_facture IS NOT NULL AND rgpcnt_id IS NOT NULL
     ),
     lignes AS (
         SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht
-        FROM iceberg_scan('{cfg.iceberg_path("facturation", "lignes_factures")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/lignes_factures/**/*.parquet')
         GROUP BY fac_num
     ),
     base AS (

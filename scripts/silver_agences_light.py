@@ -14,7 +14,7 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 # raw_secteurs et raw_agence_gestion : optionnels (graceful fallback si Bronze absent)
 """
 import json
-from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, logger
 
 
 def run(cfg: Config) -> dict:
@@ -85,7 +85,8 @@ def run(cfg: Config) -> dict:
             ) = 1
         ),
         secteurs AS (
-            SELECT
+            -- DISTINCT : raw_secteurs ingéré N fois → déduplique avant jointure
+            SELECT DISTINCT
                 LOWER(TRIM("Agence de gestion")) AS nom_ug_norm,
                 TRIM(Secteur)                    AS secteur,
                 TRIM(Périmètre)                  AS perimetre,
@@ -108,7 +109,14 @@ def run(cfg: Config) -> dict:
 
         # ── dim_agences — obligatoire ─────────────────────────────────────────
         try:
-            c1 = write_silver_iceberg(ddb, q_agences, "silver.agences.dim_agences", cfg, stats)
+            silver_path = f"s3://{cfg.bucket_silver}/slv_agences/dim_agences/**/*.parquet"
+            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+                c1 = ddb.execute(f"SELECT COUNT(*) FROM ({q_agences})").fetchone()[0]
+                logger.info(json.dumps({"mode": cfg.mode.value, "table": "dim_agences", "rows": c1}))
+            else:
+                ddb.execute(f"COPY ({q_agences}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+                c1 = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+                logger.info(json.dumps({"table": "dim_agences", "rows": c1}))
         except Exception as e:
             logger.exception(json.dumps({"table": "dim_agences", "error": str(e)}))
             stats.errors.append({"table": "dim_agences", "error": str(e)})
@@ -116,7 +124,14 @@ def run(cfg: Config) -> dict:
         # ── hierarchie_territoriale — optionnel ───────────────────────────────
         # raw_agence_gestion ou raw_secteurs absents → warning non-bloquant
         try:
-            c2 = write_silver_iceberg(ddb, q_hier, "silver.agences.hierarchie_territoriale", cfg, stats)
+            silver_path = f"s3://{cfg.bucket_silver}/slv_agences/hierarchie_territoriale/**/*.parquet"
+            if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+                c2 = ddb.execute(f"SELECT COUNT(*) FROM ({q_hier})").fetchone()[0]
+                logger.info(json.dumps({"mode": cfg.mode.value, "table": "hierarchie_territoriale", "rows": c2}))
+            else:
+                ddb.execute(f"COPY ({q_hier}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+                c2 = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+                logger.info(json.dumps({"table": "hierarchie_territoriale", "rows": c2}))
         except Exception as e:
             logger.warning(json.dumps({
                 "warning": "hierarchie_territoriale skipped — raw_agence_gestion ou raw_secteurs absent",

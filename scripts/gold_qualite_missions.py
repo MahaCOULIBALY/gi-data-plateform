@@ -13,6 +13,8 @@ Notes :
     Valider SELECT DISTINCT finmiss_code, finmiss_libelle FROM fin_mission après probe.
   - Blocker B2 (MISS_ANNULE) : probe WTMISS GROUP BY MISS_ANNULE requis avant déploiement prod.
   - La table Gold ne contient que les missions clôturées (statut_fin_mission != 'EN_COURS').
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 """
 import logging
 from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
@@ -43,7 +45,7 @@ def build_rupture_contrat_query(cfg: Config) -> str:
             AVG(CASE WHEN sm.statut_fin_mission = 'RUPTURE'
                      THEN sm.duree_reelle_jours END)
         , 1)                                                    AS duree_moy_avant_rupture
-    FROM iceberg_scan('{cfg.iceberg_path("missions", "fin_mission")}') sm
+    FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/fin_mission/**/*.parquet') sm
     WHERE sm.date_debut IS NOT NULL
       AND sm.statut_fin_mission != 'EN_COURS'
     GROUP BY 1, 2, 3

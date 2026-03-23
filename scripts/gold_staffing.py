@@ -14,6 +14,8 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 - c.MET_ID         → c.met_id      (case normalization)
 - m.PRH_BTS        → supprimé (PRH_BTS absent Silver missions)
 - Jointure heures via fac_num au lieu de PRH_BTS
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 """
 import sys
 import logging
@@ -23,7 +25,7 @@ from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_b
 def build_activite_query(cfg: Config) -> str:
     return f"""
     WITH missions AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
     ),
     -- DT-09: pré-agréger heures par (per_id, cnt_id) avant JOIN pour éviter doublons de relevés
     heures_par_contrat AS (
@@ -31,14 +33,14 @@ def build_activite_query(cfg: Config) -> str:
                SUM(h.base_paye::DECIMAL(10,2)) AS base_paye,
                SUM(h.base_fact::DECIMAL(10,2)) AS base_fact,
                MAX(h.taux_fact::DECIMAL(10,4)) AS taux_fact
-        FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}') r
-        LEFT JOIN iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}') h
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet') r
+        LEFT JOIN read_parquet('s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet') h
             ON h.prh_bts = r.prh_bts
         WHERE r.per_id IS NOT NULL AND r.cnt_id IS NOT NULL
         GROUP BY r.per_id, r.cnt_id
     ),
     dim_int AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("interimaires", "dim_interimaires")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true
     ),
     cal AS (
@@ -84,17 +86,17 @@ def build_activite_query(cfg: Config) -> str:
 def build_missions_detail_query(cfg: Config) -> str:
     return f"""
     WITH missions AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
     ),
     contrats AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("missions", "contrats")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/contrats/**/*.parquet')
     ),
     releves AS (
-        SELECT * FROM iceberg_scan('{cfg.iceberg_path("temps", "releves_heures")}')
+        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet')
     ),
     heures AS (
         SELECT prh_bts, SUM(base_paye::DECIMAL(10,2)) AS total_heures
-        FROM iceberg_scan('{cfg.iceberg_path("temps", "heures_detail")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet')
         GROUP BY prh_bts
     )
     SELECT
@@ -138,8 +140,8 @@ def build_fidelisation_query(cfg: Config) -> str:
         COUNT(DISTINCT f.per_id)                                   AS nb_interimaires,
         ROUND(AVG(f.anciennete_jours), 1)::DECIMAL(10,1)           AS anciennete_moy_jours,
         ROUND(AVG(f.jours_depuis_derniere_vente), 1)::DECIMAL(10,1) AS jours_inactivite_moyen
-    FROM iceberg_scan('{cfg.iceberg_path("interimaires", "fidelisation")}') f
-    LEFT JOIN iceberg_scan('{cfg.iceberg_path("interimaires", "portefeuille_agences")}') p
+    FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/fidelisation/**/*.parquet') f
+    LEFT JOIN read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/portefeuille_agences/**/*.parquet') p
         ON p.per_id = f.per_id
     WHERE p.rgpcnt_id IS NOT NULL
     GROUP BY 1, 2

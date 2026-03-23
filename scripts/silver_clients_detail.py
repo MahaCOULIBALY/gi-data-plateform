@@ -16,7 +16,7 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 #   Partition date appliquée sur toutes les sources Bronze (FinOps — évite full-scan S3)
 """
 import json
-from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, logger
 
 
 def process_sites_mission(ddb, cfg: Config, stats: Stats) -> int:
@@ -54,7 +54,15 @@ def process_sites_mission(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND TIE_ID IS NOT NULL
     """
-    return write_silver_iceberg(ddb, query, "silver.clients.sites_mission", cfg, stats)
+    silver_path = f"s3://{cfg.bucket_silver}/slv_clients/sites_mission/**/*.parquet"
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value, "table": "sites_mission", "rows": count}))
+        return count
+    ddb.execute(f"COPY ({query}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+    count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "sites_mission", "rows": count}))
+    return count
 
 
 def process_contacts(ddb, cfg: Config, stats: Stats) -> int:
@@ -77,7 +85,15 @@ def process_contacts(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND TIE_ID IS NOT NULL
     """
-    return write_silver_iceberg(ddb, query, "silver.clients.contacts", cfg, stats)
+    silver_path = f"s3://{cfg.bucket_silver}/slv_clients/contacts/**/*.parquet"
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value, "table": "contacts", "rows": count}))
+        return count
+    ddb.execute(f"COPY ({query}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+    count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "contacts", "rows": count}))
+    return count
 
 
 def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
@@ -98,7 +114,15 @@ def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                             AS _loaded_at
     FROM raw WHERE rn = 1 AND ENCGRP_ID IS NOT NULL
     """
-    return write_silver_iceberg(ddb, query, "silver.clients.encours_credit", cfg, stats)
+    silver_path = f"s3://{cfg.bucket_silver}/slv_clients/encours_credit/**/*.parquet"
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value, "table": "encours_credit", "rows": count}))
+        return count
+    ddb.execute(f"COPY ({query}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+    count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "encours_credit", "rows": count}))
+    return count
 
 
 def run(cfg: Config) -> dict:

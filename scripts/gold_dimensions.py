@@ -13,6 +13,9 @@ PRÉREQUIS : Silver dim_clients, dim_interimaires, dim_agences doivent exister.
 - build_dim_metiers: raw_ref_metiers → raw_wtmet (WTMET intégré dans bronze_interimaires)
 - build_dim_metiers: raw_ref_qualifications → raw_wtqua (WTQUA ajouté bronze_interimaires 2026-03-12)
 - build_dim_metiers: +pcs_code (PCS_CODE_2003 INSEE), filtre MET_DELETE actif
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+# dim_metiers conservé (lit Bronze read_json_auto — pas de Silver Parquet)
 """
 import sys
 import logging
@@ -60,8 +63,8 @@ def build_dim_agences(ddb, cfg: Config) -> list[tuple]:
             COALESCE(h.zone_geo, '') AS zone_geo,
             COALESCE(a.ville, '') AS ville,
             a.is_active
-        FROM iceberg_scan('{cfg.iceberg_path("agences", "dim_agences")}') a
-        LEFT JOIN iceberg_scan('{cfg.iceberg_path("agences", "hierarchie_territoriale")}') h
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_agences/dim_agences/**/*.parquet') a
+        LEFT JOIN read_parquet('s3://{cfg.bucket_silver}/slv_agences/hierarchie_territoriale/**/*.parquet') h
             ON h.rgpcnt_id = a.rgpcnt_id
     """).fetchall()
 
@@ -81,7 +84,7 @@ def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
             NULL::VARCHAR                                           AS naf_libelle,
             ville, code_postal, statut_client,
             NULL::VARCHAR                                           AS effectif_tranche
-        FROM iceberg_scan('{cfg.iceberg_path("clients", "dim_clients")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
     """).fetchall()
 
@@ -92,7 +95,7 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
         SELECT interimaire_sk, per_id, matricule, nom, prenom,
                ville, code_postal, date_entree, is_actif, is_candidat,
                is_permanent, agence_rattachement
-        FROM iceberg_scan('{cfg.iceberg_path("interimaires", "dim_interimaires")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true
     """).fetchall()
 

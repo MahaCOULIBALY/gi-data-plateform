@@ -10,7 +10,7 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 #   Partition date appliquée sur toutes les sources Bronze (FinOps — évite full-scan S3)
 """
 import json
-from shared import Config, Stats, get_duckdb_connection, write_silver_iceberg, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, logger
 
 
 def process_evaluations(ddb, cfg: Config, stats: Stats) -> int:
@@ -31,7 +31,15 @@ def process_evaluations(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                               AS _loaded_at
     FROM raw WHERE rn = 1 AND PER_ID IS NOT NULL
     """
-    return write_silver_iceberg(ddb, query, "silver.interimaires.evaluations", cfg, stats)
+    silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/evaluations/**/*.parquet"
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value, "table": "evaluations", "rows": count}))
+        return count
+    ddb.execute(f"COPY ({query}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+    count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "evaluations", "rows": count}))
+    return count
 
 
 def process_coordonnees(ddb, cfg: Config, stats: Stats) -> int:
@@ -53,7 +61,15 @@ def process_coordonnees(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP                               AS _loaded_at
     FROM raw WHERE rn = 1 AND PER_ID IS NOT NULL
     """
-    return write_silver_iceberg(ddb, query, "silver.interimaires.coordonnees", cfg, stats)
+    silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/coordonnees/**/*.parquet"
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value, "table": "coordonnees", "rows": count}))
+        return count
+    ddb.execute(f"COPY ({query}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+    count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "coordonnees", "rows": count}))
+    return count
 
 
 def process_ugpint(ddb, cfg: Config, stats: Stats) -> int:
@@ -78,7 +94,15 @@ def process_ugpint(ddb, cfg: Config, stats: Stats) -> int:
         CURRENT_TIMESTAMP       AS _loaded_at
     FROM raw WHERE rn = 1 AND PER_ID IS NOT NULL AND RGPCNT_ID IS NOT NULL
     """
-    return write_silver_iceberg(ddb, query, "silver.interimaires.portefeuille_agences", cfg, stats)
+    silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/portefeuille_agences/**/*.parquet"
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value, "table": "portefeuille_agences", "rows": count}))
+        return count
+    ddb.execute(f"COPY ({query}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
+    count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "portefeuille_agences", "rows": count}))
+    return count
 
 
 def process_fidelisation(ddb, cfg: Config) -> int:
@@ -86,7 +110,7 @@ def process_fidelisation(ddb, cfg: Config) -> int:
     Catégories : actif_recent (≤90j), actif_annee (≤365j), inactif_long (>365j), inactif (jamais).
     """
     b = f"s3://{cfg.bucket_bronze}"
-    silver = f"s3://{cfg.bucket_silver}/slv_interimaires/fidelisation"
+    silver = f"s3://{cfg.bucket_silver}/slv_interimaires/fidelisation/**/*.parquet"
     query = f"""
     WITH raw AS (
         SELECT *,
@@ -127,9 +151,9 @@ def process_fidelisation(ddb, cfg: Config) -> int:
                     "table": "fidelisation", "rows": count}))
         return count
     ddb.execute(
-        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+        f"COPY ({query}) TO '{silver}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
     count = ddb.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{silver}/**/*.parquet')").fetchone()[0]
+        f"SELECT COUNT(*) FROM read_parquet('{silver}')").fetchone()[0]
     logger.info(json.dumps({"table": "fidelisation", "rows": count}))
     return count
 
@@ -140,10 +164,11 @@ def run(cfg: Config) -> dict:
         c1 = process_evaluations(ddb, cfg, stats)
         c2 = process_coordonnees(ddb, cfg, stats)
         c3 = process_ugpint(ddb, cfg, stats)
-        stats.tables_processed = 3
-        stats.rows_transformed = c1 + c2 + c3
+        c4 = process_fidelisation(ddb, cfg)
+        stats.tables_processed = 4
+        stats.rows_transformed = c1 + c2 + c3 + c4
         stats.extra = {"evaluations": c1, "coordonnees": c2,
-                       "portefeuille_agences": c3}
+                       "portefeuille_agences": c3, "fidelisation": c4}
     return stats.finish()
 
 

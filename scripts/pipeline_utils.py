@@ -41,6 +41,15 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     CONSTRAINT pk_pipeline_watermarks PRIMARY KEY (pipeline, table_name)
 );
 """
+# Migrations idempotentes pour les tables créées avant l'ajout de ces colonnes
+_DDL_MIGRATIONS = [
+    f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS last_status    VARCHAR(20)  NOT NULL DEFAULT 'success';",
+    f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS last_error     TEXT;",
+    f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS run_count      INTEGER      NOT NULL DEFAULT 1;",
+    f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS rows_ingested  BIGINT       NOT NULL DEFAULT 0;",
+    f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW();",
+    f"ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW();",
+]
 
 # Exceptions non-transientes — pas de retry (erreurs de programmation ou config)
 _NON_RETRYABLE = (
@@ -59,10 +68,12 @@ class WatermarkStore:
 
     # ── Setup ─────────────────────────────────────────────────────────────────
     def _ensure_table(self) -> None:
-        """Crée le schéma ops + la table si absents (idempotent)."""
+        """Crée le schéma ops + la table si absents, applique les migrations (idempotent)."""
         with self._conn.cursor() as cur:
             cur.execute(_DDL_ENSURE_SCHEMA)
             cur.execute(_DDL_ENSURE_TABLE)
+            for migration in _DDL_MIGRATIONS:
+                cur.execute(migration)
         self._conn.commit()
 
     # ── Read ──────────────────────────────────────────────────────────────────

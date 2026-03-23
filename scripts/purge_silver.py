@@ -1,15 +1,17 @@
-"""purge_bronze.py — Purge S3 Bronze (toutes versions) + watermarks PostgreSQL.
+"""purge_silver.py — Purge S3 Silver (Parquet ZSTD) + suppression complète des versions.
 GI Data Lakehouse · Manifeste v2.1
 
 Usage :
-    uv run purge_bronze.py --target s3                               # purge bucket Bronze uniquement
-    uv run purge_bronze.py --target watermarks                       # purge watermarks PG uniquement
-    uv run purge_bronze.py --target all                              # purge S3 + watermarks
-    uv run purge_bronze.py --target s3 --pipeline bronze_missions    # purge 1 pipeline S3
-    uv run purge_bronze.py --target s3 --bucket_name gi-poc-bronze   # bucket custom
+    uv run purge_silver.py                                            # probe : affiche ce qui serait supprimé
+    RUN_MODE=live uv run purge_silver.py                              # supprime tout le bucket Silver
+    RUN_MODE=live uv run purge_silver.py --pipeline silver_missions   # un pipeline seulement
+    RUN_MODE=live uv run purge_silver.py --bucket_name gi-poc-silver  # bucket custom
+
+Pipelines reconnus (--pipeline) :
+    silver_missions | silver_interimaires | silver_agences |
+    silver_clients  | silver_temps        | silver_facturation
 
 Mode par défaut : PROBE (aucune suppression).
-Passer RUN_MODE=live pour exécuter réellement.
 """
 import argparse
 import json
@@ -22,7 +24,6 @@ from pathlib import Path
 from typing import Optional
 
 import boto3
-import psycopg2
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
@@ -31,7 +32,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(module)s.%(funcName)s:%(lineno)d | %(message)s",
 )
-logger = logging.getLogger("gi-purge-bronze")
+logger = logging.getLogger("gi-purge-silver")
 
 # ── .env.local ────────────────────────────────────────────────────────────────
 
@@ -62,10 +63,15 @@ class RunMode(str, Enum):
     LIVE = "live"
 
 
-class PurgeTarget(str, Enum):
-    S3 = "s3"
-    WATERMARKS = "watermarks"
-    ALL = "all"
+# ── Mapping pipeline → préfixe S3 Silver ─────────────────────────────────────
+_PIPELINE_PREFIX: dict[str, str] = {
+    "silver_missions": "slv_missions/",
+    "silver_interimaires": "slv_interimaires/",
+    "silver_agences": "slv_agences/",
+    "silver_clients": "slv_clients/",
+    "silver_temps": "slv_temps/",
+    "silver_facturation": "slv_facturation/",
+}
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -74,11 +80,9 @@ class PurgeTarget(str, Enum):
 class Config:
     mode: RunMode = field(default_factory=lambda: RunMode(
         os.environ.get("RUN_MODE", "probe").lower()))
-    target: PurgeTarget = PurgeTarget.S3
     pipeline_filter: Optional[str] = None
     bucket_override: Optional[str] = None
 
-    # S3
     s3_endpoint: str = field(
         default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
     s3_access_key: str = field(
@@ -88,21 +92,11 @@ class Config:
     s3_region: str = field(default_factory=lambda: os.environ.get(
         "OVH_S3_REGION", "eu-west-par"))
     _bucket_default: str = field(default_factory=lambda: os.environ.get(
-        "OVH_S3_BUCKET_BRONZE", "gi-data-prod-bronze"))
+        "OVH_S3_BUCKET_SILVER", "gi-data-prod-silver"))
 
     @property
-    def bucket_bronze(self) -> str:
+    def bucket_silver(self) -> str:
         return self.bucket_override or self._bucket_default
-
-    # PostgreSQL
-    pg_host: str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
-    pg_port: str = field(
-        default_factory=lambda: os.environ.get("OVH_PG_PORT", "5432"))
-    pg_database: str = field(
-        default_factory=lambda: os.environ.get("OVH_PG_DATABASE", "gi_data"))
-    pg_user: str = field(default_factory=lambda: os.environ["OVH_PG_USER"])
-    pg_password: str = field(
-        default_factory=lambda: os.environ["OVH_PG_PASSWORD"])
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -114,27 +108,21 @@ class Stats:
     markers_found: int = 0
     markers_deleted: int = 0
     bytes_freed: int = 0
-    wm_rows_found: int = 0
-    wm_rows_deleted: int = 0
     errors: list = field(default_factory=list)
 
     def report(self) -> dict:
         return {
-            "s3": {
+            "silver_s3": {
                 "versions_found": self.versions_found,
                 "versions_deleted": self.versions_deleted,
                 "markers_found": self.markers_found,
                 "markers_deleted": self.markers_deleted,
                 "freed_mb": round(self.bytes_freed / 1_048_576, 2),
             },
-            "watermarks": {
-                "rows_found": self.wm_rows_found,
-                "rows_deleted": self.wm_rows_deleted,
-            },
             "errors": self.errors,
         }
 
-# ── S3 helpers ────────────────────────────────────────────────────────────────
+# ── S3 ────────────────────────────────────────────────────────────────────────
 
 
 def _s3_client(cfg: Config):
@@ -150,8 +138,7 @@ def _s3_client(cfg: Config):
 def _list_all_versions(s3, bucket: str, prefix: str = "") -> tuple[list[dict], list[dict]]:
     """
     Retourne (versions, delete_markers) via list_object_versions (pagination complète).
-    Expose tout l'historique, contrairement à list_objects_v2 qui ignore
-    les versions non-courantes et les delete markers.
+    Contrairement à list_objects_v2, cette API expose TOUT l'historique versionné.
     """
     paginator = s3.get_paginator("list_object_versions")
     params = {"Bucket": bucket}
@@ -208,24 +195,40 @@ def _delete_batch(s3, bucket: str, items: list[dict], stats: Stats, step_label: 
             logger.error(json.dumps(
                 {"step": f"delete_{step_label}_batch", "error": str(e)}))
 
+# ── Run ───────────────────────────────────────────────────────────────────────
 
-def purge_s3(cfg: Config, stats: Stats) -> None:
-    s3 = _s3_client(cfg)
-    prefix = f"raw_{cfg.pipeline_filter.lower()}/" if cfg.pipeline_filter else ""
 
+def run(cfg: Config) -> Stats:
+    stats = Stats()
     logger.info(json.dumps({
-        "action": "list_object_versions",
-        "bucket": cfg.bucket_bronze,
-        "prefix": prefix or "(all)",
+        "start": True,
+        "mode": cfg.mode.value,
+        "bucket": cfg.bucket_silver,
+        "pipeline_filter": cfg.pipeline_filter or "(all)",
     }))
 
+    s3 = _s3_client(cfg)
+
+    if cfg.pipeline_filter:
+        prefix = _PIPELINE_PREFIX.get(cfg.pipeline_filter.lower())
+        if prefix is None:
+            logger.error(json.dumps({
+                "error": f"pipeline inconnu : '{cfg.pipeline_filter}'",
+                "known_pipelines": list(_PIPELINE_PREFIX.keys()),
+            }))
+            stats.errors.append(
+                {"step": "pipeline_filter", "error": f"inconnu : {cfg.pipeline_filter}"})
+            return stats
+    else:
+        prefix = ""
+
     try:
-        versions, markers = _list_all_versions(s3, cfg.bucket_bronze, prefix)
+        versions, markers = _list_all_versions(s3, cfg.bucket_silver, prefix)
     except ClientError as e:
         stats.errors.append({"step": "list_object_versions", "error": str(e)})
         logger.error(json.dumps(
             {"step": "list_object_versions", "error": str(e)}))
-        return
+        return stats
 
     stats.versions_found = len(versions)
     stats.markers_found = len(markers)
@@ -233,7 +236,7 @@ def purge_s3(cfg: Config, stats: Stats) -> None:
 
     logger.info(json.dumps({
         "mode": cfg.mode.value,
-        "bucket": cfg.bucket_bronze,
+        "bucket": cfg.bucket_silver,
         "versions_found": stats.versions_found,
         "delete_markers_found": stats.markers_found,
         "size_mb": round(stats.bytes_freed / 1_048_576, 2),
@@ -241,8 +244,9 @@ def purge_s3(cfg: Config, stats: Stats) -> None:
 
     if not versions and not markers:
         logger.info(json.dumps(
-            {"s3_bronze": "already empty (no versions, no markers)"}))
-        return
+            {"s3_silver": "already empty (no versions, no markers)"}))
+        logger.info(json.dumps({"summary": stats.report()}))
+        return stats
 
     if cfg.mode == RunMode.PROBE:
         logger.info(json.dumps({
@@ -252,129 +256,42 @@ def purge_s3(cfg: Config, stats: Stats) -> None:
             "would_free_mb": round(stats.bytes_freed / 1_048_576, 2),
             "hint": "Relancer avec RUN_MODE=live pour exécuter",
         }))
-        return
+        logger.info(json.dumps({"summary": stats.report()}))
+        return stats
 
     # ── LIVE ──────────────────────────────────────────────────────────────────
     if versions:
         logger.info(json.dumps(
             {"action": "delete_versions", "count": len(versions)}))
-        _delete_batch(s3, cfg.bucket_bronze, versions, stats, "versions")
+        _delete_batch(s3, cfg.bucket_silver, versions, stats, "versions")
 
     if markers:
         logger.info(json.dumps(
             {"action": "delete_markers", "count": len(markers)}))
-        _delete_batch(s3, cfg.bucket_bronze, markers, stats, "markers")
+        _delete_batch(s3, cfg.bucket_silver, markers, stats, "markers")
 
     logger.info(json.dumps({
-        "s3_bronze_purge": "DONE",
+        "s3_silver_purge": "DONE",
         "versions_deleted": stats.versions_deleted,
         "markers_deleted": stats.markers_deleted,
         "freed_mb": round(stats.bytes_freed / 1_048_576, 2),
     }))
-
-
-# ── Watermarks ────────────────────────────────────────────────────────────────
-_ALL_PIPELINES = [
-    "bronze_missions",
-    "bronze_agences",
-    "bronze_clients",
-    "bronze_interimaires",
-]
-
-
-def purge_watermarks(cfg: Config, stats: Stats) -> None:
-    pipelines = [
-        cfg.pipeline_filter] if cfg.pipeline_filter else _ALL_PIPELINES
-
-    try:
-        conn = psycopg2.connect(
-            host=cfg.pg_host, port=cfg.pg_port, dbname=cfg.pg_database,
-            user=cfg.pg_user, password=cfg.pg_password, sslmode="require",
-        )
-    except Exception as e:
-        stats.errors.append({"step": "pg_connect", "error": str(e)})
-        logger.error(json.dumps({"step": "pg_connect", "error": str(e)}))
-        return
-
-    with conn:
-        with conn.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(pipelines))
-            cur.execute(
-                f"SELECT pipeline, table_name, last_success "
-                f"FROM ops.pipeline_watermarks "
-                f"WHERE pipeline IN ({placeholders})",
-                pipelines,
-            )
-            rows = cur.fetchall()
-            stats.wm_rows_found = len(rows)
-            logger.info(json.dumps({
-                "mode": cfg.mode.value,
-                "watermarks_found": stats.wm_rows_found,
-                "pipelines": pipelines,
-                "detail": [{"pipeline": r[0], "table": r[1], "last_success": str(r[2])} for r in rows],
-            }))
-
-            if cfg.mode == RunMode.PROBE:
-                logger.info(json.dumps({"probe": "NO deletion performed",
-                                        "would_delete": stats.wm_rows_found}))
-                conn.close()
-                return
-
-            cur.execute(
-                f"DELETE FROM ops.pipeline_watermarks "
-                f"WHERE pipeline IN ({placeholders})",
-                pipelines,
-            )
-            stats.wm_rows_deleted = cur.rowcount
-            logger.info(json.dumps({"watermarks_purge": "DONE",
-                                    "rows_deleted": stats.wm_rows_deleted}))
-    conn.close()
-
-# ── Orchestrateur ─────────────────────────────────────────────────────────────
-
-
-def run(cfg: Config) -> Stats:
-    stats = Stats()
-    logger.info(json.dumps({
-        "start": True,
-        "mode": cfg.mode.value,
-        "target": cfg.target.value,
-        "bucket": cfg.bucket_bronze,
-        "pipeline_filter": cfg.pipeline_filter or "(all)",
-    }))
-
-    if cfg.target in (PurgeTarget.S3, PurgeTarget.ALL):
-        purge_s3(cfg, stats)
-
-    if cfg.target in (PurgeTarget.WATERMARKS, PurgeTarget.ALL):
-        purge_watermarks(cfg, stats)
-
     logger.info(json.dumps({"summary": stats.report()}))
-
     if stats.errors:
         logger.error(json.dumps({"errors": stats.errors}))
-
-    if cfg.mode == RunMode.PROBE:
-        logger.info(json.dumps({"probe_complete": True,
-                                "hint": "Relancer avec RUN_MODE=live pour exécuter la purge"}))
     return stats
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
-        description="Purge S3 Bronze et/ou watermarks PostgreSQL — GI Data Lakehouse")
-    p.add_argument("--target", choices=["s3", "watermarks", "all"], default="s3",
-                   help="Cible de purge : s3 | watermarks | all (défaut: s3)")
+        description="Purge S3 Silver — GI Data Lakehouse")
     p.add_argument("--pipeline", default=None, metavar="PIPELINE",
-                   help="Restreindre à un seul pipeline (ex: bronze_missions). Défaut : tous.")
+                   help="Restreindre à un pipeline Silver (ex: silver_missions). Défaut : tous.")
     p.add_argument("--bucket_name", default=None, metavar="BUCKET",
-                   help="Overrider le bucket cible (défaut: OVH_S3_BUCKET_BRONZE ou gi-data-prod-bronze).")
+                   help="Overrider le bucket cible (défaut: OVH_S3_BUCKET_SILVER ou gi-data-prod-silver).")
     args = p.parse_args()
-    cfg = Config(
-        target=PurgeTarget(args.target),
-        pipeline_filter=args.pipeline,
-        bucket_override=args.bucket_name,
-    )
+    cfg = Config(pipeline_filter=args.pipeline,
+                 bucket_override=args.bucket_name)
     result = run(cfg)
     sys.exit(1 if result.errors else 0)

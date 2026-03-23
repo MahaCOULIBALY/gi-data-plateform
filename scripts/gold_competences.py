@@ -4,6 +4,8 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 === CORRECTIONS SESSION 2 (audit Silver→Gold) ===
 - MISS_DATEFIN → date_fin (Silver alias canonical in missions)
 - MISS_DATEDEBUT implicite OK (non référencé directement)
+
+# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 """
 import sys
 import logging
@@ -14,17 +16,17 @@ def build_competences_dispo_query(cfg: Config) -> str:
     return f"""
     WITH competences AS (
         SELECT per_id, code::INT AS met_id
-        FROM iceberg_scan('{cfg.iceberg_path("interimaires", "competences")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/competences/**/*.parquet')
         WHERE type_competence = 'METIER' AND is_active = true AND code != ''
     ),
     dim_int AS (
         SELECT per_id, agence_rattachement AS rgpcnt_id, is_actif
-        FROM iceberg_scan('{cfg.iceberg_path("interimaires", "dim_interimaires")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true AND is_actif = true
     ),
     missions_actives AS (
         SELECT DISTINCT per_id
-        FROM iceberg_scan('{cfg.iceberg_path("missions", "missions")}')
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
         WHERE TRY_CAST(date_fin AS DATE) >= CURRENT_DATE
               OR date_fin IS NULL
     ),
