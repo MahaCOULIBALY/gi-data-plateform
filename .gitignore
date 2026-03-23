@@ -5,6 +5,7 @@
 *.env
 .env.k8s
 scripts/.env.additions
+**/.env*
 secrets/
 credentials/
 kubeconfig*.yaml          # Contient token K8s — JAMAIS commité
