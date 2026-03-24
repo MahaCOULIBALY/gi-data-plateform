@@ -31,6 +31,7 @@ def build_vue360_query(cfg: Config) -> str:
     WITH dim_c AS (
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     ca_mensuel AS (
         SELECT
@@ -56,7 +57,7 @@ def build_vue360_query(cfg: Config) -> str:
     ),
     top_metiers AS (
         SELECT tie_id,
-               LIST(metier_id ORDER BY cnt DESC LIMIT 3) AS top_3
+               list(metier_id ORDER BY cnt DESC)[1:3] AS top_3
         FROM (
             SELECT tie_id, metier_id, COUNT(*) AS cnt
             FROM postgres_scan('{pg_dsn}', 'gld_staffing', 'fact_missions_detail')
@@ -83,7 +84,7 @@ def build_vue360_query(cfg: Config) -> str:
         d.raison_sociale,
         d.siren,
         d.ville,
-        d.naf_libelle                                          AS secteur_activite,
+        NULL::VARCHAR                                          AS secteur_activite,
         d.effectif_tranche                                     AS effectif,
         d.statut_client                                        AS statut,
         COALESCE(ca.ca_ytd, 0)                                AS ca_ytd,
@@ -187,7 +188,7 @@ def run_pg_fallback(cfg: Config) -> list[tuple]:
            COALESCE(miss.nb_actives, 0), COALESCE(miss.nb_total, 0),
            COALESCE(miss.nb_int_actifs, 0), COALESCE(miss.nb_int_hist, 0),
            '[]',
-           COALESCE(EXTRACT(day FROM CURRENT_DATE - miss.first_mission)::INT, 0),
+           COALESCE((CURRENT_DATE - miss.first_mission)::INT, 0),
            COALESCE(ROUND(miss.marge_avg, 4), 0), 0, 0, 'LOW',
            COALESCE(miss.nb_agences, 0), NULL, 9999, 'HIGH', NOW()
     FROM gld_shared.dim_clients d

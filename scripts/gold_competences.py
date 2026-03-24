@@ -23,6 +23,7 @@ def build_competences_dispo_query(cfg: Config) -> str:
         SELECT per_id, agence_rattachement AS rgpcnt_id, is_actif
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true AND is_actif = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     missions_actives AS (
         SELECT DISTINCT per_id

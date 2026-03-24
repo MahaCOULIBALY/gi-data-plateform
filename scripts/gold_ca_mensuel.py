@@ -41,17 +41,20 @@ def build_ca_mensuel_query(cfg: Config) -> str:
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/factures/**/*.parquet')
     ),
     {cte_montants_factures(cfg)},
-    -- nb_missions_facturees reconstruit depuis contrats (cnt_fac_num ↔ per_id/cnt_id)
+    -- nb_missions_facturees approx depuis missions (cnt_fac_num absent Silver WTCNTI)
+    -- Approximation : missions actives par (tie_id, mois) — pas de lien direct mission↔facture
     facinfo AS (
-        SELECT cnt_fac_num AS fac_num,
+        SELECT tie_id::INT AS tie_id,
+               DATE_TRUNC('month', TRY_CAST(date_debut AS DATE)) AS mois_mission,
                COUNT(DISTINCT CONCAT(per_id::VARCHAR, '|', cnt_id::VARCHAR)) AS nb_missions_fac
-        FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/contrats/**/*.parquet')
-        WHERE cnt_fac_num IS NOT NULL
-        GROUP BY cnt_fac_num
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
+        WHERE date_debut IS NOT NULL
+        GROUP BY 1, 2
     ),
     dim_clients AS (
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     base AS (
         SELECT
@@ -66,7 +69,8 @@ def build_ca_mensuel_query(cfg: Config) -> str:
             COALESCE(fi.nb_missions_fac, 0)                       AS nb_missions_fac
         FROM factures f
         LEFT JOIN montants mt ON mt.fac_num = f.efac_num
-        LEFT JOIN facinfo fi ON fi.fac_num = f.efac_num
+        LEFT JOIN facinfo fi ON fi.tie_id = f.tie_id::INT
+            AND fi.mois_mission = DATE_TRUNC('month', TRY_CAST(f.date_facture AS DATE))
         LEFT JOIN dim_clients c ON c.tie_id = f.tie_id::INT
         WHERE f.date_facture IS NOT NULL
     )
@@ -147,7 +151,7 @@ def build_concentration_query(cfg: Config) -> str:
         WHERE date_facture IS NOT NULL AND rgpcnt_id IS NOT NULL
     ),
     lignes AS (
-        SELECT fac_num, COALESCE(SUM(lfac_mnt), 0) AS montant_ht
+        SELECT fac_num, COALESCE(SUM(montant), 0) AS montant_ht
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/lignes_factures/**/*.parquet')
         GROUP BY fac_num
     ),

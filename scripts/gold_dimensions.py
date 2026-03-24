@@ -32,7 +32,7 @@ NOMS_MOIS = {1: "janvier", 2: "février", 3: "mars", 4: "avril", 5: "mai", 6: "j
 
 
 def build_dim_calendrier(ddb) -> list[tuple]:
-    """Génère dim_calendrier 2020-01-01 → 2027-12-31."""
+    """Génère dim_calendrier 2020-01-01 → 2035-12-31."""
     rows = ddb.execute("""
         SELECT d::DATE AS date_id,
                EXTRACT(dow FROM d)::INT AS dow,
@@ -40,7 +40,7 @@ def build_dim_calendrier(ddb) -> list[tuple]:
                EXTRACT(month FROM d)::INT AS mois,
                CEIL(EXTRACT(month FROM d) / 3.0)::INT AS trimestre,
                EXTRACT(year FROM d)::INT AS annee
-        FROM generate_series('2020-01-01'::DATE, '2027-12-31'::DATE, INTERVAL '1 day') t(d)
+        FROM generate_series('2020-01-01'::DATE, '2035-12-31'::DATE, INTERVAL '1 day') t(d)
     """).fetchall()
     feries = {(m, d) for m, d in JOURS_FERIES_FIXES}
     result = []
@@ -83,9 +83,10 @@ def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
             naf_code,
             NULL::VARCHAR                                           AS naf_libelle,
             ville, code_postal, statut_client,
-            NULL::VARCHAR                                           AS effectif_tranche
+            effectif_tranche
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
     """).fetchall()
 
 
@@ -97,25 +98,25 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
                is_permanent, agence_rattachement
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
     """).fetchall()
 
 
 def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
     """Lit Bronze raw_wtmet + raw_wtqua (via bronze_interimaires depuis 2026-03-12).
-    Utilise cfg.date_partition pour éviter le full-scan S3 multi-batchs.
-    WTQUA dédupliqué par ROW_NUMBER pour éviter doublons si plusieurs batchs journaliers.
+    Utilise glob **/**/** pour lire toutes les partitions disponibles — insensible au fait
+    que Bronze n'a pas encore tourné aujourd'hui (ROW_NUMBER déduplique par MET_ID/TQUA_ID).
     """
     bronze = f"s3://{cfg.bucket_bronze}"
-    dp = cfg.date_partition
     return ddb.execute(f"""
         WITH met AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY MET_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{bronze}/raw_wtmet/{dp}/*.json', union_by_name=true, hive_partitioning=false)
+            FROM read_json_auto('{bronze}/raw_wtmet/**/**/**/*.json', union_by_name=true, hive_partitioning=false)
         ),
         qua AS (
             SELECT TQUA_ID, TQUA_LIBELLE,
                    ROW_NUMBER() OVER (PARTITION BY TQUA_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{bronze}/raw_wtqua/{dp}/*.json', union_by_name=true, hive_partitioning=false)
+            FROM read_json_auto('{bronze}/raw_wtqua/**/**/**/*.json', union_by_name=true, hive_partitioning=false)
         )
         SELECT
             MD5(MET_ID::VARCHAR) AS metier_sk,

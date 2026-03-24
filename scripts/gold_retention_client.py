@@ -35,6 +35,7 @@ def build_retention_query(cfg: Config) -> str:
     dim_clients AS (
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     quarterly AS (
         SELECT
@@ -120,6 +121,7 @@ def build_rentabilite_query(cfg: Config) -> str:
     dim_clients AS (
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     yearly AS (
         SELECT
@@ -128,8 +130,8 @@ def build_rentabilite_query(cfg: Config) -> str:
             EXTRACT(YEAR FROM TRY_CAST(f.date_facture AS DATE))::INT AS annee,
             SUM(CASE WHEN f.type_facture='F' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END)
             - SUM(CASE WHEN f.type_facture='A' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END) AS ca_net,
-            COALESCE(SUM(hc.h_fact * c.taux_horaire_fact::DECIMAL(10,4)), 0) AS ca_missions,
-            COALESCE(SUM(hc.h_paye * c.taux_horaire_paye::DECIMAL(10,4)), 0) AS cout_paye,
+            COALESCE(SUM(hc.h_fact * c.taux_fact::DECIMAL(10,4)), 0) AS ca_missions,
+            COALESCE(SUM(hc.h_paye * c.taux_paye::DECIMAL(10,4)), 0) AS cout_paye,
             COUNT(DISTINCT m.per_id) AS nb_interimaires,
             SUM(CASE WHEN f.type_facture='F' THEN COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2) ELSE 0 END) * 0.05 AS cout_gestion_estime
         FROM factures f

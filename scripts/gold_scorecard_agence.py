@@ -76,8 +76,8 @@ def build_scorecard_query(cfg: Config) -> str:
         SELECT
             m.rgpcnt_id::INT AS agence_id,
             DATE_TRUNC('month', TRY_CAST(m.date_debut AS DATE)) AS mois,
-            COALESCE(SUM(hc.h_paye * c.taux_horaire_paye::DECIMAL(10,4)), 0) AS cout_missions,
-            COALESCE(SUM(hc.h_fact * c.taux_horaire_fact::DECIMAL(10,4)), 0) AS ca_missions
+            COALESCE(SUM(hc.h_paye * c.taux_paye::DECIMAL(10,4)), 0) AS cout_missions,
+            COALESCE(SUM(hc.h_fact * c.taux_fact::DECIMAL(10,4)), 0) AS ca_missions
         FROM missions m
         LEFT JOIN contrats c ON c.per_id=m.per_id AND c.cnt_id=m.cnt_id
         -- DT-09: pré-agréger heures par (per_id, cnt_id) pour éviter doublons de relevés
@@ -94,12 +94,12 @@ def build_scorecard_query(cfg: Config) -> str:
     base_transfo AS (
         SELECT
             cmd.rgpcnt_id::INT AS agence_id,
-            DATE_TRUNC('month', TRY_CAST(cmd.cmd_dte AS DATE)) AS mois,
+            DATE_TRUNC('month', TRY_CAST(cmd.cmd_date AS DATE)) AS mois,
             COUNT(*) AS nb_commandes,
             -- statut NULL (absent DDL WTCMD) → taux_transformation sera NULL, documenté
-            COUNT(CASE WHEN cmd.statut IN ('P','C') THEN 1 END) AS nb_pourvues
+            COUNT(CASE WHEN cmd.stat_code IN ('P','C') THEN 1 END) AS nb_pourvues
         FROM commandes cmd
-        WHERE cmd.cmd_dte IS NOT NULL
+        WHERE cmd.cmd_date IS NOT NULL
         GROUP BY 1, 2
     )
     SELECT

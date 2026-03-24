@@ -1,126 +1,145 @@
 """silver_competences.py — Bronze → Iceberg OVH · Union normalisée métiers + habilitations + diplômes + expériences.
 Phase 2 · GI Data Lakehouse · Manifeste v2.0
 # CORRECTIONS DDL (probe 2026-03-05) :
-#   WTPMET      : ORDRE→PMET_ORDRE, PMET_NIVEAU absent DDL → NULL
-#   WTPHAB      : PHAB_DATEDEBUT→PHAB_DELIVR, PHAB_DATEFIN→PHAB_EXPIR
-#   WTPDIP      : PDIP_DATE confirmé (remplace PDIP_ANNEE)
-#   WTEXP       : ORDRE→EXP_ORDRE, EXP_POSTE absent, EXP_ENTREPRISE→EXP_NOM,
-#                 EXP_DUREE absent, EXP_DATEDEBUT→EXP_DEBUT, EXP_DATEFIN→EXP_FIN
+# WTPMET : ORDRE→PMET_ORDRE, PMET_NIVEAU absent DDL → NULL
+# WTPHAB : PHAB_DATEDEBUT→PHAB_DELIVR, PHAB_DATEFIN→PHAB_EXPIR
+# WTPDIP : PDIP_DATE confirmé (remplace PDIP_ANNEE)
+# WTEXP : ORDRE→EXP_ORDRE, EXP_POSTE absent, EXP_ENTREPRISE→EXP_NOM,
+# EXP_DUREE absent, EXP_DATEDEBUT→EXP_DEBUT, EXP_DATEFIN→EXP_FIN
 # ENRICHISSEMENT RÉFÉRENTIELS (2026-03-12) :
-#   WTMET  : is_active basé sur MET_DELETE (vs hardcode true) + pcs_code (PCS_CODE_2003 INSEE)
-#   WTTHAB : date_expiration = COALESCE(PHAB_EXPIR, PHAB_DELIVR + THAB_NBMOIS mois)
-#            is_active recalculé sur date_expiration composite
-#   WTTDIP : niveau = TDIP_REF (catégorie/niveau diplôme)
+# WTMET : is_active basé sur MET_DELETE (vs hardcode true) + pcs_code (PCS_CODE_2003 INSEE)
+# WTTHAB : date_expiration = COALESCE(PHAB_EXPIR, PHAB_DELIVR + THAB_NBMOIS mois)
+# is_active recalculé sur date_expiration composite
+# WTTDIP : niveau = TDIP_REF (catégorie/niveau diplôme)
+# CORRECTIONS (2026-03-23) :
+# #2 — FinOps : {cfg.date_partition} ajouté pour WTPMET/WTPHAB/WTPDIP/WTEXP (tables transactionnelles)
+#               WTMET/WTTHAB/WTTDIP conservés en /**/ (référentiels sans partition date garantie)
+# #3 — Idempotence : s3_delete_prefix avant COPY
+# #5 — CTE : ajout du ) manquant pour fermer dedup AS (...)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, s3_delete_prefix, logger
+
+_SILVER_PATH = "slv_interimaires/competences"
 
 
 def build_competences_query(cfg: Config) -> str:
     b = f"s3://{cfg.bucket_bronze}"
+    dp = cfg.date_partition
     return f"""
-    WITH metiers AS (
+WITH metiers AS (
+    SELECT
+        MD5(CONCAT(PER_ID::VARCHAR, '|METIER|',
+            COALESCE(r.MET_ID::VARCHAR, PMET_ORDRE::VARCHAR))) AS competence_id,
+        PER_ID::INT                                            AS per_id,
+        'METIER'                                               AS type_competence,
+        COALESCE(m.MET_ID::VARCHAR, '')                       AS code,
+        COALESCE(TRIM(r.MET_LIBELLE), 'Métier inconnu')       AS libelle,
+        NULL::VARCHAR                                          AS niveau,
+        NULL::DATE                                             AS date_obtention,
+        NULL::DATE                                             AS date_expiration,
+        -- MET_DELETE : 1 = supprimé logiquement, NULL/0 = actif
+        COALESCE(TRY_CAST(r.MET_DELETE AS INT), 0) = 0        AS is_active,
+        NULLIF(TRIM(r.PCS_CODE_2003::VARCHAR), '')            AS pcs_code,
+        'WTPMET'                                               AS _source_table,
+        m._loaded_at
+    FROM read_json_auto('{b}/raw_wtpmet/{dp}/*.json',
+        union_by_name=true, hive_partitioning=false) m
+    -- WTMET = référentiel quasi-statique → pas de partition date garantie → /**/
+    LEFT JOIN read_json_auto('{b}/raw_wtmet/**/*.json',
+        union_by_name=true, hive_partitioning=false) r
+    ON r.MET_ID = m.MET_ID
+),
+habilitations AS (
+    -- date_expiration = PHAB_EXPIR explicite OU date théorique (PHAB_DELIVR + THAB_NBMOIS mois)
+    SELECT
+        MD5(CONCAT(PER_ID::VARCHAR, '|HABILITATION|', THAB_ID::VARCHAR)) AS competence_id,
+        PER_ID::INT                                                        AS per_id,
+        'HABILITATION'                                                     AS type_competence,
+        COALESCE(THAB_ID::VARCHAR, '')                                    AS code,
+        COALESCE(TRIM(h.THAB_LIBELLE), 'Habilitation inconnue')           AS libelle,
+        ''                                                                 AS niveau,
+        TRY_CAST(h.PHAB_DELIVR AS DATE)                                    AS date_obtention,
+        exp                                                                AS date_expiration,
+        CASE WHEN exp IS NULL OR exp > CURRENT_DATE THEN true ELSE false END AS is_active,
+        NULL::VARCHAR                                                      AS pcs_code,
+        'WTPHAB'                                                           AS _source_table,
+        h._loaded_at
+    FROM (
         SELECT
-            MD5(CONCAT(PER_ID::VARCHAR, '|METIER|',
-                COALESCE(r.MET_ID::VARCHAR, PMET_ORDRE::VARCHAR))) AS competence_id,
-            PER_ID::INT AS per_id,
-            'METIER' AS type_competence,
-            COALESCE(m.MET_ID::VARCHAR, '') AS code,
-            COALESCE(TRIM(r.MET_LIBELLE), 'Métier inconnu') AS libelle,
-            NULL::VARCHAR AS niveau,
-            NULL::DATE AS date_obtention,
-            NULL::DATE AS date_expiration,
-            -- MET_DELETE : 1 = supprimé logiquement, NULL/0 = actif
-            COALESCE(TRY_CAST(r.MET_DELETE AS INT), 0) = 0 AS is_active,
-            NULLIF(TRIM(r.PCS_CODE_2003::VARCHAR), '') AS pcs_code,
-            'WTPMET' AS _source_table,
-            m._loaded_at
-        FROM read_json_auto('{b}/raw_wtpmet/**/*.json', union_by_name=true, hive_partitioning=false) m
-        LEFT JOIN read_json_auto('{b}/raw_wtmet/**/*.json', union_by_name=true, hive_partitioning=false) r
-            ON r.MET_ID = m.MET_ID
-    ),
-    habilitations AS (
-        -- date_expiration = PHAB_EXPIR explicite OU date théorique (PHAB_DELIVR + THAB_NBMOIS mois)
-        SELECT
-            MD5(CONCAT(PER_ID::VARCHAR, '|HABILITATION|', THAB_ID::VARCHAR)) AS competence_id,
-            PER_ID::INT AS per_id,
-            'HABILITATION' AS type_competence,
-            COALESCE(THAB_ID::VARCHAR, '') AS code,
-            COALESCE(TRIM(h.THAB_LIBELLE), 'Habilitation inconnue') AS libelle,
-            '' AS niveau,
-            TRY_CAST(h.PHAB_DELIVR AS DATE) AS date_obtention,
-            exp AS date_expiration,
-            CASE WHEN exp IS NULL OR exp > CURRENT_DATE THEN true ELSE false END AS is_active,
-            NULL::VARCHAR AS pcs_code,
-            'WTPHAB' AS _source_table,
-            h._loaded_at
-        FROM (
-            SELECT
-                h.*,
-                r.THAB_LIBELLE,
-                COALESCE(
-                    TRY_CAST(h.PHAB_EXPIR AS DATE),
-                    CASE WHEN TRY_CAST(r.THAB_NBMOIS AS INT) IS NOT NULL
-                              AND TRY_CAST(h.PHAB_DELIVR AS DATE) IS NOT NULL
-                         THEN TRY_CAST(h.PHAB_DELIVR AS DATE)
-                              + (TRY_CAST(r.THAB_NBMOIS AS INT) * INTERVAL '1 month')
-                         ELSE NULL END
-                ) AS exp
-            FROM read_json_auto('{b}/raw_wtphab/**/*.json', union_by_name=true, hive_partitioning=false) h
-            LEFT JOIN read_json_auto('{b}/raw_wtthab/**/*.json', union_by_name=true, hive_partitioning=false) r
-                ON r.THAB_ID = h.THAB_ID
-        ) h
-    ),
-    diplomes AS (
-        SELECT
-            MD5(CONCAT(PER_ID::VARCHAR, '|DIPLOME|', d.TDIP_ID::VARCHAR)) AS competence_id,
-            PER_ID::INT AS per_id,
-            'DIPLOME' AS type_competence,
-            COALESCE(d.TDIP_ID::VARCHAR, '') AS code,
-            COALESCE(TRIM(r.TDIP_LIB), 'Diplôme inconnu') AS libelle,
-            -- TDIP_REF = catégorie/niveau diplôme (référentiel)
-            NULLIF(TRY_CAST(r.TDIP_REF AS VARCHAR), '') AS niveau,
-            TRY_CAST(d.PDIP_DATE AS DATE) AS date_obtention,
-            NULL::DATE AS date_expiration,
-            true AS is_active,
-            NULL::VARCHAR AS pcs_code,
-            'WTPDIP' AS _source_table,
-            d._loaded_at
-        FROM read_json_auto('{b}/raw_wtpdip/**/*.json', union_by_name=true, hive_partitioning=false) d
-        LEFT JOIN read_json_auto('{b}/raw_wttdip/**/*.json', union_by_name=true, hive_partitioning=false) r
-            ON r.TDIP_ID = d.TDIP_ID
-    ),
-    experiences AS (
-        SELECT
-            MD5(CONCAT(PER_ID::VARCHAR, '|EXPERIENCE|', EXP_ORDRE::VARCHAR)) AS competence_id,
-            PER_ID::INT AS per_id,
-            'EXPERIENCE' AS type_competence,
-            COALESCE(EXP_ORDRE::VARCHAR, '') AS code,
-            TRIM(COALESCE(EXP_NOM, 'Expérience inconnue')) AS libelle,
-            NULL::VARCHAR AS niveau,
-            TRY_CAST(e.EXP_DEBUT AS DATE) AS date_obtention,
-            TRY_CAST(e.EXP_FIN   AS DATE) AS date_expiration,
-            true AS is_active,
-            NULL::VARCHAR AS pcs_code,
-            'WTEXP' AS _source_table,
-            e._loaded_at
-        FROM read_json_auto('{b}/raw_wtexp/**/*.json', union_by_name=true, hive_partitioning=false) e
-    ),
-    all_comp AS (
-        SELECT * FROM metiers
-        UNION ALL SELECT * FROM habilitations
-        UNION ALL SELECT * FROM diplomes
-        UNION ALL SELECT * FROM experiences
-    ),
-    dedup AS (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY competence_id ORDER BY _loaded_at DESC) AS rn
-        FROM all_comp
-    )
-    SELECT competence_id, per_id, type_competence, code, libelle, niveau,
-           date_obtention, date_expiration, is_active, pcs_code, _source_table,
-           CURRENT_TIMESTAMP AS _loaded_at
-    FROM dedup WHERE rn = 1 AND per_id IS NOT NULL
-    """
+            h.*,
+            r.THAB_LIBELLE,
+            COALESCE(
+                TRY_CAST(h.PHAB_EXPIR AS DATE),
+                CASE WHEN TRY_CAST(r.THAB_NBMOIS AS INT) IS NOT NULL
+                          AND TRY_CAST(h.PHAB_DELIVR AS DATE) IS NOT NULL
+                     THEN TRY_CAST(h.PHAB_DELIVR AS DATE)
+                          + (TRY_CAST(r.THAB_NBMOIS AS INT) * INTERVAL '1 month')
+                     ELSE NULL END
+            ) AS exp
+        FROM read_json_auto('{b}/raw_wtphab/{dp}/*.json',
+            union_by_name=true, hive_partitioning=false) h
+        -- WTTHAB = référentiel quasi-statique → /**/
+        LEFT JOIN read_json_auto('{b}/raw_wtthab/**/*.json',
+            union_by_name=true, hive_partitioning=false) r
+        ON r.THAB_ID = h.THAB_ID
+    ) h
+),
+diplomes AS (
+    SELECT
+        MD5(CONCAT(PER_ID::VARCHAR, '|DIPLOME|', d.TDIP_ID::VARCHAR)) AS competence_id,
+        PER_ID::INT                                                     AS per_id,
+        'DIPLOME'                                                       AS type_competence,
+        COALESCE(d.TDIP_ID::VARCHAR, '')                               AS code,
+        COALESCE(TRIM(r.TDIP_LIB), 'Diplôme inconnu')                  AS libelle,
+        -- TDIP_REF = catégorie/niveau diplôme (référentiel)
+        NULLIF(TRY_CAST(r.TDIP_REF AS VARCHAR), '')                    AS niveau,
+        TRY_CAST(d.PDIP_DATE AS DATE)                                   AS date_obtention,
+        NULL::DATE                                                      AS date_expiration,
+        true                                                            AS is_active,
+        NULL::VARCHAR                                                   AS pcs_code,
+        'WTPDIP'                                                        AS _source_table,
+        d._loaded_at
+    FROM read_json_auto('{b}/raw_wtpdip/{dp}/*.json',
+        union_by_name=true, hive_partitioning=false) d
+    -- WTTDIP = référentiel quasi-statique → /**/
+    LEFT JOIN read_json_auto('{b}/raw_wttdip/**/*.json',
+        union_by_name=true, hive_partitioning=false) r
+    ON r.TDIP_ID = d.TDIP_ID
+),
+experiences AS (
+    SELECT
+        MD5(CONCAT(PER_ID::VARCHAR, '|EXPERIENCE|', EXP_ORDRE::VARCHAR)) AS competence_id,
+        PER_ID::INT                                                        AS per_id,
+        'EXPERIENCE'                                                       AS type_competence,
+        COALESCE(EXP_ORDRE::VARCHAR, '')                                  AS code,
+        TRIM(COALESCE(EXP_NOM, 'Expérience inconnue'))                    AS libelle,
+        NULL::VARCHAR                                                      AS niveau,
+        TRY_CAST(e.EXP_DEBUT AS DATE)                                      AS date_obtention,
+        TRY_CAST(e.EXP_FIN AS DATE)                                        AS date_expiration,
+        true                                                               AS is_active,
+        NULL::VARCHAR                                                      AS pcs_code,
+        'WTEXP'                                                            AS _source_table,
+        e._loaded_at
+    FROM read_json_auto('{b}/raw_wtexp/{dp}/*.json',
+        union_by_name=true, hive_partitioning=false) e
+),
+all_comp AS (
+    SELECT * FROM metiers
+    UNION ALL SELECT * FROM habilitations
+    UNION ALL SELECT * FROM diplomes
+    UNION ALL SELECT * FROM experiences
+),
+dedup AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY competence_id ORDER BY _loaded_at DESC) AS rn
+    FROM all_comp
+)   -- correction #5 : ) manquant pour fermer dedup AS (...)
+SELECT
+    competence_id, per_id, type_competence, code, libelle, niveau,
+    date_obtention, date_expiration, is_active, pcs_code, _source_table,
+    CURRENT_TIMESTAMP AS _loaded_at
+FROM dedup WHERE rn = 1 AND per_id IS NOT NULL
+"""
 
 
 def run(cfg: Config) -> dict:
@@ -128,14 +147,24 @@ def run(cfg: Config) -> dict:
     try:
         with get_duckdb_connection(cfg) as ddb:
             q = build_competences_query(cfg)
-            silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/competences/**/*.parquet"
+            silver_path = f"s3://{cfg.bucket_silver}/{_SILVER_PATH}/**/*.parquet"
             if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-                count = ddb.execute(f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
-                logger.info(json.dumps({"mode": cfg.mode.value, "table": "competences", "rows": count}))
+                count = ddb.execute(
+                    f"SELECT COUNT(*) FROM ({q})").fetchone()[0]
+                logger.info(json.dumps(
+                    {"mode": cfg.mode.value, "table": "competences", "rows": count}))
             else:
-                ddb.execute(f"COPY ({q}) TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)")
-                count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
-                logger.info(json.dumps({"table": "competences", "rows": count}))
+                # Purge avant écriture — correction #3
+                s3_delete_prefix(cfg, cfg.bucket_silver, _SILVER_PATH + "/")
+                ddb.execute(
+                    f"COPY ({q}) TO '{silver_path}' "
+                    f"(FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)"
+                )
+                count = ddb.execute(
+                    f"SELECT COUNT(*) FROM read_parquet('{silver_path}')"
+                ).fetchone()[0]
+                logger.info(json.dumps(
+                    {"table": "competences", "rows": count}))
             stats.rows_transformed = count
     except Exception as e:
         logger.exception(json.dumps({"table": "competences", "error": str(e)}))

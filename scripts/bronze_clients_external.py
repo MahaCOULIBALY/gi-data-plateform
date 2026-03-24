@@ -1,5 +1,8 @@
 """bronze_clients_external.py — Enrichissement clients depuis SIRENE API + Salesforce.
 Phase 1 · GI Data Lakehouse · Manifeste v2.0
+# CORRECTIONS (2026-03-23) :
+#   s3_delete_prefix centralisée depuis shared.py — purge avant écriture généralisée
+#   run_sirene / run_salesforce : purge du préfixe date avant upload (idempotence re-run)
 """
 import os
 import json
@@ -8,7 +11,10 @@ import urllib.request
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
-from shared import Config, Stats, generate_batch_id, today_s3_prefix, upload_to_s3, logger
+from shared import (
+    Config, Stats, generate_batch_id, today_s3_prefix,
+    upload_to_s3, s3_delete_prefix, logger,
+)
 from pipeline_utils import with_retry
 
 SIRENE_ENDPOINT = "https://api.insee.fr/entreprises/sirene/V3.11/siret"
@@ -53,17 +59,6 @@ def fetch_sirene(siret: str, token: str) -> dict | None:
         }
 
 
-def _handle_sirene_404(siret: str) -> dict | None:
-    """Wraps fetch_sirene pour intercepter 404 sans lever une exception."""
-    try:
-        # token injecté via closure dans run_sirene
-        return fetch_sirene(siret, _token_ref)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return None
-        raise
-
-
 def load_sirets(path: str) -> list[str]:
     try:
         with open(path) as f:
@@ -92,13 +87,19 @@ def run_sirene(cfg: Config, ext: ExternalConfig, stats: Stats) -> None:
     if not sirets:
         return
     batch_id = generate_batch_id()
+    prefix = f"raw_sirene/{today_s3_prefix()}"
+
+    # Purge avant écriture — idempotence re-run dans la même journée
+    # s3_delete_prefix gère le guard OFFLINE/PROBE : no-op hors mode LIVE
+    s3_delete_prefix(cfg, cfg.bucket_bronze, prefix)
+
     results, not_found = [], 0
     for i, siret in enumerate(sirets):
         try:
             data = fetch_sirene(siret.strip(), ext.sirene_token)
             if data:
-                data.update({"_loaded_at": datetime.now(
-                    timezone.utc).isoformat(), "_batch_id": batch_id})
+                data.update({"_loaded_at": datetime.now(timezone.utc).isoformat(),
+                             "_batch_id": batch_id})
                 results.append(data)
             else:
                 not_found += 1
@@ -114,16 +115,22 @@ def run_sirene(cfg: Config, ext: ExternalConfig, stats: Stats) -> None:
         time.sleep(2 if (i + 1) % SIRENE_RATE_LIMIT != 0 else 60)
 
     if results:
-        key = f"raw_sirene/{today_s3_prefix()}/batch_{batch_id}.json"
+        key = f"{prefix}/batch_{batch_id}.json"
         upload_to_s3(cfg, results, cfg.bucket_bronze, key, stats)
         stats.rows_ingested += len(results)
-    stats.extra.update({"sirene_found": len(results),
-                       "sirene_not_found": not_found})
-    stats.tables_processed += 1
+        stats.extra.update({"sirene_found": len(results),
+                           "sirene_not_found": not_found})
+        stats.tables_processed += 1
 
 
 def run_salesforce(cfg: Config, ext: ExternalConfig, stats: Stats) -> None:
     batch_id = generate_batch_id()
+    prefix = f"raw_salesforce_accounts/{today_s3_prefix()}"
+
+    # Purge avant écriture — idempotence re-run dans la même journée
+    # s3_delete_prefix gère le guard OFFLINE/PROBE : no-op hors mode LIVE
+    s3_delete_prefix(cfg, cfg.bucket_bronze, prefix)
+
     if ext.salesforce_enabled:
         logger.info(json.dumps(
             {"info": "salesforce live mode not yet implemented — using stub"}))
@@ -131,7 +138,7 @@ def run_salesforce(cfg: Config, ext: ExternalConfig, stats: Stats) -> None:
     accounts = generate_salesforce_stub()
     enriched = [{**a, "_loaded_at": datetime.now(timezone.utc).isoformat(), "_batch_id": batch_id}
                 for a in accounts]
-    key = f"raw_salesforce_accounts/{today_s3_prefix()}/batch_{batch_id}.json"
+    key = f"{prefix}/batch_{batch_id}.json"
     upload_to_s3(cfg, enriched, cfg.bucket_bronze, key, stats)
     stats.rows_ingested += len(enriched)
     stats.extra["salesforce_accounts"] = len(enriched)

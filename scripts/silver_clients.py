@@ -2,14 +2,18 @@
 Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # FinOps (2026-03-05) : lecture partitionnée Bronze ({cfg.date_partition})
 # CORRECTIONS DDL (probe 2026-03-05) :
-#   WTTIESERV : TIES_RS→TIES_RAISOC→TIES_DESIGNATION (confirmé bronze_clients v2)
-#               TIES_CODPOS→TIES_CODEP (confirmé bronze_clients v2)
-#               TIES_SIRET absent DDL → siren via TIES_SIREN, naf via NAF/NAF2008 (sans préfixe TIES_)
-#               Adresse : TIES_ADR1/ADR2/CODEP/VILLE confirmés
-#   WTCLPT    : CLPT_PROSPEC→CLPT_PROS, CLPT_CAESTIME→CLPT_CAPT,
-#               CLPT_DATCREA→CLPT_DCREA (confirmés bronze_clients v2)
+# WTTIESERV : TIES_RS→TIES_RAISOC→TIES_DESIGNATION (confirmé bronze_clients v2)
+# TIES_CODPOS→TIES_CODEP (confirmé bronze_clients v2)
+# TIES_SIRET absent DDL → siren via TIES_SIREN, naf via NAF/NAF2008 (sans préfixe TIES_)
+# Adresse : TIES_ADR1/ADR2/CODEP/VILLE confirmés
+# WTCLPT : CLPT_PROSPEC→CLPT_PROS, CLPT_CAESTIME→CLPT_CAPT,
+# CLPT_DATCREA→CLPT_DCREA (confirmés bronze_clients v2)
 # CORRECTIONS DDL (2026-03-11) :
-#   Alignement colonnes WTTIESERV/WTCLPT sur Bronze v2 (state card silver_required)
+# Alignement colonnes WTTIESERV/WTCLPT sur Bronze v2 (state card silver_required)
+# CORRECTIONS (2026-03-23) :
+# #1 — SCD2 : existing lu depuis Silver avant _apply_scd2 (était hardcodé [])
+#             historical recalculé depuis existing réel → historique préservé
+# #3 — Idempotence : s3_delete_prefix avant COPY (snapshot SCD2 atomique)
 """
 import hashlib
 import json
@@ -17,43 +21,46 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, s3_delete_prefix, logger
 
 # TIES_SIREN/NIC et naf_code ajoutés au tracking SCD2 (NIC ajouté 2026-03-11)
 SCD2_TRACKED_COLS = ("raison_sociale", "siren", "nic", "naf_code",
                      "adresse_complete", "ville", "code_postal",
                      "statut_client", "ca_potentiel")
 
+_SILVER_PATH = "slv_clients/dim_clients"
+
 
 def build_staging_query(cfg: Config) -> str:
     b = f"s3://{cfg.bucket_bronze}"
     return f"""
-    WITH raw_ties AS (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY TIE_ID, TIES_SERV ORDER BY _loaded_at DESC) AS rn
-        FROM read_json_auto('{b}/raw_wttieserv/{cfg.date_partition}/*.json',
-                            union_by_name=true, hive_partitioning=false)
-    ),
-    raw_clpt AS (
-        SELECT * FROM read_json_auto('{b}/raw_wtclpt/{cfg.date_partition}/*.json',
-                                     union_by_name=true, hive_partitioning=false)
-    )
-    SELECT
-        t.TIE_ID::INT                                               AS tie_id,
-        TRIM(t.TIES_DESIGNATION)                                    AS raison_sociale,
-        TRIM(COALESCE(t.TIES_SIREN, ''))                            AS siren,
-        CASE WHEN LEN(TRIM(t.TIES_NIC)) = 5 THEN TRIM(t.TIES_NIC) ELSE NULL END AS nic,
-        TRIM(COALESCE(t.NAF, COALESCE(t.NAF2008, '')))              AS naf_code,
-        CONCAT_WS(' ', t.TIES_ADR1, t.TIES_ADR2, t.TIES_CODEP, t.TIES_VILLE) AS adresse_complete,
-        TRIM(t.TIES_VILLE)                                          AS ville,
-        TRIM(t.TIES_CODEP)                                          AS code_postal,
-        TRIM(COALESCE(c.CLPT_PROS::VARCHAR, 'INCONNU'))             AS statut_client,
-        TRY_CAST(c.CLPT_CAPT AS DECIMAL(18,2))                     AS ca_potentiel,
-        TRY_CAST(c.CLPT_DCREA AS DATE)                             AS date_creation_fiche,
-        t._batch_id                                                  AS _source_raw_id
-    FROM raw_ties t
-    LEFT JOIN raw_clpt c ON c.TIE_ID::INT = t.TIE_ID::INT
-    WHERE t.rn = 1 AND t.TIE_ID IS NOT NULL
-    """
+WITH raw_ties AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY TIE_ID, TIES_SERV ORDER BY _loaded_at DESC) AS rn
+    FROM read_json_auto('{b}/raw_wttieserv/{cfg.date_partition}/*.json',
+        union_by_name=true, hive_partitioning=false)
+),
+raw_clpt AS (
+    SELECT * FROM read_json_auto('{b}/raw_wtclpt/{cfg.date_partition}/*.json',
+        union_by_name=true, hive_partitioning=false)
+)
+SELECT
+    t.TIE_ID::INT                                                  AS tie_id,
+    TRIM(t.TIES_DESIGNATION)                                       AS raison_sociale,
+    TRIM(COALESCE(t.TIES_SIREN, ''))                              AS siren,
+    CASE WHEN LEN(TRIM(t.TIES_NIC)) = 5 THEN TRIM(t.TIES_NIC) ELSE NULL END AS nic,
+    TRIM(COALESCE(t.NAF, COALESCE(t.NAF2008, '')))               AS naf_code,
+    CONCAT_WS(' ', t.TIES_ADR1, t.TIES_ADR2, t.TIES_CODEP, t.TIES_VILLE) AS adresse_complete,
+    TRIM(t.TIES_VILLE)                                             AS ville,
+    TRIM(t.TIES_CODEP)                                             AS code_postal,
+    TRIM(COALESCE(c.CLPT_PROS::VARCHAR, 'INCONNU'))               AS statut_client,
+    TRY_CAST(c.CLPT_CAPT AS DECIMAL(18,2))                        AS ca_potentiel,
+    TRY_CAST(c.CLPT_DCREA AS DATE)                                 AS date_creation_fiche,
+    TRIM(c.CLPT_EFFT::VARCHAR)                                     AS effectif_tranche,
+    t._batch_id                                                    AS _source_raw_id
+FROM raw_ties t
+LEFT JOIN raw_clpt c ON c.TIE_ID::INT = t.TIE_ID::INT
+WHERE t.rn = 1 AND t.TIE_ID IS NOT NULL
+"""
 
 
 def _hash(row: dict) -> str:
@@ -64,14 +71,14 @@ def _hash(row: dict) -> str:
 def _apply_scd2(
     staging: list[dict],
     existing: list[dict],
-    now: "datetime",
+    now: datetime,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Logique SCD Type 2 pure — sans I/O, testable unitairement.
     Retourne (new_records, closed_records, unchanged_current).
+    historical (is_current=False) est calculé par run() depuis existing.
     """
     current_by_id: dict[int, dict] = {
         int(r["tie_id"]): r for r in existing if r.get("is_current")}
-    historical = [r for r in existing if not r.get("is_current")]
     new_records: list[dict] = []
     closed_records: list[dict] = []
 
@@ -99,6 +106,7 @@ def _apply_scd2(
             "statut_client": rd.get("statut_client", "INCONNU"),
             "ca_potentiel": rd.get("ca_potentiel"),
             "date_creation_fiche": rd.get("date_creation_fiche"),
+            "effectif_tranche": rd.get("effectif_tranche"),
             "is_current": True,
             "valid_from": now.isoformat(),
             "valid_to": None,
@@ -107,13 +115,15 @@ def _apply_scd2(
         })
 
     changed_ids = {int(r["tie_id"]) for r in new_records}
-    unchanged_current = [r for pid, r in current_by_id.items() if pid not in changed_ids]
+    unchanged_current = [r for pid,
+                         r in current_by_id.items() if pid not in changed_ids]
     return new_records, closed_records, unchanged_current
 
 
 def run(cfg: Config) -> dict:
     stats = Stats()
     now = datetime.now(timezone.utc)
+    silver_path = f"s3://{cfg.bucket_silver}/{_SILVER_PATH}/**/*.parquet"
 
     with get_duckdb_connection(cfg) as ddb:
         res = ddb.execute(build_staging_query(cfg))
@@ -123,28 +133,55 @@ def run(cfg: Config) -> dict:
             stats.warnings.append("No Bronze clients data")
             return stats.finish()
 
-        existing: list[dict] = []
-        historical = [r for r in existing if not r.get("is_current")]
-        new_records, closed_records, unchanged_current = _apply_scd2(staging, existing, now)
-        all_records = historical + closed_records + unchanged_current + new_records
-        stats.extra = {"records_written": len(all_records), "closed": len(closed_records)}
+        # Lire l'état Silver existant — correction #1
+        # Premier run ou Silver absent → existing=[] (pas d'erreur)
+        try:
+            res_ex = ddb.execute(
+                f"SELECT * FROM read_parquet('{silver_path}')")
+            existing = [dict(zip([d[0] for d in res_ex.description], row))
+                        for row in res_ex.fetchall()]
+            logger.info(json.dumps({"silver_existing_records": len(existing)}))
+        except Exception:
+            existing = []
 
-        silver_path = f"s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet"
+        # historical = versions déjà fermées dans le Silver (is_current=False)
+        historical = [r for r in existing if not r.get("is_current")]
+        new_records, closed_records, unchanged_current = _apply_scd2(
+            staging, existing, now)
+        all_records = historical + closed_records + unchanged_current + new_records
+        # Normalisation schema — garantit que toutes les colonnes ajoutées après le 1er run
+        # sont présentes dans TOUS les records (JSONL union_by_name ne suffit pas si les
+        # nouvelles colonnes n'apparaissent qu'en fin de fichier, hors de la fenêtre de sampling)
+        _schema_defaults = {"effectif_tranche": None}
+        for r in all_records:
+            for k, v in _schema_defaults.items():
+                r.setdefault(k, v)
+        stats.extra = {"records_written": len(all_records), "closed": len(closed_records),
+                       "new": len(new_records), "unchanged": len(unchanged_current)}
+
         if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
             count = len(all_records)
-            logger.info(json.dumps({"mode": cfg.mode.value, "table": "dim_clients", "rows": count}))
+            logger.info(json.dumps(
+                {"mode": cfg.mode.value, "table": "dim_clients", "rows": count}))
         elif all_records:
+            # Purge avant écriture — correction #3
+            # Le snapshot SCD2 est COMPLET et ATOMIQUE : purge + réécriture = idempotent
+            # s3_delete_prefix gère le guard OFFLINE/PROBE nativement (no-op si non LIVE)
+            s3_delete_prefix(cfg, cfg.bucket_silver, _SILVER_PATH + "/")
             with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
                 for r in all_records:
                     f.write(json.dumps(r, default=str) + "\n")
-                tmp = f.name
+            tmp = f.name
             try:
                 ddb.execute(
                     f"COPY (SELECT * FROM read_json_auto('{tmp}', union_by_name=true)) "
                     f"TO '{silver_path}' (FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)"
                 )
-                count = ddb.execute(f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
-                logger.info(json.dumps({"table": "dim_clients", "rows": count}))
+                count = ddb.execute(
+                    f"SELECT COUNT(*) FROM read_parquet('{silver_path}')"
+                ).fetchone()[0]
+                logger.info(json.dumps(
+                    {"table": "dim_clients", "rows": count}))
             finally:
                 os.unlink(tmp)
         stats.rows_transformed = len(new_records)

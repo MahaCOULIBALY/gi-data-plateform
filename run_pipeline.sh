@@ -277,7 +277,6 @@ elif [[ "$CMD" == "full-probe" ]]; then
 # =============================================================================
 elif [[ "$CMD" == "full" ]]; then
     _banner "PIPELINE COMPLET — LIVE"
-    _warn "Gold sera ignoré (migration iceberg_scan → read_parquet requise)."
 
     bash "${BASH_SOURCE[0]}" bronze
     SILVER_DATE_PARTITION="$(date -u +%Y/%m/%d)" bash "${BASH_SOURCE[0]}" silver
@@ -310,8 +309,8 @@ else
     echo "  SILVER_DATE_PARTITION='**' ./run_pipeline.sh silver   # full-history"
     echo ""
     echo -e "${BOLD}Gold (Silver Parquet → PostgreSQL 18) :${RESET}"
-    echo "  gold-probe            Probe connectivité + comptes (gold live bloqué)"
-    echo "  gold                  ⚠ Bloqué — migration iceberg_scan requise"
+    echo "  gold-probe            Probe connectivité + comptes"
+    echo "  gold                  Silver Parquet → PostgreSQL Gold"
     echo ""
     echo -e "${BOLD}Pipeline complet :${RESET}"
     echo "  full-probe            Probe de bout en bout"

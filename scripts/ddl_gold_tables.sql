@@ -93,7 +93,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS dim_metiers_met_id_idx ON gld_shared.dim_metie
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS gld_commercial.fact_ca_mensuel_client (
-    client_sk               INTEGER,                    -- tie_id (pas de surrogate FK)
+    client_sk               VARCHAR(64),                -- MD5(tie_id) — surrogate key depuis dim_clients
     tie_id                  INTEGER         NOT NULL,
     mois                    DATE            NOT NULL,
     ca_ht                   DECIMAL(18,2)   NOT NULL DEFAULT 0,
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS gld_clients.fact_concentration_client (
 
 -- vue_360_client : version complète (gold_vue360_client.py — 27 colonnes)
 CREATE TABLE IF NOT EXISTS gld_clients.vue_360_client (
-    client_sk               INTEGER         NOT NULL,
+    client_sk               VARCHAR(64)     NOT NULL,
     tie_id                  INTEGER         NOT NULL,
     raison_sociale          VARCHAR(255),
     siren                   VARCHAR(9),
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS gld_clients.vue_360_client (
 
 -- fact_retention_client : version complète (gold_retention_client.py — 15 colonnes)
 CREATE TABLE IF NOT EXISTS gld_clients.fact_retention_client (
-    client_sk               INTEGER         NOT NULL,
+    client_sk               VARCHAR(64)     NOT NULL,
     tie_id                  INTEGER         NOT NULL,
     trimestre               DATE            NOT NULL,
     ca_net                  DECIMAL(18,2),
@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS gld_clients.fact_retention_client (
 );
 
 CREATE TABLE IF NOT EXISTS gld_clients.fact_rentabilite_client (
-    client_sk               INTEGER,
+    client_sk               VARCHAR(64),
     tie_id                  INTEGER         NOT NULL,
     annee                   SMALLINT        NOT NULL,
     ca_net                  DECIMAL(18,2),

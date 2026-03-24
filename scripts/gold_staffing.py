@@ -42,6 +42,7 @@ def build_activite_query(cfg: Config) -> str:
     dim_int AS (
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     cal AS (
         SELECT DISTINCT DATE_TRUNC('month', d::DATE) AS mois, 22 * 7.0 AS heures_dispo_mois
@@ -66,7 +67,7 @@ def build_activite_query(cfg: Config) -> str:
     SELECT
         interimaire_sk,
         per_id,
-        mois,
+        b.mois,
         COUNT(DISTINCT cnt_id) AS nb_missions,
         COUNT(DISTINCT rgpcnt_id) AS nb_agences,
         COUNT(DISTINCT tie_id) AS nb_clients,
@@ -78,26 +79,32 @@ def build_activite_query(cfg: Config) -> str:
         COALESCE(SUM(base_fact * taux_fact), 0) AS ca_genere
     FROM base b
     LEFT JOIN cal c ON c.mois = b.mois
-    WHERE mois IS NOT NULL
-    GROUP BY interimaire_sk, per_id, mois, c.heures_dispo_mois
+    WHERE b.mois IS NOT NULL
+    GROUP BY interimaire_sk, per_id, b.mois, c.heures_dispo_mois
     """
 
 
 def build_missions_detail_query(cfg: Config) -> str:
     return f"""
     WITH missions AS (
+        -- Dédupliquer sur (per_id, cnt_id) — Silver contient l'historique multi-versions
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id, cnt_id ORDER BY _loaded_at DESC NULLS LAST) = 1
     ),
     contrats AS (
+        -- Idem : une seule version de contrat par (per_id, cnt_id)
         SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/contrats/**/*.parquet')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id, cnt_id ORDER BY _loaded_at DESC NULLS LAST) = 1
     ),
-    releves AS (
-        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet')
-    ),
-    heures AS (
-        SELECT prh_bts, SUM(base_paye::DECIMAL(10,2)) AS total_heures
-        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet')
-        GROUP BY prh_bts
+    -- Pré-agréger heures à (per_id, cnt_id) — évite le fan-out mission_sk par relevé
+    heures_par_contrat AS (
+        SELECT r.per_id, r.cnt_id,
+               SUM(h.base_paye::DECIMAL(10,2)) AS total_heures
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_temps/releves_heures/**/*.parquet') r
+        LEFT JOIN read_parquet('s3://{cfg.bucket_silver}/slv_temps/heures_detail/**/*.parquet') h
+            ON h.prh_bts = r.prh_bts
+        WHERE r.per_id IS NOT NULL AND r.cnt_id IS NOT NULL
+        GROUP BY r.per_id, r.cnt_id
     )
     SELECT
         MD5(CONCAT(m.per_id::VARCHAR, '|', m.cnt_id::VARCHAR, '|', m.tie_id::VARCHAR)) AS mission_sk,
@@ -109,44 +116,93 @@ def build_missions_detail_query(cfg: Config) -> str:
         TRY_CAST(c.date_debut AS DATE) AS date_debut,
         TRY_CAST(c.date_fin AS DATE) AS date_fin,
         DATEDIFF('day', TRY_CAST(c.date_debut AS DATE), TRY_CAST(c.date_fin AS DATE)) AS duree_jours,
-        c.taux_horaire_paye::DECIMAL(10,4) AS taux_horaire_paye,
-        c.taux_horaire_fact::DECIMAL(10,4) AS taux_horaire_fact,
-        c.taux_horaire_fact::DECIMAL(10,4) - c.taux_horaire_paye::DECIMAL(10,4) AS marge_horaire,
-        COALESCE(h.total_heures, 0) AS heures_totales,
-        COALESCE(h.total_heures, 0) * c.taux_horaire_fact::DECIMAL(10,4) AS ca_mission,
-        COALESCE(h.total_heures, 0) * c.taux_horaire_paye::DECIMAL(10,4) AS cout_mission,
-        COALESCE(h.total_heures, 0) * (c.taux_horaire_fact::DECIMAL(10,4) - c.taux_horaire_paye::DECIMAL(10,4)) AS marge_mission,
-        CASE WHEN COALESCE(h.total_heures, 0) * c.taux_horaire_fact::DECIMAL(10,4) > 0
-             THEN ROUND((COALESCE(h.total_heures, 0) * (c.taux_horaire_fact::DECIMAL(10,4) - c.taux_horaire_paye::DECIMAL(10,4)))
-                  / (COALESCE(h.total_heures, 0) * c.taux_horaire_fact::DECIMAL(10,4)), 4)
-             ELSE 0 END AS taux_marge
+        c.taux_paye::DECIMAL(10,4) AS taux_horaire_paye,
+        c.taux_fact::DECIMAL(10,4) AS taux_horaire_fact,
+        c.taux_fact::DECIMAL(10,4) - c.taux_paye::DECIMAL(10,4) AS marge_horaire,
+        COALESCE(hc.total_heures, 0)                                                              AS heures_totales,
+        COALESCE(hc.total_heures, 0) * COALESCE(c.taux_fact::DECIMAL(10,4), 0)                   AS ca_mission,
+        COALESCE(hc.total_heures, 0) * COALESCE(c.taux_paye::DECIMAL(10,4), 0)                   AS cout_mission,
+        COALESCE(hc.total_heures, 0) * (COALESCE(c.taux_fact::DECIMAL(10,4), 0)
+                                       - COALESCE(c.taux_paye::DECIMAL(10,4), 0))                AS marge_mission,
+        CASE WHEN COALESCE(hc.total_heures, 0) * COALESCE(c.taux_fact::DECIMAL(10,4), 0) > 0
+             THEN ROUND((COALESCE(hc.total_heures, 0) * (COALESCE(c.taux_fact::DECIMAL(10,4), 0)
+                                                        - COALESCE(c.taux_paye::DECIMAL(10,4), 0)))
+                  / (COALESCE(hc.total_heures, 0) * COALESCE(c.taux_fact::DECIMAL(10,4), 0)), 4)
+             ELSE 0 END                                                                           AS taux_marge
     FROM missions m
     LEFT JOIN contrats c ON c.per_id = m.per_id AND c.cnt_id = m.cnt_id
-    -- PRH_BTS absent Silver missions → jointure via releves (per_id+cnt_id)
-    LEFT JOIN releves r ON r.per_id = m.per_id AND r.cnt_id = m.cnt_id
-    LEFT JOIN heures h ON h.prh_bts = r.prh_bts
+    LEFT JOIN heures_par_contrat hc ON hc.per_id = m.per_id AND hc.cnt_id = m.cnt_id
     WHERE m.per_id IS NOT NULL AND m.cnt_id IS NOT NULL
     """
 
 
 def build_fidelisation_query(cfg: Config) -> str:
     """Fidélisation intérimaires par agence/catégorie.
-    Source : silver.interimaires.fidelisation + silver.interimaires.portefeuille_agences.
+    Sources :
+      - slv_interimaires/fidelisation  (WTPINT — toutes les personnes)
+      - slv_interimaires/portefeuille_agences (WTUGPINT — rattachement per↔agence, peut être partiel)
+      - slv_interimaires/dim_interimaires.agence_rattachement (fallback si absent de WTUGPINT)
+    Un intérimaire est assigné à son agence portefeuille en priorité ; sinon à son agence de
+    rattachement Silver. Les intérimaires sans aucune agence résolue sont exclus.
     """
     return f"""
+    WITH portefeuille AS (
+        SELECT per_id, rgpcnt_id
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/portefeuille_agences/**/*.parquet')
+    ),
+    dim_int_current AS (
+        SELECT per_id, agence_rattachement
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
+        WHERE is_current = true AND agence_rattachement IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
+    )
     SELECT
-        p.rgpcnt_id::INT                                           AS agence_id,
+        COALESCE(p.rgpcnt_id, di.agence_rattachement)::INT         AS agence_id,
         f.categorie_fidelisation,
-        COUNT(DISTINCT f.per_id)                                   AS nb_interimaires,
-        ROUND(AVG(f.anciennete_jours), 1)::DECIMAL(10,1)           AS anciennete_moy_jours,
+        COUNT(DISTINCT f.per_id)                                    AS nb_interimaires,
+        ROUND(AVG(f.anciennete_jours), 1)::DECIMAL(10,1)            AS anciennete_moy_jours,
         ROUND(AVG(f.jours_depuis_derniere_vente), 1)::DECIMAL(10,1) AS jours_inactivite_moyen
     FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/fidelisation/**/*.parquet') f
-    LEFT JOIN read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/portefeuille_agences/**/*.parquet') p
-        ON p.per_id = f.per_id
-    WHERE p.rgpcnt_id IS NOT NULL
+    LEFT JOIN portefeuille p ON p.per_id = f.per_id
+    LEFT JOIN dim_int_current di ON di.per_id = f.per_id
+    WHERE COALESCE(p.rgpcnt_id, di.agence_rattachement) IS NOT NULL
     GROUP BY 1, 2
     ORDER BY 1, 2
     """
+
+
+def _log_fidelisation_coverage(cfg: Config, ddb) -> None:
+    """Log de couverture : nb intérimaires Silver fidelisation résolus vs perdus."""
+    try:
+        result = ddb.execute(f"""
+        WITH fidel AS (
+            SELECT per_id FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/fidelisation/**/*.parquet')
+        ),
+        portefeuille AS (
+            SELECT per_id FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/portefeuille_agences/**/*.parquet')
+        ),
+        dim_int AS (
+            SELECT per_id FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
+            WHERE is_current = true AND agence_rattachement IS NOT NULL
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
+        )
+        SELECT
+            COUNT(DISTINCT f.per_id)                                                  AS total_fidel,
+            COUNT(DISTINCT p.per_id)                                                  AS via_portefeuille,
+            COUNT(DISTINCT CASE WHEN p.per_id IS NULL THEN di.per_id END)             AS via_agence_rattachement,
+            COUNT(DISTINCT CASE WHEN p.per_id IS NULL AND di.per_id IS NULL
+                                THEN f.per_id END)                                    AS non_resolus
+        FROM fidel f
+        LEFT JOIN portefeuille p  ON p.per_id  = f.per_id
+        LEFT JOIN dim_int di      ON di.per_id = f.per_id
+        """).fetchone()
+        logger.info(
+            f"fidelisation coverage — total: {result[0]} | "
+            f"via_portefeuille: {result[1]} | via_agence_rattachement: {result[2]} | "
+            f"non_resolus (exclus): {result[3]}"
+        )
+    except Exception as e:
+        logger.warning(f"fidelisation coverage probe failed: {e}")
 
 
 def run(cfg: Config) -> dict:
@@ -162,6 +218,7 @@ def run(cfg: Config) -> dict:
     with get_duckdb_connection(cfg) as ddb:
         activite_rows = ddb.execute(build_activite_query(cfg)).fetchall()
         missions_rows = ddb.execute(build_missions_detail_query(cfg)).fetchall()
+        _log_fidelisation_coverage(cfg, ddb)
         fidelisation_rows = ddb.execute(build_fidelisation_query(cfg)).fetchall()
         logger.info(
             f"fact_activite_int: {len(activite_rows)} rows | "

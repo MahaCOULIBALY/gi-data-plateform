@@ -25,7 +25,8 @@ import pyodbc
 from shared import (
     Config, Stats, TableConfig, RunMode, _CHUNK_SIZE,
     generate_batch_id, today_s3_prefix,
-    get_evolia_connection, get_pg_connection, upload_to_s3, logger,
+    get_evolia_connection, get_pg_connection,
+    upload_to_s3, s3_delete_prefix, logger,
     filter_tables,
 )
 from pipeline_utils import WatermarkStore, with_retry
@@ -49,7 +50,8 @@ TABLES_DELTA: list[TableConfig] = [
     TableConfig("WTEFAC", "EFAC_DTEEDI", ["EFAC_NUM"]),
     TableConfig("WTPRH", "PRH_MODIFDATE", ["PRH_BTS"]),
     # allow_null_delta=True : contrats actifs ont CNT_DATEFIN IS NULL → capturés à chaque run
-    TableConfig("PYCONTRAT", "CNT_DATEFIN", ["PER_ID", "CNT_ID"], allow_null_delta=True),
+    TableConfig("PYCONTRAT", "CNT_DATEFIN", [
+                "PER_ID", "CNT_ID"], allow_null_delta=True),
     # RHD_DATED = date métier paie — utilisé comme proxy delta, horizon 2024-01-01 (voir FALLBACK_SINCE_OVERRIDE)
     TableConfig("WTRHDON", "RHD_DATED", ["RINT_ID", "RHD_LIGNE"]),
 ]
@@ -162,16 +164,24 @@ def _ingest(cfg: Config, conn: pyodbc.Connection, tc: TableConfig,
     Si rows est fourni, l'extraction est ignorée (cas WTLFAC filtrée par JOIN externe).
     """
     t0 = time.monotonic()
-    rows = rows if rows is not None else (_extract_delta(conn, tc, since) if since else _extract_full(conn, tc))
+    rows = rows if rows is not None else (_extract_delta(
+        conn, tc, since) if since else _extract_full(conn, tc))
     if not rows:
-        logger.info(json.dumps({"table": tc.name, "rows": 0, "status": "empty"}))
+        logger.info(json.dumps(
+            {"table": tc.name, "rows": 0, "status": "empty"}))
         return 0
     loaded_at = datetime.now(timezone.utc).isoformat()
     enriched = [{"_loaded_at": loaded_at, "_batch_id": batch_id,
                  "_source_table": tc.name, **r} for r in rows]
     # Chunking : 1 fichier S3 par tranche de _CHUNK_SIZE lignes (évite EntityTooLarge OVH)
-    chunks = [enriched[i:i + _CHUNK_SIZE] for i in range(0, len(enriched), _CHUNK_SIZE)]
+    chunks = [enriched[i:i + _CHUNK_SIZE]
+              for i in range(0, len(enriched), _CHUNK_SIZE)]
     prefix = f"raw_{tc.name.lower()}/{today_s3_prefix()}"
+
+    # Purge avant écriture pour les tables FULL
+    if since is None:  # mode full
+        s3_delete_prefix(cfg, cfg.bucket_bronze, prefix)
+
     for idx, chunk in enumerate(chunks):
         key = f"{prefix}/batch_{batch_id}_{idx:04d}.json"
         upload_to_s3(cfg, chunk, cfg.bucket_bronze, key, stats)
@@ -195,7 +205,8 @@ def run(cfg: Config) -> dict:
         wm = WatermarkStore(pg_conn, PIPELINE)
         with get_evolia_connection(cfg) as conn:
             for tc in filter_tables(TABLES_DELTA, cfg):
-                since = wm.get(tc.name) or FALLBACK_SINCE_OVERRIDE.get(tc.name, FALLBACK_SINCE)
+                since = wm.get(tc.name) or FALLBACK_SINCE_OVERRIDE.get(
+                    tc.name, FALLBACK_SINCE)
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
                         null_clause = f" OR {tc.delta_col} IS NULL" if tc.allow_null_delta else ""
@@ -212,7 +223,8 @@ def run(cfg: Config) -> dict:
                     n = _ingest(cfg, conn, tc, batch_id, since, stats) or 0
                     wm.set(tc.name, datetime.now(timezone.utc), n)
                 except Exception as e:
-                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                    logger.exception(json.dumps(
+                        {"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
             for tc in filter_tables(TABLES_FULL, cfg):
@@ -235,12 +247,15 @@ def run(cfg: Config) -> dict:
                         continue
                     try:
                         rows = _extract_wtlfac_filtered(conn, since)
-                        n = _ingest(cfg, conn, tc, batch_id, None, stats, rows=rows) or 0
+                        n = _ingest(cfg, conn, tc, batch_id,
+                                    None, stats, rows=rows) or 0
                         wm.set(tc.name, datetime.now(timezone.utc), n)
                     except Exception as e:
-                        logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                        logger.exception(json.dumps(
+                            {"table": tc.name, "error": str(e)}))
                         wm.mark_failed(tc.name, str(e))
-                        stats.errors.append({"table": tc.name, "error": str(e)})
+                        stats.errors.append(
+                            {"table": tc.name, "error": str(e)})
                     continue
                 if cfg.mode == RunMode.PROBE:
                     with conn.cursor() as cur:
@@ -254,7 +269,8 @@ def run(cfg: Config) -> dict:
                     n = _ingest(cfg, conn, tc, batch_id, None, stats) or 0
                     wm.set(tc.name, datetime.now(timezone.utc), n)
                 except Exception as e:
-                    logger.exception(json.dumps({"table": tc.name, "error": str(e)}))
+                    logger.exception(json.dumps(
+                        {"table": tc.name, "error": str(e)}))
                     wm.mark_failed(tc.name, str(e))
                     stats.errors.append({"table": tc.name, "error": str(e)})
     return stats.finish()

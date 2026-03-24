@@ -975,6 +975,7 @@ dependencies = [
     { name = "pyodbc" },
     { name = "pyspark" },
     { name = "python-dotenv" },
+    { name = "pytz" },
 ]
 
 [package.optional-dependencies]
@@ -1015,6 +1016,7 @@ requires-dist = [
     { name = "pyodbc", specifier = ">=5.0.0" },
     { name = "pyspark", specifier = ">=4.1.1" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pytz", specifier = ">=2026.1.post1" },
 ]
 provides-extras = ["quality", "dbt", "catalogue", "geo"]
 

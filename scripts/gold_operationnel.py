@@ -34,10 +34,10 @@ SQL = {
             rgpcnt_id                                           AS agence_id,
             DATE_TRUNC('week', cmd_date)::DATE                  AS semaine_debut,
             COUNT(*)                                            AS nb_commandes,
-            COUNT(*) FILTER (WHERE statut = 'P')                AS nb_pourvues,
-            COUNT(*) FILTER (WHERE statut = 'O')                AS nb_ouvertes,
+            COUNT(*) FILTER (WHERE stat_code = 'P')             AS nb_pourvues,
+            COUNT(*) FILTER (WHERE stat_code = 'O')             AS nb_ouvertes,
             COALESCE(
-                COUNT(*) FILTER (WHERE statut = 'P')::DECIMAL
+                COUNT(*) FILTER (WHERE stat_code = 'P')::DECIMAL
                 / NULLIF(COUNT(*), 0), 0
             )                                                   AS taux_satisfaction
         FROM silver_cmd

@@ -22,12 +22,14 @@ from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connect
 DOMAIN = "gld_clients"
 
 VUE360_COLS = [
-    "client_sk", "siren", "raison_sociale", "naf_code", "ville", "nb_sites",
-    "ca_ytd", "ca_n1", "delta_ca_pct", "encours_montant", "encours_limite", "risque_credit",
+    "client_sk", "tie_id", "raison_sociale", "siren", "ville",
+    "secteur_activite",
+    "ca_ytd", "ca_n1", "delta_ca_pct",
+    "montant_encours", "limite_credit", "risque_credit_score",
 ]
 
 RETENTION_COLS = [
-    "client_sk", "trimestre", "ca", "delta_ca", "nb_missions", "risque_churn",
+    "client_sk", "tie_id", "trimestre", "ca_net", "delta_ca_qoq", "nb_missions", "risque_churn",
 ]
 
 SQL = {
@@ -50,47 +52,53 @@ SQL = {
         )
         SELECT
             c.tie_id                                                AS client_sk,
-            TRIM(c.siren)                                           AS siren,
+            c.tie_id                                                AS tie_id,
             TRIM(c.raison_sociale)                                  AS raison_sociale,
-            TRIM(c.naf_code)                                        AS naf_code,
+            TRIM(c.siren)                                           AS siren,
             TRIM(c.ville)                                           AS ville,
-            COALESCE(s.nb_sites, 0)                                 AS nb_sites,
+            TRIM(c.naf_code)                                        AS secteur_activite,
             COALESCE(ca.ca_ytd, 0)                                  AS ca_ytd,
             COALESCE(ca.ca_n1, 0)                                   AS ca_n1,
             CASE WHEN COALESCE(ca.ca_n1, 0) = 0 THEN NULL
                  ELSE ROUND((ca.ca_ytd - ca.ca_n1) / ca.ca_n1, 4)
             END                                                     AS delta_ca_pct,
-            COALESCE(enc.montant_encours, 0)                        AS encours_montant,
-            COALESCE(enc.limite_credit, 0)                          AS encours_limite,
+            COALESCE(enc.montant_encours, 0)                        AS montant_encours,
+            COALESCE(enc.limite_credit, 0)                          AS limite_credit,
             CASE
                 WHEN enc.montant_encours > enc.limite_credit * 0.9 THEN 'CRITIQUE'
                 WHEN enc.montant_encours > enc.limite_credit * 0.7 THEN 'ELEVE'
                 ELSE 'NORMAL'
-            END                                                     AS risque_credit
+            END                                                     AS risque_credit_score
         FROM silver_clients c
         LEFT JOIN ca   ON ca.tie_id  = c.tie_id
-        LEFT JOIN sites s ON s.tie_id = c.tie_id
         LEFT JOIN enc  ON enc.siren  = c.siren
         WHERE c.tie_id IS NOT NULL
     """,
     "fact_retention_client": """
+        WITH agg AS (
+            SELECT
+                tie_id                             AS client_sk,
+                tie_id                             AS tie_id,
+                DATE_TRUNC('quarter', mois)::DATE  AS trimestre,
+                SUM(ca_ht)                         AS ca_net,
+                SUM(nb_missions)                   AS nb_missions
+            FROM silver_ca
+            GROUP BY tie_id, DATE_TRUNC('quarter', mois)::DATE
+        )
         SELECT
-            tie_id                                                  AS client_sk,
-            DATE_TRUNC('quarter', mois)::DATE                       AS trimestre,
-            SUM(ca_ht)                                              AS ca,
-            SUM(ca_ht) - LAG(SUM(ca_ht), 1, 0) OVER (
-                PARTITION BY tie_id ORDER BY DATE_TRUNC('quarter', mois)
-            )                                                       AS delta_ca,
-            SUM(nb_missions)                                        AS nb_missions,
+            client_sk,
+            tie_id,
+            trimestre,
+            ca_net,
+            ca_net - LAG(ca_net, 1, 0) OVER (PARTITION BY client_sk ORDER BY trimestre) AS delta_ca_qoq,
+            nb_missions,
             CASE
-                WHEN SUM(ca_ht) < LAG(SUM(ca_ht), 1, 0) OVER (
-                    PARTITION BY tie_id ORDER BY DATE_TRUNC('quarter', mois)
-                ) * 0.7 THEN 'RISQUE_FORT'
-                WHEN SUM(ca_ht) = 0 THEN 'INACTIF'
+                WHEN ca_net < LAG(ca_net, 1, 0) OVER (PARTITION BY client_sk ORDER BY trimestre) * 0.7
+                    THEN 'RISQUE_FORT'
+                WHEN ca_net = 0 THEN 'INACTIF'
                 ELSE 'STABLE'
-            END                                                     AS risque_churn
-        FROM silver_ca
-        GROUP BY 1, 2
+            END AS risque_churn
+        FROM agg
     """,
 }
 
@@ -103,8 +111,10 @@ _COLS_MAP = {
 def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
     """Enregistre les vues Silver Parquet + injecte fact_ca_mensuel_client depuis PostgreSQL."""
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_clients AS SELECT * FROM read_parquet("
-        f"'s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')"
+        f"CREATE OR REPLACE VIEW silver_clients AS "
+        f"SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet') "
+        f"WHERE is_current = true "
+        f"QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1"
     )
     ddb.execute(
         f"CREATE OR REPLACE VIEW silver_sites   AS SELECT * FROM read_parquet("

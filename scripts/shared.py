@@ -24,7 +24,6 @@ import pymssql
 import pyodbc
 from dotenv import load_dotenv
 
-
 # Charge .env.local (dev) ou .env (CI/prod) — AVANT les dataclasses
 _project_root = Path(__file__).resolve().parent.parent
 for _env_file in (".env", ".env.local"):
@@ -98,35 +97,52 @@ def get_run_mode() -> RunMode:
 @dataclass
 class Config:
     """Configuration centralisée. EVOLIA_SERVER format : 'host,port' (pymssql)."""
-    evolia_server:   str = field(default_factory=lambda: os.environ["EVOLIA_SERVER"])
-    evolia_db:       str = field(default_factory=lambda: os.environ["EVOLIA_DB"])
-    evolia_user:     str = field(default_factory=lambda: os.environ["EVOLIA_USER"])
-    evolia_password: str = field(default_factory=lambda: os.environ["EVOLIA_PASSWORD"])
+    evolia_server: str = field(
+        default_factory=lambda: os.environ["EVOLIA_SERVER"])
+    evolia_db: str = field(default_factory=lambda: os.environ["EVOLIA_DB"])
+    evolia_user: str = field(default_factory=lambda: os.environ["EVOLIA_USER"])
+    evolia_password: str = field(
+        default_factory=lambda: os.environ["EVOLIA_PASSWORD"])
     # evolia_odbc_driver retiré — plus utilisé avec pymssql.
     # Pour pipeline_dayack et projets pyodbc : DB_DRIVER dans leur propre .env
-    s3_endpoint:     str = field(default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
-    s3_access_key:   str = field(default_factory=lambda: os.environ["OVH_S3_ACCESS_KEY"])
-    s3_secret_key:   str = field(default_factory=lambda: os.environ["OVH_S3_SECRET_KEY"])
-    bucket_bronze:   str = field(default_factory=lambda: os.environ.get("OVH_S3_BUCKET_BRONZE", "gi-data-prod-bronze"))
-    bucket_silver:   str = field(default_factory=lambda: os.environ.get("OVH_S3_BUCKET_SILVER", "gi-data-prod-silver"))
-    bucket_gold:     str = field(default_factory=lambda: os.environ.get("OVH_S3_BUCKET_GOLD",   "gi-data-prod-gold"))
-    bucket_iceberg:  str = field(default_factory=lambda: os.environ["BUCKET_ICEBERG"])
-    ovh_pg_host:     str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
-    ovh_pg_port:     int = field(default_factory=lambda: int(os.environ.get("OVH_PG_PORT", "20184")))
-    ovh_pg_database: str = field(default_factory=lambda: os.environ.get("OVH_PG_DATABASE", "gi_poc_ddi_gold"))
-    ovh_pg_user:     str = field(default_factory=lambda: os.environ.get("OVH_PG_USER", ""))
-    ovh_pg_password: str = field(default_factory=lambda: os.environ.get("OVH_PG_PASSWORD", ""))
-    rgpd_salt:       str = field(default_factory=lambda: os.environ.get("RGPD_SALT", _RGPD_SALT_SENTINEL))
-    alert_email:     str = field(default_factory=lambda: os.environ.get("ALERT_EMAIL", "data-team@groupe-interaction.fr"))
-    mode:            RunMode = field(default_factory=get_run_mode)
-    date_partition:  str = field(
+    s3_endpoint: str = field(
+        default_factory=lambda: os.environ["OVH_S3_ENDPOINT"])
+    s3_access_key: str = field(
+        default_factory=lambda: os.environ["OVH_S3_ACCESS_KEY"])
+    s3_secret_key: str = field(
+        default_factory=lambda: os.environ["OVH_S3_SECRET_KEY"])
+    bucket_bronze: str = field(default_factory=lambda: os.environ.get(
+        "OVH_S3_BUCKET_BRONZE", "gi-data-prod-bronze"))
+    bucket_silver: str = field(default_factory=lambda: os.environ.get(
+        "OVH_S3_BUCKET_SILVER", "gi-data-prod-silver"))
+    bucket_gold: str = field(default_factory=lambda: os.environ.get(
+        "OVH_S3_BUCKET_GOLD", "gi-data-prod-gold"))
+    bucket_iceberg: str = field(
+        default_factory=lambda: os.environ["BUCKET_ICEBERG"])
+    ovh_pg_host: str = field(default_factory=lambda: os.environ["OVH_PG_HOST"])
+    ovh_pg_port: int = field(default_factory=lambda: int(
+        os.environ.get("OVH_PG_PORT", "20184")))
+    ovh_pg_database: str = field(default_factory=lambda: os.environ.get(
+        "OVH_PG_DATABASE", "gi_poc_ddi_gold"))
+    ovh_pg_user: str = field(
+        default_factory=lambda: os.environ.get("OVH_PG_USER", ""))
+    ovh_pg_password: str = field(
+        default_factory=lambda: os.environ.get("OVH_PG_PASSWORD", ""))
+    rgpd_salt: str = field(default_factory=lambda: os.environ.get(
+        "RGPD_SALT", _RGPD_SALT_SENTINEL))
+    alert_email: str = field(default_factory=lambda: os.environ.get(
+        "ALERT_EMAIL", "data-team@groupe-interaction.fr"))
+    mode: RunMode = field(default_factory=get_run_mode)
+    date_partition: str = field(
         default_factory=lambda: os.environ.get(
             "SILVER_DATE_PARTITION",
             datetime.now(timezone.utc).strftime("%Y/%m/%d"),
         )
     )
-    iceberg_uri:     str = field(default_factory=lambda: os.environ.get("OVH_ICEBERG_URI", ""))
-    iceberg_catalog: str = field(default_factory=lambda: os.environ.get("OVH_ICEBERG_CATALOG", "silver"))
+    iceberg_uri: str = field(
+        default_factory=lambda: os.environ.get("OVH_ICEBERG_URI", ""))
+    iceberg_catalog: str = field(
+        default_factory=lambda: os.environ.get("OVH_ICEBERG_CATALOG", "silver"))
 
     def __post_init__(self) -> None:
         # Refus explicite du salt par défaut en LIVE et PROBE (PROBE se connecte à Evolia en production)
@@ -140,7 +156,7 @@ class Config:
     def dry_run(self) -> bool:
         """Rétrocompatibilité — True si mode != LIVE."""
         return self.mode != RunMode.LIVE
-    
+
     @property
     def evolia_host(self) -> str:
         """Hôte SQL Server extrait de EVOLIA_SERVER (format 'host,port' ou 'host')."""
@@ -154,6 +170,7 @@ class Config:
 
     def iceberg_path(self, namespace: str, table: str) -> str:
         return f"s3://{self.bucket_iceberg}/iceberg/{namespace}/{table}"
+
 
 @dataclass
 class Stats:
@@ -181,12 +198,12 @@ class TableConfig:
     name: str
     delta_col: str
     pk_cols: list[str]
-    rgpd_flag: str = ""  # "" | "SENSIBLE" | "PERSONNEL"
+    rgpd_flag: str = ""      # "" | "SENSIBLE" | "PERSONNEL"
     # True → WHERE delta_col >= ? OR delta_col IS NULL (ex: contrats actifs sans date fin)
     allow_null_delta: bool = False
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def generate_batch_id() -> str:
     """UUID4 — pas de collision même en exécutions parallèles (K8s CronJobs)."""
@@ -226,7 +243,7 @@ def pseudonymize_nir(nir: str | None, salt: str) -> str | None:
     return hashlib.sha256(f"{nir}{salt}".encode()).hexdigest()
 
 
-# ── Connexions ───────────────────────────────────────────────────────────────────
+# ── Connexions ───────────────────────────────────────────────────────────────
 
 def get_evolia_connection(cfg: Config):
     """Connexion Evolia via pymssql (FreeTDS).
@@ -242,7 +259,7 @@ def get_evolia_connection(cfg: Config):
         user=cfg.evolia_user,
         password=cfg.evolia_password,
         login_timeout=30,
-        tds_version="7.4",    # TDS 7.4 = SQL Server 2012–2019
+        tds_version="7.4",  # TDS 7.4 = SQL Server 2012–2019
         autocommit=True,
     )
     return conn
@@ -266,7 +283,7 @@ def get_pg_connection(cfg: Config):
 
 def get_duckdb_connection(cfg: Config) -> duckdb.DuckDBPyConnection:
     """INSTALL + LOAD httpfs — idempotent (pas de re-download si déjà installé).
-    Nécessaire à chaque upgrade DuckDB (cache extensions versionnée par ~/.duckdb/extensions/<version>/).
+    Nécessaire à chaque upgrade DuckDB (cache extensions versionnée par ~/.duckdb/extensions/<ver>/<arch>/).
     En prod K8s OVH : httpfs pré-installé dans l'image → INSTALL est no-op.
     Credentials via CREATE SECRET (DuckDB ≥ 0.10) — évite les credentials en clair
     dans les logs SET et gère les apostrophes défensivement.
@@ -304,7 +321,7 @@ def get_duckdb_connection(cfg: Config) -> duckdb.DuckDBPyConnection:
     return conn
 
 
-# ── I/O ─────────────────────────────────────────────────────────────────────────
+# ── I/O ──────────────────────────────────────────────────────────────────────
 
 def upload_to_s3(cfg: Config, data: list[dict], bucket: str, key: str, stats: Stats) -> None:
     if cfg.mode == RunMode.OFFLINE:
@@ -319,6 +336,37 @@ def upload_to_s3(cfg: Config, data: list[dict], bucket: str, key: str, stats: St
                            for r in data).encode("utf-8")
     get_s3_client(cfg).put_object(Bucket=bucket, Key=key, Body=body_bytes)
     stats.bytes_written += len(body_bytes)
+
+
+def s3_delete_prefix(cfg: "Config", bucket: str, prefix: str) -> int:
+    """Purge tous les objets S3 sous `prefix` dans `bucket`.
+    Utilise le client boto3 singleton de cfg (mêmes credentials qu'upload_to_s3).
+    Guard OFFLINE/PROBE intégré — jamais de suppression hors mode LIVE.
+    Retourne le nombre d'objets supprimés.
+    """
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        logger.info(json.dumps({
+            "action": "s3_delete_prefix",
+            "mode": cfg.mode.value,
+            "bucket": bucket,
+            "prefix": prefix,
+            "deleted": 0,
+        }))
+        return 0
+    s3 = get_s3_client(cfg)
+    paginator = s3.get_paginator("list_objects_v2")
+    deleted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            deleted += 1
+    logger.info(json.dumps({
+        "action": "s3_delete_prefix",
+        "bucket": bucket,
+        "prefix": prefix,
+        "deleted": deleted,
+    }))
+    return deleted
 
 
 # Convention de nommage → type PG (évite le tout-TEXT, améliore perfs Superset)
@@ -359,13 +407,28 @@ def pg_bulk_insert(
             cur.execute(
                 f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({ddl_cols})')
             cur.execute(f'TRUNCATE TABLE "{schema}"."{table}"')
+            def _copy_val(v) -> str:
+                if v is None:
+                    return "\\N"
+                s = str(v)
+                # Échapper les caractères spéciaux du format COPY TEXT
+                s = s.replace("\\", "\\\\")
+                s = s.replace("\t", "\\t")
+                s = s.replace("\n", "\\n")
+                s = s.replace("\r", "\\r")
+                return s
             buf = io.StringIO()
             for row in rows:
-                buf.write("\t".join("\\N" if v is None else str(v)
-                          for v in row) + "\n")
+                buf.write("\t".join(_copy_val(v) for v in row) + "\n")
             buf.seek(0)
-            cur.copy_from(buf, f"{schema}.{table}",
-                          columns=columns, null="\\N")
+            # psycopg2.copy_from quote le nom de table comme un identifiant unique →
+            # "schema.table" échoue avec UndefinedTable. On utilise copy_expert avec
+            # une commande COPY explicite et des noms correctement délimités.
+            cols_sql = ", ".join(f'"{c}"' for c in columns)
+            cur.copy_expert(
+                f'COPY "{schema}"."{table}" ({cols_sql}) FROM STDIN WITH (FORMAT TEXT, NULL \'\\N\')',
+                buf,
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -392,57 +455,15 @@ def write_silver_iceberg(
     count = len(arrow_table)
 
     if cfg.mode == RunMode.PROBE:
-        logger.info(json.dumps({"table": table_id, "rows": count, "mode": cfg.mode.value}))
+        logger.info(json.dumps(
+            {"table": table_id, "rows": count, "mode": cfg.mode.value}))
         return count
 
-    # LIVE
-    from pyiceberg.catalog import load_catalog  # noqa: PLC0415
-    catalog = load_catalog(cfg.iceberg_catalog, uri=cfg.iceberg_uri)
-    table = catalog.load_table(table_id)
-    table.overwrite(arrow_table)
-    stats.rows_transformed += count
-    logger.info(json.dumps({"table": table_id, "rows": count, "mode": cfg.mode.value}))
+    from pyiceberg.catalog import load_catalog  # type: ignore
+    catalog = load_catalog(cfg.iceberg_catalog, **{"uri": cfg.iceberg_uri})
+    ns, tbl = table_id.split(".", 1)
+    iceberg_table = catalog.load_table(f"{ns}.{tbl}")
+    iceberg_table.overwrite(arrow_table)
+    logger.info(json.dumps({"table": table_id, "rows": count, "mode": "live"}))
+    stats.rows_ingested += count
     return count
-
-
-def count_iceberg(table_id: str, cfg: Config) -> int:
-    """Retourne le nombre de lignes dans la table Iceberg table_id.
-    OFFLINE : retourne 0. PROBE/LIVE : scan via PyIceberg.
-    Import pyiceberg lazy — les scripts Bronze n'ont pas pyiceberg installé.
-    """
-    if cfg.mode == RunMode.OFFLINE:
-        return 0
-
-    from pyiceberg.catalog import load_catalog  # noqa: PLC0415
-    catalog = load_catalog(cfg.iceberg_catalog, uri=cfg.iceberg_uri)
-    return catalog.load_table(table_id).scan().count()
-
-
-def atomic_load_gold(
-    cfg: Config, conn, schema: str, table: str,
-    columns: list[str], rows: list[tuple], stats: Stats,
-) -> None:
-    """Insert atomique via psycopg2.sql (injection-safe) + execute_batch.
-    Usage : tables critiques (fact_ca, scorecard) — rollback auto sur erreur.
-    """
-    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
-        logger.info(
-            f"[{cfg.mode.value.upper()}] Would atomic-load {len(rows)} rows → {schema}.{table}")
-        return
-    fqn = psycopg2.sql.SQL("{}.{}").format(
-        psycopg2.sql.Identifier(schema), psycopg2.sql.Identifier(table))
-    insert_sql = psycopg2.sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
-        fqn,
-        psycopg2.sql.SQL(", ").join(map(psycopg2.sql.Identifier, columns)),
-        psycopg2.sql.SQL(", ").join(
-            [psycopg2.sql.Placeholder()] * len(columns)),
-    )
-    try:
-        with conn.cursor() as cur:
-            cur.execute(psycopg2.sql.SQL("TRUNCATE TABLE {}").format(fqn))
-            psycopg2.extras.execute_batch(cur, insert_sql, rows, page_size=500)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    stats.rows_ingested += len(rows)
