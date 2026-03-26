@@ -416,6 +416,35 @@ ALTER TABLE gld_clients.vue_360_client
     ADD COLUMN IF NOT EXISTS code_postal      VARCHAR(10),
     ADD COLUMN IF NOT EXISTS adresse_complete TEXT;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 1 KPI completion (2026-03-26)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- fact_delai_placement : refonte grain + distribution opérationnelle
+-- Raison : retrait categorie_delai (dimension) remplacée par KPIs % actionnables.
+-- La PK passe de (agence_id, semaine_debut, categorie_delai) à (agence_id, semaine_debut).
+-- DROP + CREATE nécessaire car modification de la clé primaire.
+DROP TABLE IF EXISTS gld_operationnel.fact_delai_placement;
+CREATE TABLE gld_operationnel.fact_delai_placement (
+    agence_id               INTEGER         NOT NULL,
+    semaine_debut           DATE            NOT NULL,
+    nb_missions             INTEGER         NOT NULL DEFAULT 0,
+    delai_moyen_heures      DECIMAL(10,2),
+    delai_median_heures     DECIMAL(10,2),
+    pct_moins_4h            DECIMAL(6,1),   -- % placements en < 4h  (réactivité excellente)
+    pct_meme_jour           DECIMAL(6,1),   -- % placements en ≤ 24h (même journée)
+    pct_plus_3j             DECIMAL(6,1),   -- % placements > 72h    (alerte opérationnelle)
+    _loaded_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, semaine_debut)
+);
+
+-- fact_conformite_dpae : ajout colonnes conformes/retard + correction taux (2026-03-26)
+-- Raison : taux_conformite_dpae était calculé sur nb_transmises (erroné — inclut les retards).
+-- Correction : taux = nb_dpae_conformes (ecart_heures <= 0) / nb_missions.
+ALTER TABLE gld_operationnel.fact_conformite_dpae
+    ADD COLUMN IF NOT EXISTS nb_dpae_conformes  INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS nb_dpae_retard     INTEGER NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS ops.pipeline_watermarks (
     pipeline        VARCHAR(100)    NOT NULL,
     table_name      VARCHAR(200)    NOT NULL,
