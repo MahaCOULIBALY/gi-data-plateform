@@ -286,6 +286,12 @@ _WTEFAC = [
     "EFAC_ORDNUM",      # ✓
     # x EFAC_MONTANTHT/TTC — absent DDL (montants calculés via WTLFAC)
     # x PRH_BTS            — absent DDL dans WTEFAC
+    # x B5 (probe 2026-03-26) — colonnes paiement DÉFINITIVEMENT ABSENTES de WTEFAC Evolia
+    # x EFAC_TIERS   — absent → TIE_ID utilisé dans silver_clients_detail.process_facturation_detail
+    # x EFAC_AGENCE  — absent → RGPCNT_ID utilisé
+    # x EFAC_DATPAI  — absent → EFAC_DTEREGLF (date règlement final) utilisé en fallback
+    # x EFAC_MNTPAI  — absent → montant_regle = NULL::DECIMAL(18,2) dans Silver (définitif)
+    # x EFAC_TYPEPAI — absent → type_reglement = NULL::VARCHAR dans Silver (définitif)
 ]
 
 _WTFAC = [
@@ -585,4 +591,6 @@ UNCERTAIN_COLUMNS: dict[str, list[str]] = {
     # présents en _COLS mais non testés probe
     "WTPRH": ["PRH_DTEDEBSEM", "LOTPAYE_CODE", "CNTI_ORDRE"],
     "PYCONTRAT": ["RGPCNT_ID", "ETA_ID"],
+    # B5 probe 2026-03-26 : EFAC_TIERS/AGENCE/DATPAI/MNTPAI/TYPEPAI confirmés ABSENTS → retirés
+    # WTEFAC n'a plus de colonnes incertaines.
 }

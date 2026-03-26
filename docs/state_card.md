@@ -148,17 +148,26 @@ L'enrichissement SIRENE ne s'exécute jamais même si `SIRENE_API_TOKEN` est con
 
 ---
 
-### 🟡 B5 — montant_regle NULL dans slv_clients/facturation_detail
+### ✅ B5 — montant_regle NULL dans slv_clients/facturation_detail (RÉSOLU 2026-03-26)
 
-**Impact :** `gold_recouvrement.fact_dso_client` — `encours_ht` surestimé (aucune déduction
-des paiements). DSO potentiellement > réalité. `fact_balance_agee` non affecté (basé sur date_echeance).
+**Probe exécuté** : `RUN_MODE=probe python probe_ddl.py` — WTEFAC : 31 colonnes réelles, WARN.
 
-**Cause :** Colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` absentes du DDL Evolia WTEFAC (probe 2026-03-26).
-`EFAC_TIERS` et `EFAC_AGENCE` également absents — remplacés par `TIE_ID` / `RGPCNT_ID`.
+**Résultat** : Les 5 colonnes B5 sont **définitivement absentes** de WTEFAC côté Evolia :
+`EFAC_TIERS`, `EFAC_AGENCE`, `EFAC_DATPAI`, `EFAC_MNTPAI`, `EFAC_TYPEPAI` → toutes `ABSENT`.
 
-**Action :** `SELECT TOP 1 EFAC_MNTPAI, EFAC_TYPEPAI, EFAC_TIERS, EFAC_AGENCE FROM WTEFAC` en probe.
-Si confirmées, ajouter dans `_COLS["WTEFAC"]` de `bronze_missions.py` et mettre à jour
-`process_facturation_detail()` dans `silver_clients_detail.py`.
+**Décision** : L'implémentation Silver est correcte et définitive :
+
+- `tie_id` ← `TIE_ID`, `rgpcnt_id` ← `RGPCNT_ID`, `date_paiement` ← `EFAC_DTEREGLF`
+- `montant_regle = NULL::DECIMAL(18,2)` et `type_reglement = NULL::VARCHAR` sont **définitifs**
+- `fact_dso_client.encours_ht` = SUM(factures HT) sans déduction (pas de données paiement Evolia)
+
+**Impact résiduel** : DSO surestimé si des règlements existent en dehors d'Evolia (ex. virements
+tracés dans un autre système). Si une source de paiements est identifiée ultérieurement, une
+nouvelle Silver table dédiée devra être créée (table séparée de WTEFAC).
+
+**Fix collatéral** : `probe_ddl.py` corrigé — `_get_actual_columns()` utilisait `?` (paramètre
+positionnel non supporté par FreeTDS/DB-Lib dans `INFORMATION_SCHEMA`). Remplacé par f-string.
+Probe passe maintenant à **39 PASS / 1 WARN / 5 FAIL** (vs 0 PASS / 45 FAIL avant fix).
 
 ---
 

@@ -58,12 +58,15 @@ _DOMAIN_MAP: dict[str, str] = {
 
 
 def _get_actual_columns(conn: pyodbc.Connection, table: str) -> list[str]:
-    """Retourne les colonnes réelles depuis INFORMATION_SCHEMA, ordonnées."""
+    """Retourne les colonnes réelles depuis INFORMATION_SCHEMA, ordonnées.
+    F-string utilisé à la place du paramètre positionnel '?' :
+    FreeTDS/DB-Lib ne supporte pas les paramètres dans INFORMATION_SCHEMA.
+    Sûr ici : `table` provient exclusivement du dict EXPECTED (valeurs internes, non-user).
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-            table,
+            f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            f"WHERE TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
         )
         return [row[0] for row in cur.fetchall()]
 
