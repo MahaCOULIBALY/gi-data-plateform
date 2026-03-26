@@ -16,6 +16,11 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 - G-ST-m01 : imports sys/logging supprimés
 - G-ST-m02 : filter_tables importé et appliqué
 
+# PHASE 2 (2026-03-26) :
+# fact_dynamique_vivier : entrées/sorties/croissance nette du pool intérimaires par agence/mois
+#   Source : slv_interimaires/fidelisation (premiere_mission, date_derniere_vente, categorie_fidelisation)
+#   Dépend de fact_fidelisation_interimaires (doit tourner avant dans le DAG)
+
 # MIGRÉ : iceberg_scan → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 """
 import json
@@ -192,6 +197,71 @@ def build_fidelisation_query(cfg: Config) -> str:
     """
 
 
+def build_dynamique_vivier_query(cfg: Config) -> str:
+    """Dynamique du pool intérimaires : entrées, sorties, croissance nette par agence/mois.
+    Source : slv_interimaires/fidelisation — colonnes utilisées :
+      - premiere_mission  : date d'entrée dans le vivier (première vente)
+      - date_derniere_vente : date de sortie estimée (dernier placement)
+      - categorie_fidelisation : ACTIF_RECENT / ACTIF / DORMANT / INACTIF
+    Pool actif/total calculé sur l'état courant du vivier (snapshot).
+    """
+    slv = f"s3://{cfg.bucket_silver}"
+    return f"""
+    WITH fidel AS (
+        SELECT
+            per_id,
+            agence_id::INT                                          AS agence_id,
+            categorie_fidelisation,
+            TRY_CAST(premiere_mission      AS DATE)                AS premiere_mission,
+            TRY_CAST(date_derniere_vente   AS DATE)                AS date_derniere_vente
+        FROM read_parquet('{slv}/slv_interimaires/fidelisation/**/*.parquet')
+        WHERE agence_id IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY _loaded_at DESC NULLS LAST) = 1
+    ),
+    entrees AS (
+        SELECT agence_id,
+               DATE_TRUNC('month', premiere_mission)::DATE          AS mois,
+               COUNT(DISTINCT per_id)                               AS nb_nouveaux
+        FROM fidel
+        WHERE premiere_mission IS NOT NULL
+        GROUP BY 1, 2
+    ),
+    sorties AS (
+        SELECT agence_id,
+               DATE_TRUNC('month', date_derniere_vente)::DATE       AS mois,
+               COUNT(DISTINCT per_id) FILTER
+                   (WHERE categorie_fidelisation = 'INACTIF')       AS nb_perdus
+        FROM fidel
+        WHERE date_derniere_vente IS NOT NULL
+        GROUP BY 1, 2
+    ),
+    pool AS (
+        SELECT agence_id,
+               COUNT(DISTINCT per_id) FILTER
+                   (WHERE categorie_fidelisation = 'ACTIF_RECENT')  AS pool_actif,
+               COUNT(DISTINCT per_id)                               AS pool_total
+        FROM fidel
+        GROUP BY 1
+    )
+    SELECT
+        e.agence_id,
+        e.mois,
+        e.nb_nouveaux,
+        COALESCE(s.nb_perdus, 0)                                    AS nb_perdus,
+        (e.nb_nouveaux - COALESCE(s.nb_perdus, 0))                  AS croissance_nette,
+        COALESCE(p.pool_actif, 0)                                   AS pool_actif,
+        COALESCE(p.pool_total, 0)                                   AS pool_total,
+        ROUND(
+            e.nb_nouveaux::DECIMAL / NULLIF(COALESCE(p.pool_total, 0), 0) * 100
+        , 1)::DECIMAL(6,1)                                          AS taux_renouvellement_vivier_pct
+    FROM entrees e
+    LEFT JOIN sorties s ON s.agence_id = e.agence_id AND s.mois = e.mois
+    LEFT JOIN pool    p ON p.agence_id = e.agence_id
+    WHERE e.mois IS NOT NULL
+    ORDER BY e.mois DESC, e.agence_id
+    """
+
+
 def _log_fidelisation_coverage(cfg: Config, ddb) -> None:
     try:
         result = ddb.execute(f"""
@@ -229,7 +299,8 @@ def _log_fidelisation_coverage(cfg: Config, ddb) -> None:
 def run(cfg: Config) -> dict:
     stats = Stats()
     active = filter_tables(["fact_activite_int", "fact_missions_detail",
-                            "fact_fidelisation_interimaires"], cfg)  # G-ST-m02
+                            "fact_fidelisation_interimaires",
+                            "fact_dynamique_vivier"], cfg)  # G-ST-m02
 
     if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):  # G-ST-M04
         for name in active:
@@ -247,11 +318,15 @@ def run(cfg: Config) -> dict:
                      "ca_mission", "cout_mission", "marge_mission", "taux_marge"]
     fidelisation_cols = ["agence_id", "categorie_fidelisation", "nb_interimaires",
                          "anciennete_moy_jours", "jours_inactivite_moyen"]
+    vivier_cols = ["agence_id", "mois", "nb_nouveaux", "nb_perdus",
+                   "croissance_nette", "pool_actif", "pool_total",
+                   "taux_renouvellement_vivier_pct"]
 
     query_map = {
         "fact_activite_int": (build_activite_query, activite_cols),
         "fact_missions_detail": (build_missions_detail_query, missions_cols),
         "fact_fidelisation_interimaires": (build_fidelisation_query, fidelisation_cols),
+        "fact_dynamique_vivier": (build_dynamique_vivier_query, vivier_cols),
     }
 
     # --- DuckDB build ---

@@ -16,6 +16,11 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 
 # MIGRÉ : iceberg_scan → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 # TODO B-02: montant_ht NULL en Silver → reconstitution via SUM(lfac_base * lfac_taux)
+# PHASE 2 (2026-03-26) :
+# fact_ca_secteur_naf : ventilation du CA par section NAF (A-U, nomenclature INSEE).
+#   Mapping NAF embarqué en CASE SQL — pas de dépendance PG ref_naf_sections.
+#   Source : slv_facturation/factures + lignes + slv_clients/dim_clients (naf_code).
+#   seed_ref_naf.py crée la table ref_naf_sections dans gld_shared pour Superset.
 """
 import csv
 import json
@@ -41,10 +46,16 @@ CONCENTRATION_COLUMNS = [
     "agence_id", "mois", "nb_clients", "nb_clients_top20",
     "ca_net_total", "ca_net_top20", "taux_concentration",
 ]
+NAF_SECTEUR_COLUMNS = [
+    "agence_id", "mois", "naf_code", "naf_division",
+    "naf_section", "secteur_libelle",
+    "nb_clients", "ca_net_ht", "nb_missions", "part_ca_agence_pct",
+]
 
 _TABLES = {
     "fact_ca_mensuel_client": ("gld_commercial", CA_COLUMNS),
     "fact_concentration_client": ("gld_clients", CONCENTRATION_COLUMNS),
+    "fact_ca_secteur_naf": ("gld_commercial", NAF_SECTEUR_COLUMNS),
 }
 
 
@@ -156,6 +167,115 @@ def build_concentration_query(cfg: Config) -> str:
     """
 
 
+def build_ca_secteur_naf_query(cfg: Config) -> str:
+    """Ventilation du CA mensuel par section NAF (nomenclature INSEE A-U).
+    Le mapping division→section est embarqué en CASE pour éviter la dépendance
+    à ref_naf_sections PG (alimentée séparément par seed_ref_naf.py).
+    Source : slv_facturation/factures + lignes_factures + slv_clients/dim_clients.
+    """
+    slv = f"s3://{cfg.bucket_silver}"
+    return f"""
+    WITH dim_clients AS (
+        SELECT tie_id::INT AS tie_id, COALESCE(naf_code, '') AS naf_code
+        FROM read_parquet('{slv}/slv_clients/dim_clients/**/*.parquet')
+        WHERE is_current = true
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
+    ),
+    lignes AS (
+        SELECT fac_num, COALESCE(SUM(montant), 0) AS montant_ht
+        FROM read_parquet('{slv}/slv_facturation/lignes_factures/**/*.parquet')
+        GROUP BY fac_num
+    ),
+    base AS (
+        SELECT
+            f.rgpcnt_id::INT                                            AS agence_id,
+            DATE_TRUNC('month', TRY_CAST(f.date_facture AS DATE))::DATE AS mois,
+            f.tie_id::INT                                               AS tie_id,
+            d.naf_code,
+            LEFT(d.naf_code, 2)                                         AS naf_division,
+            CASE
+                WHEN LEFT(d.naf_code, 2) BETWEEN '01' AND '03' THEN 'A'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '05' AND '09' THEN 'B'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '10' AND '33' THEN 'C'
+                WHEN LEFT(d.naf_code, 2) = '35'                THEN 'D'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '36' AND '39' THEN 'E'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '41' AND '43' THEN 'F'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '45' AND '47' THEN 'G'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '49' AND '53' THEN 'H'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '55' AND '56' THEN 'I'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '58' AND '63' THEN 'J'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '64' AND '66' THEN 'K'
+                WHEN LEFT(d.naf_code, 2) = '68'                THEN 'L'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '69' AND '75' THEN 'M'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '77' AND '82' THEN 'N'
+                WHEN LEFT(d.naf_code, 2) = '84'                THEN 'O'
+                WHEN LEFT(d.naf_code, 2) = '85'                THEN 'P'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '86' AND '88' THEN 'Q'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '90' AND '93' THEN 'R'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '94' AND '96' THEN 'S'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '97' AND '98' THEN 'T'
+                WHEN LEFT(d.naf_code, 2) = '99'                THEN 'U'
+                ELSE 'XX'
+            END                                                         AS naf_section,
+            CASE
+                WHEN LEFT(d.naf_code, 2) BETWEEN '01' AND '03' THEN 'Agriculture, sylviculture et pêche'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '05' AND '09' THEN 'Industries extractives'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '10' AND '33' THEN 'Industrie manufacturière'
+                WHEN LEFT(d.naf_code, 2) = '35'                THEN 'Production et distribution énergie'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '36' AND '39' THEN 'Eau, assainissement, déchets'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '41' AND '43' THEN 'Construction'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '45' AND '47' THEN 'Commerce, réparation automobiles'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '49' AND '53' THEN 'Transports et entreposage'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '55' AND '56' THEN 'Hébergement et restauration'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '58' AND '63' THEN 'Information et communication'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '64' AND '66' THEN 'Activités financières et assurance'
+                WHEN LEFT(d.naf_code, 2) = '68'                THEN 'Activités immobilières'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '69' AND '75' THEN 'Activités spécialisées et techniques'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '77' AND '82' THEN 'Services administratifs et de soutien'
+                WHEN LEFT(d.naf_code, 2) = '84'                THEN 'Administration publique'
+                WHEN LEFT(d.naf_code, 2) = '85'                THEN 'Enseignement'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '86' AND '88' THEN 'Santé humaine et action sociale'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '90' AND '93' THEN 'Arts, spectacles et loisirs'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '94' AND '96' THEN 'Autres activités de services'
+                WHEN LEFT(d.naf_code, 2) BETWEEN '97' AND '98' THEN 'Ménages employeurs'
+                WHEN LEFT(d.naf_code, 2) = '99'                THEN 'Activités extra-territoriales'
+                ELSE 'Non classifié'
+            END                                                         AS secteur_libelle,
+            CASE WHEN f.type_facture = 'F' THEN  COALESCE(l.montant_ht, 0)
+                 WHEN f.type_facture = 'A' THEN -COALESCE(l.montant_ht, 0)
+                 ELSE 0 END                                             AS montant_net,
+            CASE WHEN f.type_facture = 'F' THEN 1 ELSE 0 END           AS is_mission
+        FROM read_parquet('{slv}/slv_facturation/factures/**/*.parquet') f
+        LEFT JOIN lignes      l ON l.fac_num = f.efac_num
+        LEFT JOIN dim_clients d ON d.tie_id  = f.tie_id::INT
+        WHERE f.date_facture IS NOT NULL
+          AND f.rgpcnt_id IS NOT NULL
+          AND f.tie_id IS NOT NULL
+    ),
+    aggregated AS (
+        SELECT
+            agence_id, mois, naf_code, naf_division, naf_section, secteur_libelle,
+            COUNT(DISTINCT tie_id)  AS nb_clients,
+            SUM(montant_net)        AS ca_net_ht,
+            SUM(is_mission)         AS nb_missions
+        FROM base
+        WHERE mois IS NOT NULL
+        GROUP BY 1, 2, 3, 4, 5, 6
+    )
+    SELECT
+        agence_id, mois, naf_code, naf_division, naf_section, secteur_libelle,
+        nb_clients,
+        ROUND(ca_net_ht, 2)::DECIMAL(18,2)                              AS ca_net_ht,
+        nb_missions,
+        ROUND(
+            ca_net_ht / NULLIF(SUM(ca_net_ht) OVER (PARTITION BY agence_id, mois), 0) * 100
+        , 1)::DECIMAL(6,1)                                              AS part_ca_agence_pct
+    FROM aggregated
+    WHERE ca_net_ht > 0
+    ORDER BY mois DESC, agence_id, ca_net_ht DESC
+    """
+
+
 def validate_vs_pyramid(pg_conn, stats: Stats) -> list[dict]:
     if not PYRAMID_VALIDATION_FILE.exists():
         logger.warning(
@@ -206,38 +326,44 @@ def validate_vs_pyramid(pg_conn, stats: Stats) -> list[dict]:
 def run(cfg: Config) -> dict:
     stats = Stats()
     active = gold_filter_tables(
-        ["fact_ca_mensuel_client", "fact_concentration_client"], cfg
+        ["fact_ca_mensuel_client", "fact_concentration_client",
+         "fact_ca_secteur_naf"], cfg
     )
 
     if cfg.mode == RunMode.OFFLINE:
         return stats.finish(cfg, PIPELINE)
 
-    ca_rows, concentration_rows = [], []
+    query_builders = {
+        "fact_ca_mensuel_client":    build_ca_mensuel_query,
+        "fact_concentration_client": build_concentration_query,
+        "fact_ca_secteur_naf":       build_ca_secteur_naf_query,
+    }
+    schema_map = {
+        "fact_ca_mensuel_client":    ("gld_commercial", CA_COLUMNS),
+        "fact_concentration_client": ("gld_clients",    CONCENTRATION_COLUMNS),
+        "fact_ca_secteur_naf":       ("gld_commercial", NAF_SECTEUR_COLUMNS),
+    }
+
+    rows_map: dict[str, list] = {}
     try:
         with get_duckdb_connection(cfg) as ddb:
-            ca_rows = ddb.execute(build_ca_mensuel_query(cfg)).fetchall()
-            concentration_rows = ddb.execute(
-                build_concentration_query(cfg)).fetchall()
-            logger.info(json.dumps({
-                "fact_ca_mensuel_client": len(ca_rows),
-                "fact_concentration_client": len(concentration_rows),
-            }))
+            for name in active:
+                rows_map[name] = ddb.execute(query_builders[name](cfg)).fetchall()
+            logger.info(json.dumps({n: len(r) for n, r in rows_map.items()}))
     except Exception as e:
         logger.exception(json.dumps({"step": "duckdb_build", "error": str(e)}))
         stats.errors.append({"step": "duckdb_build", "error": str(e)})
         return stats.finish(cfg, PIPELINE)
 
-    rows_map = {
-        "fact_ca_mensuel_client": (ca_rows, "gld_commercial", CA_COLUMNS),
-        "fact_concentration_client": (concentration_rows, "gld_clients", CONCENTRATION_COLUMNS),
-    }
     with get_pg_connection(cfg) as pg_conn:
         for name in active:
-            rows, schema, cols = rows_map[name]
+            if name not in rows_map:
+                continue
+            schema, cols = schema_map[name]
             try:
-                pg_bulk_insert(cfg, pg_conn, schema, name, cols, rows, stats)
+                pg_bulk_insert(cfg, pg_conn, schema, name, cols, rows_map[name], stats)
                 stats.tables_processed += 1
-                stats.rows_transformed += len(rows)
+                stats.rows_transformed += len(rows_map[name])
             except Exception as e:
                 logger.exception(json.dumps({"table": name, "error": str(e)}))
                 stats.errors.append({"table": name, "error": str(e)})
