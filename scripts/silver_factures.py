@@ -8,8 +8,9 @@ Phase 0 · GI Data Lakehouse · Manifeste v2.0
 """
 import json
 from dataclasses import dataclass
-from shared import Config, RunMode, Stats, get_duckdb_connection, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, s3_has_files, logger
 
+PIPELINE = "silver_factures"
 DOMAIN = "facturation"
 
 
@@ -76,6 +77,10 @@ _TABLES: list[_Table] = [
 def _process(ddb, cfg: Config, t: _Table, stats: Stats) -> None:
     bronze_path = f"s3://{cfg.bucket_bronze}/raw_{t.bronze}/{cfg.date_partition}/*.json"
     silver_path = f"s3://{cfg.bucket_silver}/{t.silver}/**/*.parquet"
+    # Guard : table de facturation critique — WARNING si source bronze absente
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_{t.bronze}/{cfg.date_partition}/"):
+        logger.warning(json.dumps({"table": t.name, "rows": 0, "status": "empty"}))
+        return
     try:
         ddb.execute(
             f"CREATE OR REPLACE VIEW src AS "
@@ -107,7 +112,7 @@ def run(cfg: Config) -> dict:
     with get_duckdb_connection(cfg) as ddb:
         for t in _TABLES:
             _process(ddb, cfg, t, stats)
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

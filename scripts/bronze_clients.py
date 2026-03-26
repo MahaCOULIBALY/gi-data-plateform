@@ -134,7 +134,7 @@ def run(cfg: Config) -> dict:
     if cfg.mode == RunMode.OFFLINE:
         for tc in filter_tables(TABLES_DELTA + TABLES_FULL, cfg):
             logger.info(json.dumps({"mode": "offline", "table": tc.name}))
-        return stats.finish()
+        return stats.finish(cfg, PIPELINE)
 
     with get_pg_connection(cfg) as pg_conn:
         wm = WatermarkStore(pg_conn, PIPELINE)
@@ -194,7 +194,7 @@ def run(cfg: Config) -> dict:
                     except Exception:
                         pass
 
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

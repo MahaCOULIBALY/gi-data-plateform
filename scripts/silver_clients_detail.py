@@ -20,10 +20,16 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # #5 — CTE : ajout du ) manquant dans les 3 process_ pour fermer raw AS (...)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, s3_delete_prefix, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, s3_has_files, s3_delete_prefix, logger
+
+
+PIPELINE = "silver_clients_detail"
 
 
 def process_sites_mission(ddb, cfg: Config, stats: Stats) -> int:
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wttieserv/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "sites_mission", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     silver_path = f"s3://{cfg.bucket_silver}/slv_clients/sites_mission/**/*.parquet"
     query = f"""
@@ -77,6 +83,9 @@ FROM raw WHERE rn = 1 AND TIE_ID IS NOT NULL
 
 def process_contacts(ddb, cfg: Config, stats: Stats) -> int:
     """RGPD : email/tel Silver-only — jamais exposé en Gold."""
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wttieint/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "contacts", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     silver_path = f"s3://{cfg.bucket_silver}/slv_clients/contacts/**/*.parquet"
     query = f"""
@@ -113,6 +122,9 @@ FROM raw WHERE rn = 1 AND TIE_ID IS NOT NULL
 
 
 def process_encours_credit(ddb, cfg: Config, stats: Stats) -> int:
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtencoursg/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "encours_credit", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     silver_path = f"s3://{cfg.bucket_silver}/slv_clients/encours_credit/**/*.parquet"
     query = f"""
@@ -162,7 +174,7 @@ def run(cfg: Config) -> dict:
         # correction #4 : était 4 (coefficients inactif)
         stats.tables_processed = 3
         stats.rows_transformed = sum(stats.extra.values())
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

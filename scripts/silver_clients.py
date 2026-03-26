@@ -21,8 +21,9 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, s3_delete_prefix, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, s3_has_files, s3_delete_prefix, logger
 
+PIPELINE = "silver_clients"
 # TIES_SIREN/NIC et naf_code ajoutés au tracking SCD2 (NIC ajouté 2026-03-11)
 SCD2_TRACKED_COLS = ("raison_sociale", "siren", "nic", "naf_code",
                      "adresse_complete", "ville", "code_postal",
@@ -126,12 +127,17 @@ def run(cfg: Config) -> dict:
     silver_path = f"s3://{cfg.bucket_silver}/{_SILVER_PATH}/**/*.parquet"
 
     with get_duckdb_connection(cfg) as ddb:
+        # Guard : source vide → skip avant SCD2 sans polluer stats.errors
+        if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wttieserv/{cfg.date_partition}/"):
+            logger.info(json.dumps({"pipeline": PIPELINE, "rows": 0, "status": "empty"}))
+            return stats.finish(cfg, PIPELINE)
+
         res = ddb.execute(build_staging_query(cfg))
         cols = [d[0] for d in res.description]
         staging = [dict(zip(cols, row)) for row in res.fetchall()]
         if not staging:
             stats.warnings.append("No Bronze clients data")
-            return stats.finish()
+            return stats.finish(cfg, PIPELINE)
 
         # Lire l'état Silver existant — correction #1
         # Premier run ou Silver absent → existing=[] (pas d'erreur)
@@ -186,7 +192,7 @@ def run(cfg: Config) -> dict:
                 os.unlink(tmp)
         stats.rows_transformed = len(new_records)
 
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

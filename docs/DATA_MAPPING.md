@@ -1,6 +1,6 @@
 # DATA MAPPING — GI Data Lakehouse · Evolia → Superset
 
-> **Manifeste v3.0 · Phases 0-3 · Dernière mise à jour : 2026-03-13**
+> **Manifeste v3.1 · Phases 0-4 · Dernière mise à jour : 2026-03-26**
 > Lecture : de gauche à droite — Source Evolia SQL Server → Bronze S3 → Silver Parquet → Gold PostgreSQL → Superset
 
 ---
@@ -22,16 +22,16 @@
 
 ## 1. Vue d'ensemble — Flux de données
 
-```
+```text
 EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
 │
-│  pyodbc · lecture seule · ODBC Driver 17
+│  pymssql · lecture seule · TDS 7.4
 │
 ├── bronze_agences.py ──────────────────────────────────────────────────────┐
 ├── bronze_clients.py ──────────────────────────────────────────────────────┤
 ├── bronze_clients_external.py (SIRENE API + Salesforce) ──────────────────┤
 ├── bronze_missions.py ─────────────────────────────────────────────────────┤ → S3 Bronze
-├── bronze_interimaires.py ─────────────────────────────────────────────────┤   gi-poc-bronze
+├── bronze_interimaires.py ─────────────────────────────────────────────────┤   gi-data-prod-bronze
                                                                             │   raw_{table}/YYYY/MM/DD/
                                                                             │   JSON newline-delimited
                                                                             │
@@ -40,7 +40,7 @@ EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
                         ┌── silver_agences_light.py ──────────────────────────────┐
                         ├── silver_clients.py (SCD2) ─────────────────────────────┤
                         ├── silver_clients_detail.py ─────────────────────────────┤ → S3 Silver
-                        ├── silver_missions.py ───────────────────────────────────┤   gi-poc-silver
+                        ├── silver_missions.py ───────────────────────────────────┤   gi-data-prod-silver
                         ├── silver_factures.py ───────────────────────────────────┤   slv_{domaine}/
                         ├── silver_interimaires.py (SCD2) ────────────────────────┤   {table}/**/*.parquet
                         ├── silver_interimaires_detail.py ───────────────────────┤
@@ -58,7 +58,8 @@ EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
                         ├── gold_operationnel.py ── gld_operationnel.* ─────────┤
                         ├── gold_vue360_client.py ─ gld_clients.* ──────────────┤
                         ├── gold_retention_client.py ─ gld_clients.* ───────────┤
-                        └── gold_clients_detail.py ─ gld_clients.* ─────────────┘
+                        ├── gold_clients_detail.py ─ gld_clients.* ─────────────┤
+                        └── gold_qualite_missions.py ─ gld_performance.* ───────┘  ⚠️ hors DAG
                                                                             │
                               SQL direct / REST API                         │
                                                                             ▼
@@ -66,37 +67,45 @@ EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
                                               Datasets → Charts → Dashboards
 ```
 
+**Module partagé Gold :** `gold_helpers.py` — 3 CTE réutilisables :
+
+- `cte_montants_factures` — reconstitution montant HT depuis WTLFAC (contournement B-01)
+- `cte_heures_par_contrat` — pré-agrégation heures (per\_id, cnt\_id) pour éviter fan-out
+- `cte_missions_distinct` — missions dédupliquées pour JOINs factures (tie\_id, rgpcnt\_id)
+
 ---
 
 ## 2. Domaine Agences
 
 ### 2.1 Mapping Evolia → Bronze
 
-| Table Evolia | S3 Bronze path | Colonnes extraites | Mode | PK |
-|---|---|---|---|---|
-| `PYREGROUPECNT` | `raw_pyregroupecnt/…` | RGPCNT_ID, RGPCNT_CODE, RGPCNT_LIBELLE, DOS_ID, ENT_ID, DATE_CLOTURE | FULL | RGPCNT_ID |
-| `PYENTREPRISE` | `raw_pyentreprise/…` | ENT_ID, ENT_SIREN, ENT_RAISON, ENT_APE, ENT_ETT, RGPCNT_ID, ENT_MONOETAB | FULL | ENT_ID |
-| `PYETABLISSEMENT` | `raw_pyetablissement/…` | ETA_ID, ENT_ID, ETA_ACTIVITE, ETA_COMMUNE, ETA_ADR2_COMP, ETA_ADR2_VOIE, ETA_ADR2_CP, ETA_ADR2_VILLE, ETA_PSEUDO_SIRET, ETA_DATE_CESACT | FULL | ETA_ID |
-| `WTUG` | `raw_wtug/…` | RGPCNT_ID, ETA_ID, UG_GPS (NVARCHAR), UG_CLOTURE_DATE, UG_CLOTURE_USER, PIL_ID, UG_EMAIL | FULL | RGPCNT_ID, ETA_ID |
-| `PYDOSPETA` | `raw_pydospeta/…` | RGPCNT_ID, ETA_ID | FULL | RGPCNT_ID, ETA_ID |
+| Table Evolia | S3 Bronze path | Colonnes extraites | Mode | PK / Delta col |
+| --- | --- | --- | --- | --- |
+| `PYREGROUPECNT` | `raw_pyregroupecnt/…` | RGPCNT\_ID, RGPCNT\_CODE, RGPCNT\_LIBELLE, DOS\_ID, ENT\_ID, DATE\_CLOTURE | FULL | RGPCNT\_ID |
+| `PYENTREPRISE` | `raw_pyentreprise/…` | ENT\_ID, ENT\_SIREN, ENT\_RAISON, ENT\_APE, ENT\_ETT, RGPCNT\_ID, ENT\_MONOETAB | FULL | ENT\_ID |
+| `PYETABLISSEMENT` | `raw_pyetablissement/…` | ETA\_ID, ENT\_ID, ETA\_ACTIVITE, ETA\_COMMUNE, ETA\_ADR2\_COMP, ETA\_ADR2\_VOIE, ETA\_ADR2\_CP, ETA\_ADR2\_VILLE, ETA\_PSEUDO\_SIRET, ETA\_DATE\_CESACT | FULL | ETA\_ID |
+| `WTUG` | `raw_wtug/…` | RGPCNT\_ID, ETA\_ID, UG\_GPS, UG\_CLOTURE\_DATE, UG\_CLOTURE\_USER, PIL\_ID, UG\_EMAIL | FULL | RGPCNT\_ID, ETA\_ID |
+| `PYDOSPETA` | `raw_pydospeta/…` | RGPCNT\_ID, ETA\_ID | FULL | RGPCNT\_ID, ETA\_ID |
+| `AGENCE_GESTION` | `raw_agence_gestion/…` | DATE\_UG\_GEST, NOM\_COMMERCIAL, ID\_UG, NOM\_UG, CODE\_COMM, MARQUE, BRANCHE, COMMERCIAL\_GESTION, TAUX | DELTA | DATE\_UG\_GEST (depuis 2022-01-01) |
+| `Secteurs` (vue Evolia) | `raw_secteurs/…` | [currentTime], [Agence de gestion], [Secteur], [Périmètre], [Zone Géographique] | FULL | — |
 
 ### 2.2 Bronze → Silver
 
 | Script | Lire depuis Bronze | Écrire vers Silver | Colonnes Silver |
-|---|---|---|---|
-| `silver_agences_light.py` | raw_pyregroupecnt, raw_wtug | `slv_agences/dim_agences` | agence_sk *(MD5)*, rgpcnt_id, nom, code, marque, branche, ville, email, latitude, longitude, is_cloture, **is_active**, cloture_date, _loaded_at |
-| `silver_agences_light.py` | raw_pyregroupecnt | `slv_agences/hierarchie_territoriale` | rgpcnt_id, secteur, perimetre, zone_geo, _loaded_at |
+| --- | --- | --- | --- |
+| `silver_agences_light.py` | raw\_pyregroupecnt, raw\_wtug, raw\_agence\_gestion (optionnel) | `slv_agences/dim_agences` | agence\_sk (MD5), rgpcnt\_id, nom, code, marque, branche, nom\_commercial, code\_comm, ville, email, latitude, longitude, is\_cloture, is\_active, cloture\_date, \_loaded\_at |
+| `silver_agences_light.py` | raw\_secteurs (optionnel) | `slv_agences/hierarchie_territoriale` | rgpcnt\_id, secteur, perimetre, zone\_geo, \_loaded\_at |
 
 ### 2.3 Silver → Gold
 
 | Script | Lire depuis Silver | Table Gold | Colonnes Gold |
-|---|---|---|---|
-| `gold_dimensions.py` | slv_agences/dim_agences, slv_agences/hierarchie_territoriale | `gld_shared.dim_agences` | agence_sk, rgpcnt_id, nom_agence, marque, branche, secteur, perimetre, zone_geo, ville, **is_active** |
-| `gold_scorecard_agence.py` | slv_missions, slv_facturation, slv_temps | `gld_performance.scorecard_agence` | agence_id, mois, ca_net_ht, taux_marge, marge_brute, nb_clients_actifs, nb_int_actifs, nb_missions, taux_transformation, nb_commandes, nb_pourvues |
-| `gold_scorecard_agence.py` | idem | `gld_performance.ranking_agences` | agence_id, mois, ca_net_ht, taux_marge, nb_int_actifs, taux_transformation, rang_ca, rang_marge, rang_placement, rang_transfo, score_global |
-| `gold_scorecard_agence.py` | idem | `gld_performance.tendances_agence` | agence_id, mois, ca_net_ht, taux_marge, nb_int_actifs, delta_ca_mom, delta_marge_mom, delta_int_mom, delta_ca_yoy, delta_marge_yoy, tendance |
-| `gold_operationnel.py` | slv_temps/releves_heures, slv_missions/commandes | `gld_operationnel.fact_heures_hebdo` | agence_id, tie_id, semaine_debut, heures_paye, heures_fact, nb_releves, _loaded_at |
-| `gold_operationnel.py` | idem | `gld_operationnel.fact_commandes_pipeline` | agence_id, semaine_debut, nb_commandes, nb_pourvues, nb_ouvertes, taux_satisfaction, _loaded_at |
+| --- | --- | --- | --- |
+| `gold_dimensions.py` | slv\_agences/dim\_agences, slv\_agences/hierarchie\_territoriale | `gld_shared.dim_agences` | agence\_sk, rgpcnt\_id, nom\_agence, marque, branche, secteur, perimetre, zone\_geo, ville, is\_active |
+| `gold_scorecard_agence.py` | slv\_missions, slv\_facturation, slv\_temps | `gld_performance.scorecard_agence` | agence\_id, mois, ca\_net\_ht, taux\_marge, marge\_brute, nb\_clients\_actifs, nb\_int\_actifs, nb\_missions, taux\_transformation, nb\_commandes, nb\_pourvues |
+| `gold_scorecard_agence.py` | idem | `gld_performance.ranking_agence` | agence\_id, mois, ca\_net\_ht, taux\_marge, nb\_int\_actifs, taux\_transformation, rang\_ca, rang\_marge, rang\_placement, rang\_transfo, score\_global (35% CA + 25% marge + 25% placement + 15% transfo) |
+| `gold_scorecard_agence.py` | idem | `gld_performance.tendances_agence` | agence\_id, mois, trend\_ca, trend\_marge, trend\_placement\_yoy, trend\_transformation\_qoq |
+| `gold_operationnel.py` | slv\_temps/releves\_heures, slv\_missions/commandes | `gld_operationnel.fact_heures_hebdo` | agence\_id, tie\_id, semaine\_debut, heures\_paye, heures\_fact, nb\_releves, \_loaded\_at |
+| `gold_operationnel.py` | slv\_missions/commandes | `gld_operationnel.fact_commandes_pipeline` | agence\_id, semaine\_debut, nb\_commandes, nb\_pourvues, nb\_ouvertes, taux\_satisfaction, \_loaded\_at |
 
 ---
 
@@ -105,43 +114,44 @@ EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
 ### 3.1 Mapping Evolia → Bronze
 
 | Table Evolia | S3 Bronze path | Colonnes extraites | Mode | PK |
-|---|---|---|---|---|
-| `CMTIERS` | `raw_cmtiers/…` | TIE_ID, TIE_NOM, TIE_NOMC, TIE_SIRET, TIE_CODE | FULL | TIE_ID |
-| `WTTIESERV` | `raw_wttieserv/…` | TIE_ID, TIES_SERV, TIES_DESIGNATION, TIES_NOM, TIES_ADR1, TIES_ADR2, TIES_CODEP, TIES_VILLE, PAYS_CODE, TIES_SIREN, TIES_NIC, NAF, NAF2008, TIES_EMAIL, CLOT_DAT, TIES_CDMODIFDATE, RGPCNT_ID | FULL | TIE_ID, TIES_SERV |
-| `WTCLPT` | `raw_wtclpt/…` | TIE_ID, CLPT_PROS, CLPT_CAPT, CLPT_DCREA, CLPT_EFFT, CLPT_MODIFDATE | FULL | TIE_ID |
-| `WTTIEINT` | `raw_wttieint/…` | TIE_ID, TIEI_ORDRE, TIEI_NOM, TIEI_PRENOM, TIEI_EMAIL, TIEI_BUREAU, FCTI_CODE | FULL | TIE_ID, TIEI_ORDRE |
-| `WTCOEF` | `raw_wtcoef/…` | TQUA_ID, RGPCNT_ID, TIE_ID, COEF_VAL, COEF_DEFF, COEF_DFIN | FULL | TQUA_ID, RGPCNT_ID, TIE_ID |
-| `WTENCOURSG` | `raw_wtencoursg/…` | ENCGRP_ID, ENC_SIREN, ENCG_DECISIONLIB | FULL | ENCGRP_ID |
-| `WTUGCLI` | `raw_wtugcli/…` | RGPCNT_ID, TIE_ID, UGCLI_ORIG | FULL | RGPCNT_ID, TIE_ID |
+| --- | --- | --- | --- | --- |
+| `CMTIERS` | `raw_cmtiers/…` | TIE\_ID, TIE\_NOM, TIE\_NOMC, TIE\_SIRET, TIE\_CODE | FULL | TIE\_ID |
+| `WTTIESERV` | `raw_wttieserv/…` | TIE\_ID, TIES\_SERV, TIES\_DESIGNATION, TIES\_NOM, TIES\_ADR1, TIES\_ADR2, TIES\_CODEP, TIES\_VILLE, PAYS\_CODE, TIES\_SIREN, TIES\_NIC, NAF, NAF2008, TIES\_EMAIL, CLOT\_DAT, TIES\_CDMODIFDATE, RGPCNT\_ID | FULL | TIE\_ID, TIES\_SERV |
+| `WTCLPT` | `raw_wtclpt/…` | TIE\_ID, CLPT\_PROS, CLPT\_CAPT, CLPT\_DCREA, CLPT\_EFFT, CLPT\_MODIFDATE | FULL | TIE\_ID |
+| `WTTIEINT` | `raw_wttieint/…` | TIE\_ID, TIEI\_ORDRE, TIEI\_NOM, TIEI\_PRENOM, TIEI\_EMAIL, TIEI\_BUREAU, FCTI\_CODE | FULL | TIE\_ID, TIEI\_ORDRE |
+| `WTENCOURSG` | `raw_wtencoursg/…` | ENCGRP\_ID, ENC\_SIREN, ENCG\_DECISIONLIB | FULL | ENCGRP\_ID |
+| `WTUGCLI` | `raw_wtugcli/…` | RGPCNT\_ID, TIE\_ID, UGCLI\_ORIG | FULL | RGPCNT\_ID, TIE\_ID |
+
+> ⚠️ `WTCOEF` retiré du mapping actif — table vide (count=0, probe 2026-03-12). La fonction `process_coefficients` est commentée dans `silver_clients_detail.py`.
 
 **Sources externes :**
 
 | Source | S3 Bronze path | Colonnes extraites |
-|---|---|---|
-| SIRENE API | `raw_sirene/…` | siret, raison_sociale_officielle, date_creation, tranche_effectif, naf, adresse_siege, _loaded_at |
-| Salesforce (stub) | `raw_salesforce_accounts/…` | Account_Id, Name, Industry, SIRET__c, BillingCity, CreatedDate, _loaded_at |
+| --- | --- | --- |
+| SIRENE API | `raw_sirene/…` | siret, raison\_sociale\_officielle, date\_creation, tranche\_effectif, naf, adresse\_siege, \_loaded\_at |
+| Salesforce (stub) | `raw_salesforce_accounts/…` | Account\_Id, Name, Industry, SIRET\_\_c, BillingCity, CreatedDate, \_loaded\_at |
 
 ### 3.2 Bronze → Silver
 
 | Script | Lire depuis Bronze | Écrire vers Silver | Colonnes Silver |
-|---|---|---|---|
-| `silver_clients.py` *(SCD2)* | raw_wttieserv, raw_wtclpt | `slv_clients/dim_clients` | client_sk *(MD5)*, tie_id, change_hash, raison_sociale, siren, nic, naf_code, adresse_complete, ville, code_postal, statut_client, ca_potentiel, date_creation_fiche, **is_current**, valid_from, valid_to, _loaded_at |
-| `silver_clients_detail.py` | raw_wttieserv | `slv_clients/sites_mission` | site_id, tie_id, nom_site, siren, nic, adresse, ville, code_postal, pays_code, siret_site, email, agence_id, **is_active**, clot_at, row_hash, _loaded_at |
-| `silver_clients_detail.py` | raw_wttieint | `slv_clients/contacts` | contact_id *(MD5)*, tie_id, nom, prenom, email, telephone, fonction_code, _loaded_at |
-| `silver_clients_detail.py` | raw_wtencoursg | `slv_clients/encours_credit` | encours_id, siren, montant_encours, limite_credit, date_decision, decision_libelle, _loaded_at |
-| `silver_clients_detail.py` | raw_wtcoef | `slv_clients/coefficients` | coef_id *(MD5)*, rgpcnt_id, tie_id, qualification_code, coefficient, date_effet, _loaded_at |
+| --- | --- | --- | --- |
+| `silver_clients.py` (SCD2) | raw\_wttieserv, raw\_wtclpt | `slv_clients/dim_clients` | client\_sk (MD5), tie\_id, change\_hash, raison\_sociale, siren, nic, naf\_code, adresse\_complete, ville, code\_postal, statut\_client, ca\_potentiel, date\_creation\_fiche, effectif\_tranche, is\_current, valid\_from, valid\_to, \_source\_raw\_id, \_loaded\_at |
+| `silver_clients_detail.py` | raw\_wttieserv | `slv_clients/sites_mission` | site\_id, tie\_id, nom\_site, siren, nic, adresse, ville, code\_postal, pays\_code, siret\_site, email, agence\_id, is\_active, clot\_at, row\_hash, \_loaded\_at |
+| `silver_clients_detail.py` | raw\_wttieint | `slv_clients/contacts` 🟡 | contact\_id (MD5), tie\_id, nom, prenom, email, telephone, fonction\_code, \_loaded\_at |
+| `silver_clients_detail.py` | raw\_wtencoursg | `slv_clients/encours_credit` | encours\_id, siren, montant\_encours (NULL — DDL absent), limite\_credit (NULL), date\_decision (NULL), decision\_libelle, \_loaded\_at |
 
 ### 3.3 Silver → Gold
 
 | Script | Lire depuis Silver | Table Gold | Colonnes Gold |
-|---|---|---|---|
-| `gold_dimensions.py` | slv_clients/dim_clients | `gld_shared.dim_clients` | client_sk, tie_id, raison_sociale, siren, nic, siret, naf_code, naf_libelle, ville, code_postal, statut_client, effectif_tranche |
-| `gold_clients_detail.py` | slv_clients, slv_missions, gld_commercial.fact_ca_mensuel_client | `gld_clients.vue_360_client` | client_sk, siren, raison_sociale, naf_code, ville, nb_sites, ca_ytd, ca_n1, delta_ca_pct, encours_montant, encours_limite, **risque_credit** *(CRITIQUE/ELEVE/NORMAL)*, _loaded_at |
-| `gold_clients_detail.py` | idem | `gld_clients.fact_retention_client` | client_sk, trimestre, ca, delta_ca, nb_missions, **risque_churn** *(RISQUE_FORT/INACTIF/STABLE)*, _loaded_at |
-| `gold_vue360_client.py` | slv_clients, slv_missions, gld_commercial, gld_staffing | `gld_clients.vue_360_client` | client_sk, tie_id, raison_sociale, siren, ville, secteur_activite, effectif, statut, ca_ytd, ca_n1, delta_ca_pct, ca_12_mois_glissants, nb_missions_actives, nb_missions_total, nb_int_actifs, nb_int_historique, top_3_metiers *(JSON)*, anciennete_jours, marge_moyenne_pct, montant_encours, limite_credit, risque_credit_score, nb_agences_partenaires, derniere_facture_date, jours_depuis_derniere, **risque_churn**, _computed_at |
-| `gold_retention_client.py` | slv_facturation, slv_missions, slv_temps | `gld_clients.fact_retention_client` | client_sk, tie_id, trimestre, ca_net, delta_ca_qoq, delta_ca_qoq_pct, delta_ca_yoy, delta_ca_yoy_pct, nb_missions, nb_factures, frequence_4_trimestres, derniere_facture, jours_inactivite, **risque_churn**, churn_score_ml |
-| `gold_retention_client.py` | idem | `gld_clients.fact_rentabilite_client` | client_sk, tie_id, annee, ca_net, ca_missions, cout_paye, marge_brute, taux_marge, cout_gestion_estime, rentabilite_nette, taux_rentabilite_nette, nb_interimaires |
-| `gold_ca_mensuel.py` | slv_facturation, slv_temps, slv_missions, slv_clients | `gld_commercial.fact_ca_mensuel_client` | client_sk, tie_id, mois, ca_ht, avoir_ht, ca_net_ht, nb_factures, nb_missions_facturees, nb_heures_facturees, taux_moyen_fact, agence_principale |
+| --- | --- | --- | --- |
+| `gold_dimensions.py` | slv\_clients/dim\_clients | `gld_shared.dim_clients` | client\_sk, tie\_id, raison\_sociale, siren, nic, siret (calculé), naf\_code, naf\_libelle (NULL), ville, code\_postal, statut\_client, effectif\_tranche |
+| `gold_clients_detail.py` | slv\_clients, gld\_commercial.fact\_ca\_mensuel\_client | `gld_clients.vue_360_client` | client\_sk, tie\_id, raison\_sociale, siren, ville, secteur\_activite, ca\_ytd, ca\_n1, delta\_ca\_pct, montant\_encours, limite\_credit, risque\_credit\_score |
+| `gold_clients_detail.py` | idem | `gld_clients.fact_retention_client` | client\_sk, tie\_id, trimestre, ca\_net, delta\_ca\_qoq, nb\_missions, risque\_churn |
+| `gold_vue360_client.py` | slv\_clients, slv\_missions, slv\_facturation, slv\_clients/sites\_mission, slv\_clients/encours\_credit + Gold PG | `gld_clients.vue_360_client` | client\_sk, tie\_id, raison\_sociale, siren, nic, siret, email, ville, secteur\_activite, ca\_ytd, ca\_n1, delta\_ca\_pct, nb\_missions\_actives, nb\_missions\_total, nb\_int\_actifs, nb\_int\_historique, nb\_agences\_partenaires, premiere\_mission, marge\_moyenne\_pct, nb\_sites\_actifs, encours\_credit, limite\_credit, risque\_credit, top\_3\_metiers (JSON), derniere\_facture\_date, \_computed\_at |
+| `gold_retention_client.py` | slv\_facturation, slv\_clients/dim\_clients, slv\_missions | `gld_clients.fact_retention_client` | client\_sk, tie\_id, trimestre, ca\_net, delta\_ca\_qoq, delta\_ca\_qoq\_pct, delta\_ca\_yoy, delta\_ca\_yoy\_pct, nb\_missions, nb\_factures, frequence\_4\_trimestres, derniere\_facture, jours\_inactivite, risque\_churn |
+| `gold_retention_client.py` | idem | `gld_clients.fact_rentabilite_client` | tie\_id, annee, ca\_annee, cout\_missions\_annee, marge\_brute\_annee, taux\_rentabilite\_annee, top\_3\_metiers, nb\_clients\_concurrents |
+| `gold_ca_mensuel.py` | slv\_facturation, slv\_missions, slv\_clients | `gld_commercial.fact_ca_mensuel_client` | client\_sk, tie\_id, mois, ca\_ht (reconstitué via lignes\_factures), avoir\_ht, ca\_net\_ht, nb\_factures, nb\_missions\_facturees, agence\_principale |
+| `gold_ca_mensuel.py` | slv\_facturation (Pareto top-20% CA) | `gld_clients.fact_concentration_client` | agence\_id, mois, nb\_clients, nb\_clients\_top20, ca\_net\_total, ca\_net\_top20, taux\_concentration |
 
 ---
 
@@ -150,43 +160,49 @@ EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
 ### 4.1 Mapping Evolia → Bronze
 
 | Table Evolia | S3 Bronze path | Colonnes extraites | Mode | Delta col |
-|---|---|---|---|---|
-| `WTMISS` | `raw_wtmiss/…` | PER_ID, CNT_ID, TIE_ID, MISS_TIEID, TIES_SERV, MISS_CODE, MISS_JUSTIFICATION, MISS_DPAE, MISS_ETRANGER, MISS_QUAL, MISS_PERFERM, RGPCNT_ID, MISS_NDPAE, CNTI_CREATE, FINMISS_CODE, MISS_SAISIE_DTFIN, MISS_TRANSDATE, MISS_MODIFDATE, **MISS_FLAGDPAE** ⚠️datetime2, MISS_BTP, MISS_TYPCOEF, MISS_LOGIN, **CMD_ID** ⚠️float | DELTA | CNTI_CREATE |
-| `WTCNTI` | `raw_wtcnti/…` | PER_ID, CNT_ID, CNTI_ORDRE, TIE_ID, MET_ID, CNTI_CREATE, CNTI_DATEFFET, CNTI_DATEFINCNTI, CNTI_SOUPDEB, CNTI_SOUPFIN, CNTI_HPART, CNTI_RETCT, CNTI_RETINT, CNTI_THPAYE, CNTI_THFACT, CNTI_SOUPMODIF, CNTI_POSTE, LOTFAC_CODE, CNTI_SALREF1-4, CNTI_DESCRIPT1-2, CNTI_PROTEC1-2, CNTI_DURHEBDO, PCS_CODE_2003 | DELTA | CNTI_CREATE |
-| `WTEFAC` | `raw_wtefac/…` | EFAC_NUM, EFAC_LIB, RGPCNT_ID, TIE_ID, TIES_SERV, EFAC_IDRUPT, EFAC_RUPTURE, DEV_CODE, MRG_CODE, EFAC_DTEEDI, EFAC_DTEECH, EFAC_TYPF, EFAC_TYPG, WTE_EFAC_NUM, EFAC_MATR, EFAC_VERROU, EFAC_TRANS, EFAC_TRANS_FACTO, EFAC_ORDNUM, EFAC_USER, JSTFAV_ID, EFAC_JSTFCOMM, TVA_CODE, EFAC_DTEREGLF, EFAC_TAUXTVA, EFAC_PLAC_ID | DELTA | EFAC_DTEEDI |
-| `WTLFAC` | `raw_wtlfac/…` | FAC_NUM, LFAC_ORD, LFAC_LIB, LFAC_BASE, LFAC_TAUX, LFAC_MNT | FULL | — |
-| `WTFACINFO` | `raw_wtfacinfo/…` | CNT_ID, FAC_NUM, PER_ID, TIE_ID | FULL | — |
-| `WTCMD` | `raw_wtcmd/…` | CMD_ID, RGPCNT_ID, CMD_DTE, CMD_NBSALS, CMD_CODE, STAT_CODE, STAT_TYPE | FULL | — |
-| `WTPLAC` | `raw_wtplac/…` | PLAC_ID, RGPCNT_ID, TIE_ID, MET_ID, PLAC_DTEEDI | FULL | — |
-| `PYCONTRAT` | `raw_pycontrat/…` | PER_ID, CNT_ID, ETA_ID, RGPCNT_ID, CNT_DATEDEB, CNT_DATEFIN, CNT_FINPREVU, LOTPAYE_CODE, TYPCOT_CODE, CNT_AVT_ORDRE, CNT_INI_ORDRE | DELTA | CNT_DATEFIN *(allow_null)* |
+| --- | --- | --- | --- | --- |
+| `WTMISS` | `raw_wtmiss/…` | PER\_ID, CNT\_ID, TIE\_ID, MISS\_TIEID, TIES\_SERV, MISS\_CODE, MISS\_JUSTIFICATION, MISS\_DPAE, MISS\_ETRANGER, MISS\_QUAL, MISS\_PERFERM, RGPCNT\_ID, MISS\_NDPAE, CNTI\_CREATE, FINMISS\_CODE, MISS\_SAISIE\_DTFIN, MISS\_TRANSDATE, MISS\_MODIFDATE, **MISS\_FLAGDPAE** ⚠️datetime2, MISS\_BTP, MISS\_TYPCOEF, MISS\_LOGIN, CMD\_ID, **MISS\_ANNULE** | DELTA | CNTI\_CREATE |
+| `WTCNTI` | `raw_wtcnti/…` | PER\_ID, CNT\_ID, CNTI\_ORDRE, TIE\_ID, MET\_ID, CNTI\_CREATE, CNTI\_DATEFFET, CNTI\_DATEFINCNTI, CNTI\_SOUPDEB, CNTI\_SOUPFIN, CNTI\_HPART, CNTI\_RETCT, CNTI\_RETINT, CNTI\_THPAYE, CNTI\_THFACT, CNTI\_SOUPMODIF, CNTI\_POSTE, LOTFAC\_CODE, CNTI\_SALREF1-4, CNTI\_DESCRIPT1-2, CNTI\_PROTEC1-2, CNTI\_DURHEBDO, PCS\_CODE\_2003 | DELTA | CNTI\_CREATE |
+| `WTEFAC` | `raw_wtefac/…` | EFAC\_NUM, EFAC\_LIB, RGPCNT\_ID, TIE\_ID, TIES\_SERV, EFAC\_DTEEDI, EFAC\_DTEECH, EFAC\_TYPF, EFAC\_TYPG, WTE\_EFAC\_NUM, EFAC\_MATR, EFAC\_TRANS, EFAC\_TAUXTVA, EFAC\_DTEREGLF | DELTA | EFAC\_DTEEDI |
+| `WTLFAC` | `raw_wtlfac/…` | FAC\_NUM, LFAC\_ORD, LFAC\_LIB, LFAC\_BASE, LFAC\_TAUX, LFAC\_MNT | FULL (filtré via WTEFAC depuis 2024-01-01) | — |
+| `WTFACINFO` | `raw_wtfacinfo/…` | CNT\_ID, FAC\_NUM, PER\_ID, TIE\_ID | FULL | — |
+| `WTCMD` | `raw_wtcmd/…` | CMD\_ID, RGPCNT\_ID, CMD\_DTE, CMD\_NBSALS, CMD\_CODE, STAT\_CODE, STAT\_TYPE | FULL | — |
+| `WTPLAC` | `raw_wtplac/…` | PLAC\_ID, RGPCNT\_ID, TIE\_ID, MET\_ID, PLAC\_DTEEDI | FULL | — |
+| `PYCONTRAT` | `raw_pycontrat/…` | PER\_ID, CNT\_ID, ETA\_ID, RGPCNT\_ID, CNT\_DATEDEB, CNT\_DATEFIN, CNT\_FINPREVU, LOTPAYE\_CODE, TYPCOT\_CODE, CNT\_AVT\_ORDRE, CNT\_INI\_ORDRE | DELTA | CNT\_DATEFIN (allow\_null) |
+| `WTFINMISS` | `raw_wtfinmiss/…` | FINMISS\_CODE, FINMISS\_LIBELLE, FINMISS\_IFM, FINMISS\_CP, **MTFCNT\_ID** | FULL | — |
+| `PYMTFCNT` | `raw_pymtfcnt/…` | MTFCNT\_ID, MTFCNT\_CODE, MTFCNT\_LIBELLE, MTFCNT\_FINCNT, MTFCNT\_DADS | FULL | — |
 
 ### 4.2 Bronze → Silver
 
 | Script | Lire depuis Bronze | Écrire vers Silver | Colonnes Silver |
-|---|---|---|---|
-| `silver_missions.py` | raw_wtmiss + raw_wtcnti + raw_wtcmd (JOIN multi-sources via sql_fn) | `slv_missions/missions` | per_id, cnt_id, tie_id, ties_serv, rgpcnt_id, date_debut, date_fin, motif, code_fin, prh_bts, **statut_dpae** (MISS_FLAGDPAE datetime2), **ecart_heures** (DPAE vs début contrat en heures), **delai_placement_heures** (CMD_DTE→CNTI_DATEFFET), **categorie_delai** (urgent/court/standard/long/inconnu), _batch_id, _loaded_at |
-| `silver_missions.py` | idem | `slv_missions/contrats` | per_id, cnt_id, ordre, met_id, tpci_code, date_debut, date_fin, taux_paye, taux_fact, nb_heures, poste, _batch_id, _loaded_at |
-| `silver_missions.py` | idem | `slv_missions/commandes` | cmd_id, rgpcnt_id, cmd_date, nb_sal, stat_code, stat_type, _batch_id, _loaded_at |
-| `silver_missions.py` | idem | `slv_missions/placements` | plac_id, rgpcnt_id, tie_id, met_id, statut, plac_date, _batch_id, _loaded_at |
-| `silver_missions.py` | idem | `slv_missions/contrats_paie` | per_id, cnt_id, eta_id, rgpcnt_id, date_debut, date_fin, date_fin_prevue, lot_paye_code, typ_cotisation_code, avt_ordre, ini_ordre, _batch_id, _loaded_at |
-| `silver_factures.py` | raw_wtefac, raw_wtlfac | `slv_facturation/factures` | efac_num, rgpcnt_id, tie_id, ties_serv, type_facture, date_facture, date_echeance, montant_ht ⚠️NULL, montant_ttc ⚠️NULL, taux_tva, prh_bts, _batch_id, _loaded_at |
-| `silver_factures.py` | idem | `slv_facturation/lignes_factures` | fac_num, lfac_ord, libelle, base, taux, montant, rubrique, _batch_id, _loaded_at |
+| --- | --- | --- | --- |
+| `silver_missions.py` | raw\_wtmiss + raw\_wtcnti + raw\_wtcmd | `slv_missions/missions` | per\_id, cnt\_id, tie\_id, ties\_serv, rgpcnt\_id, date\_debut, date\_fin, motif, code\_fin, prh\_bts, **statut\_dpae** (MISS\_FLAGDPAE datetime2), **ecart\_heures** (DPAE vs début contrat en heures), **delai\_placement\_heures** (CMD\_DTE→CNTI\_DATEFFET), **categorie\_delai** (urgent/court/standard/long), \_batch\_id, \_loaded\_at |
+| `silver_missions.py` | raw\_wtcnti | `slv_missions/contrats` | per\_id, cnt\_id, ordre, met\_id, tpci\_code, date\_debut, date\_fin, taux\_paye, taux\_fact, nb\_heures, poste, \_batch\_id, \_loaded\_at |
+| `silver_missions.py` | raw\_wtcmd | `slv_missions/commandes` | cmd\_id, rgpcnt\_id, cmd\_date, nb\_sal, stat\_code, stat\_type, \_batch\_id, \_loaded\_at |
+| `silver_missions.py` | raw\_wtplac | `slv_missions/placements` | plac\_id, rgpcnt\_id, tie\_id, met\_id, statut, plac\_date, \_batch\_id, \_loaded\_at |
+| `silver_missions.py` | raw\_wtmiss + raw\_wtfinmiss + raw\_pymtfcnt | `slv_missions/fin_mission` | per\_id, cnt\_id, rgpcnt\_id, tie\_id, date\_debut, date\_fin\_reelle, date\_fin\_saisie, finmiss\_code, finmiss\_libelle, mtfcnt\_code, mtfcnt\_libelle, mtfcnt\_fincnt, miss\_annule, duree\_reelle\_jours, **statut\_fin\_mission** (ANNULEE/EN\_COURS/TERME\_NORMAL/RUPTURE), \_batch\_id, \_loaded\_at |
+| `silver_missions.py` | raw\_pycontrat | `slv_missions/contrats_paie` | per\_id, cnt\_id, eta\_id, rgpcnt\_id, date\_debut, date\_fin, date\_fin\_prevue, lot\_paye\_code, typ\_cotisation\_code, avt\_ordre, ini\_ordre, \_batch\_id, \_loaded\_at |
+| `silver_factures.py` | raw\_wtefac | `slv_facturation/factures` | efac\_num, rgpcnt\_id, tie\_id, ties\_serv, type\_facture, date\_facture, date\_echeance, montant\_ht ⚠️NULL, montant\_ttc, taux\_tva, \_batch\_id, \_loaded\_at |
+| `silver_factures.py` | raw\_wtlfac | `slv_facturation/lignes_factures` | fac\_num, lfac\_ord, libelle, base, taux, montant (LFAC\_MNT), \_batch\_id, \_loaded\_at |
 
-> ⚠️ **Bug B-02** : `WTEFAC.EFAC_MONTANTHT` absent du DDL Evolia → `montant_ht` NULL en Silver.
-> Contournement Gold : `ca_ht = SUM(lfac_base × lfac_taux)` via `lignes_factures`.
+> ⚠️ **Bug B-01** : `WTEFAC.EFAC_MONTANTHT` absent du DDL Evolia → `montant_ht` NULL en Silver.
+> Contournement Gold : `ca_ht = SUM(lfac_base × lfac_taux)` via `lignes_factures` (helper `cte_montants_factures`).
 
 ### 4.3 Silver → Gold
 
 | Script | Lire depuis Silver | Table Gold | Colonnes Gold |
-|---|---|---|---|
-| `gold_ca_mensuel.py` | slv_facturation/factures, slv_facturation/lignes_factures, slv_temps/heures_detail, slv_missions/missions, slv_clients/dim_clients | `gld_commercial.fact_ca_mensuel_client` | client_sk, tie_id, mois, ca_ht *(reconstitué)*, avoir_ht, ca_net_ht, nb_factures, nb_missions_facturees, nb_heures_facturees, taux_moyen_fact, agence_principale |
-| `gold_ca_mensuel.py` | slv_facturation (Pareto top-20% CA par agence/mois) | `gld_clients.fact_concentration_client` | agence_id, mois, nb_clients, nb_clients_top20, ca_net_total, ca_net_top20, taux_concentration |
-| `gold_staffing.py` | slv_missions, slv_missions/contrats, slv_temps/releves_heures, slv_interimaires | `gld_staffing.fact_missions_detail` | mission_sk, per_id, cnt_id, tie_id, agence_id, metier_id, date_debut, date_fin, duree_jours, taux_horaire_paye, taux_horaire_fact, marge_horaire, heures_totales, ca_mission, cout_mission, marge_mission, taux_marge |
-| `gold_scorecard_agence.py` | slv_missions, slv_facturation, slv_temps | `gld_performance.scorecard_agence` | agence_id, mois, ca_net_ht, taux_marge, marge_brute, nb_clients_actifs, nb_int_actifs, nb_missions, taux_transformation, nb_commandes, nb_pourvues |
-| `gold_operationnel.py` | slv_missions/missions (statut_dpae, delai_placement_heures, categorie_delai) | `gld_operationnel.fact_delai_placement` | agence_id, semaine_debut, categorie_delai, nb_missions, delai_moyen_heures, delai_median_heures |
-| `gold_operationnel.py` | slv_missions/missions (statut_dpae, ecart_heures) | `gld_operationnel.fact_conformite_dpae` | agence_id, mois, nb_missions, nb_dpae_transmises, nb_dpae_manquantes, taux_conformite_dpae, ecart_moyen_heures |
+| --- | --- | --- | --- |
+| `gold_ca_mensuel.py` | slv\_facturation/factures, slv\_facturation/lignes\_factures, slv\_missions/missions, slv\_clients/dim\_clients | `gld_commercial.fact_ca_mensuel_client` | client\_sk, tie\_id, mois, ca\_ht (reconstitué), avoir\_ht, ca\_net\_ht, nb\_factures, nb\_missions\_facturees, agence\_principale |
+| `gold_ca_mensuel.py` | slv\_facturation (Pareto top-20%) | `gld_clients.fact_concentration_client` | agence\_id, mois, nb\_clients, nb\_clients\_top20, ca\_net\_total, ca\_net\_top20, taux\_concentration |
+| `gold_staffing.py` | slv\_missions, slv\_missions/contrats, slv\_temps, slv\_interimaires | `gld_staffing.fact_missions_detail` | mission\_sk, per\_id, cnt\_id, tie\_id, agence\_id, metier\_id, date\_debut, date\_fin, duree\_jours, taux\_horaire\_paye, taux\_horaire\_fact, marge\_horaire, heures\_totales, ca\_mission, cout\_mission, marge\_mission, taux\_marge |
+| `gold_scorecard_agence.py` | slv\_missions, slv\_facturation, slv\_temps | `gld_performance.scorecard_agence` | agence\_id, mois, ca\_net\_ht, taux\_marge, marge\_brute, nb\_clients\_actifs, nb\_int\_actifs, nb\_missions, taux\_transformation, nb\_commandes, nb\_pourvues |
+| `gold_operationnel.py` | slv\_missions/missions (statut\_dpae, delai\_placement\_heures, categorie\_delai) | `gld_operationnel.fact_delai_placement` | agence\_id, semaine\_debut, categorie\_delai, nb\_missions, delai\_moyen\_heures, delai\_median\_heures |
+| `gold_operationnel.py` | slv\_missions/missions (statut\_dpae, ecart\_heures) | `gld_operationnel.fact_conformite_dpae` | agence\_id, mois, nb\_missions, nb\_dpae\_transmises, nb\_dpae\_manquantes, taux\_conformite\_dpae, ecart\_moyen\_heures |
+| `gold_operationnel.py` | slv\_missions/fin\_mission | `gld_operationnel.fact_ruptures_early_term` | agence\_id, semaine\_debut, nb\_ruptures, taux\_rupture\_pct, nb\_annulations, taux\_annulation\_pct |
+| `gold_qualite_missions.py` ⚠️ | slv\_missions/fin\_mission + slv\_missions/missions | `gld_performance.fact_rupture_contrat` | agence\_id, tie\_id, mois, nb\_missions\_total, nb\_ruptures, nb\_annulations, nb\_terme\_normal, taux\_rupture\_pct, taux\_fin\_anticipee\_pct, duree\_moy\_avant\_rupture |
 
-> ⚠️ **Prérequis** : `fact_delai_placement` et `fact_conformite_dpae` nécessitent un run Silver missions après le 2026-03-13 (colonnes enrichies absentes des Parquet antérieurs).
+> ⚠️ **`gold_qualite_missions.py` n'est pas intégré dans `dag_gi_pipeline.py`** (Phase 4 — à ajouter dans `gold_facts_group`).
+> Prérequis : `slv_missions/fin_mission` produit par `silver_missions.py` depuis 2026-03-15.
 
 ---
 
@@ -197,44 +213,45 @@ EVOLIA SQL Server (on-prem · SRV-SQL2\cegi · DB: INTERACTION)
 **Tables personne / dossier :**
 
 | Table Evolia | S3 Bronze path | Colonnes extraites | Mode | RGPD |
-|---|---|---|---|---|
-| `PYPERSONNE` | `raw_pypersonne/…` | PER_ID, PER_NOM, PER_PRENOM, PER_NAISSANCE, **PER_NIR** 🔴, NAT_CODE, PAYS_CODE, PER_BISVOIE, PER_COMPVOIE, PER_CP, PER_VILLE, PER_COMMUNE | FULL | SENSIBLE |
-| `PYSALARIE` | `raw_pysalarie/…` | PER_ID, SAL_MATRICULE, SAL_DATEENTREE, SAL_ACTIF | FULL | PERSONNEL |
-| `WTPINT` | `raw_wtpint/…` | PER_ID, PINT_CANDIDAT, PINT_DOSSIER, PINT_PERMANENT, **PINT_PREVENDTE**, **PINT_DERVENDTE**, **PINT_MODIFDATE**, **PINT_CREATDTE** | FULL | PERSONNEL |
-| `PYCOORDONNEE` | `raw_pycoordonnee/…` | PER_ID, TYPTEL_CODE, **PER_TEL_NTEL** 🔴, PER_TEL_POSTE | FULL | SENSIBLE |
-| `WTPEVAL` | `raw_wtpeval/…` | PER_ID, PEVAL_DU, PEVAL_EVALUATION, PEVAL_UTL | DELTA | — |
-| `WTUGPINT` | `raw_wtugpint/…` | PER_ID, RGPCNT_ID, AUG_ORI | FULL | — |
+| --- | --- | --- | --- | --- |
+| `PYPERSONNE` | `raw_pypersonne/…` | PER\_ID, PER\_NOM, PER\_PRENOM, PER\_NAISSANCE, **PER\_NIR** 🔴, NAT\_CODE, PAYS\_CODE, PER\_BISVOIE, PER\_COMPVOIE, PER\_CP, PER\_VILLE, PER\_COMMUNE | FULL | SENSIBLE |
+| `PYSALARIE` | `raw_pysalarie/…` | PER\_ID, SAL\_MATRICULE, SAL\_DATEENTREE, SAL\_ACTIF | FULL | PERSONNEL |
+| `WTPINT` | `raw_wtpint/…` | PER\_ID, PINT\_CANDIDAT, PINT\_DOSSIER, PINT\_PERMANENT, PINT\_PREVENDTE, PINT\_DERVENDTE, PINT\_MODIFDATE, PINT\_CREATDTE | FULL | PERSONNEL |
+| `PYCOORDONNEE` | `raw_pycoordonnee/…` | PER\_ID, TYPTEL\_CODE, **PER\_TEL\_NTEL** 🔴, PER\_TEL\_POSTE | FULL | SENSIBLE |
+| `WTPEVAL` | `raw_wtpeval/…` | PER\_ID, PEVAL\_DU, PEVAL\_EVALUATION, PEVAL\_UTL | DELTA | PEVAL\_DU |
+| `WTUGPINT` | `raw_wtugpint/…` | PER\_ID, RGPCNT\_ID, AUG\_ORI | FULL | — |
 
 **Tables compétences (liens personne-référentiel) :**
 
 | Table Evolia | S3 Bronze path | Colonnes extraites | Mode |
-|---|---|---|---|
-| `WTPMET` | `raw_wtpmet/…` | PER_ID, PMET_ORDRE, MET_ID | FULL |
-| `WTPHAB` | `raw_wtphab/…` | PER_ID, THAB_ID, PHAB_DELIVR, PHAB_EXPIR, PHAB_ORDRE | FULL |
-| `WTPDIP` | `raw_wtpdip/…` | PER_ID, TDIP_ID, PDIP_DATE | FULL |
-| `WTEXP` | `raw_wtexp/…` | PER_ID, EXP_ORDRE, EXP_NOM, EXP_DEBUT, EXP_FIN, EXP_INTERNE | FULL |
+| --- | --- | --- | --- |
+| `WTPMET` | `raw_wtpmet/…` | PER\_ID, PMET\_ORDRE, MET\_ID | FULL |
+| `WTPHAB` | `raw_wtphab/…` | PER\_ID, THAB\_ID, PHAB\_DELIVR, PHAB\_EXPIR, PHAB\_ORDRE | FULL |
+| `WTPDIP` | `raw_wtpdip/…` | PER\_ID, TDIP\_ID, PDIP\_DATE | FULL |
+| `WTEXP` | `raw_wtexp/…` | PER\_ID, EXP\_ORDRE, EXP\_NOM, EXP\_DEBUT, EXP\_FIN, EXP\_INTERNE | FULL |
 
 **Tables référentiels compétences :**
 
 | Table Evolia | S3 Bronze path | Colonnes extraites | Mode | Note |
-|---|---|---|---|---|
-| `WTMET` | `raw_wtmet/…` | MET_ID, MET_CODE, MET_LIBELLE, TQUA_ID, NIVQ_ID, SPE_ID, **PCS_CODE_2003**, DFS_ID, **MET_DELETE** | FULL | Classification INSEE |
-| `WTTHAB` | `raw_wtthab/…` | THAB_ID, THAB_CDE, THAB_LIBELLE, **THAB_NBMOIS** | FULL | Durée validité standard |
-| `WTTDIP` | `raw_wttdip/…` | TDIP_ID, TDIP_CODE, TDIP_LIB, **TDIP_REF** | FULL | Catégorie diplôme |
-| `WTQUA` | `raw_wtqua/…` | TQUA_ID, TQUA_CODE, **TQUA_LIBELLE** | FULL | Libellé type qualification |
+| --- | --- | --- | --- | --- |
+| `WTMET` | `raw_wtmet/…` | MET\_ID, MET\_CODE, MET\_LIBELLE, TQUA\_ID, NIVQ\_ID, SPE\_ID, **PCS\_CODE\_2003**, DFS\_ID, **MET\_DELETE** | FULL | Classification INSEE |
+| `WTTHAB` | `raw_wtthab/…` | THAB\_ID, THAB\_CDE, THAB\_LIBELLE, **THAB\_NBMOIS** | FULL | Durée validité standard |
+| `WTTDIP` | `raw_wttdip/…` | TDIP\_ID, TDIP\_CODE, TDIP\_LIB, **TDIP\_REF** | FULL | Catégorie diplôme |
+| `WTQUA` | `raw_wtqua/…` | TQUA\_ID, TQUA\_CODE, **TQUA\_LIBELLE** | FULL | Libellé type qualification |
 
 ### 5.2 Bronze → Silver
 
 | Script | Lire depuis Bronze | Écrire vers Silver | Colonnes Silver | Logique métier |
-|---|---|---|---|---|
-| `silver_interimaires.py` *(SCD2)* | raw_pypersonne, raw_pysalarie, raw_wtpint | `slv_interimaires/dim_interimaires` | interimaire_sk, per_id, change_hash, matricule, nom, prenom, date_naissance, **nir_pseudo** 🟡, nationalite, pays, adresse, ville, code_postal, date_entree, date_sortie, is_actif, is_candidat, is_permanent, agence_rattachement, is_current, valid_from, valid_to, _loaded_at | NIR → SHA-256+salt |
-| `silver_interimaires_detail.py` | raw_wtpeval, raw_pycoordonnee, raw_wtugpint | `slv_interimaires/evaluations` | eval_id, per_id, date_eval, note, commentaire, evaluateur_id, _loaded_at | — |
-| `silver_interimaires_detail.py` | idem | `slv_interimaires/coordonnees` 🟡 | coord_id, per_id, type_coord, valeur, poste, is_principal, _loaded_at | Silver uniquement — jamais en Gold |
-| `silver_interimaires_detail.py` | idem | `slv_interimaires/portefeuille_agences` | per_id, rgpcnt_id, _loaded_at | — |
-| `silver_interimaires_detail.py` | raw_wtpint (PINT_DERVENDTE proxy SAL_DATESORTIE) | `slv_interimaires/fidelisation` | per_id, date_premiere_vente, date_avant_derniere_vente, date_derniere_vente, anciennete_jours, jours_depuis_derniere_vente, **categorie_fidelisation** (4 valeurs : actif-recent / actif-annee / inactif-long / inactif), _loaded_at | SAL_DATESORTIE absent DDL |
-| `silver_competences.py` | raw_wtpmet+raw_wtmet, raw_wtphab+raw_wtthab, raw_wtpdip+raw_wttdip, raw_wtexp | `slv_interimaires/competences` | competence_id, per_id, type_competence, code, libelle, niveau *(TDIP_REF)*, date_obtention, **date_expiration** *(COALESCE PHAB_EXPIR, PHAB_DELIVR+THAB_NBMOIS)*, **is_active** *(MET_DELETE+date_expir)*, **pcs_code** *(PCS_CODE_2003)*, _source_table, _loaded_at | Calcul date_expir théorique |
+| --- | --- | --- | --- | --- |
+| `silver_interimaires.py` (SCD2) | raw\_pypersonne, raw\_pysalarie, raw\_wtpint | `slv_interimaires/dim_interimaires` | interimaire\_sk, per\_id, change\_hash, matricule, nom, prenom, date\_naissance, **nir\_pseudo** 🟡, nationalite, pays, adresse, ville, code\_postal, date\_entree, is\_actif, is\_candidat, is\_permanent, agence\_rattachement, is\_current, valid\_from, valid\_to, \_source\_raw\_id, \_loaded\_at | NIR → SHA-256+salt |
+| `silver_interimaires_detail.py` | raw\_wtpeval | `slv_interimaires/evaluations` | eval\_id, per\_id, date\_eval, note, commentaire, evaluateur\_id, \_loaded\_at | — |
+| `silver_interimaires_detail.py` | raw\_pycoordonnee | `slv_interimaires/coordonnees` 🟡 | coord\_id, per\_id, type\_coord, valeur, poste, is\_principal, \_loaded\_at | Silver uniquement — jamais en Gold |
+| `silver_interimaires_detail.py` | raw\_wtugpint | `slv_interimaires/portefeuille_agences` | per\_id, rgpcnt\_id, \_loaded\_at | — |
+| `silver_interimaires_detail.py` | raw\_wtpint (PINT\_DERVENDTE proxy) | `slv_interimaires/fidelisation` | per\_id, date\_premiere\_vente, date\_avant\_derniere\_vente, date\_derniere\_vente, anciennete\_jours, jours\_depuis\_derniere\_vente, **categorie\_fidelisation** (actif\_recent/actif\_annee/inactif\_long/inactif), \_loaded\_at | SAL\_DATESORTIE absent DDL |
+| `silver_competences.py` | raw\_wtpmet+raw\_wtmet, raw\_wtphab+raw\_wtthab, raw\_wtpdip+raw\_wttdip, raw\_wtexp | `slv_interimaires/competences` | competence\_id, per\_id, type\_competence (METIER/HABILITATION/DIPLOME/EXPERIENCE), code, libelle, niveau (TDIP\_REF), date\_obtention, **date\_expiration** (COALESCE PHAB\_EXPIR, PHAB\_DELIVR+THAB\_NBMOIS), **is\_active** (MET\_DELETE+date\_expir), **pcs\_code** (PCS\_CODE\_2003), \_source\_table, \_loaded\_at | Calcul date\_expir théorique |
 
-**Logique date_expiration habilitations :**
+**Logique date\_expiration habilitations :**
+
 ```sql
 date_expiration = COALESCE(
   PHAB_EXPIR::DATE,
@@ -245,14 +262,15 @@ date_expiration = COALESCE(
 ### 5.3 Silver → Gold
 
 | Script | Lire depuis Silver | Table Gold | Colonnes Gold |
-|---|---|---|---|
-| `gold_dimensions.py` | slv_interimaires/dim_interimaires | `gld_shared.dim_interimaires` | interimaire_sk, per_id, matricule, nom, prenom, ville, code_postal, date_entree, is_actif, is_candidat, is_permanent, agence_rattachement |
-| `gold_dimensions.py` | raw_wtmet + raw_wtqua *(Bronze direct)* | `gld_shared.dim_metiers` | metier_sk, met_id, code_metier, libelle_metier, qualification *(TQUA_LIBELLE)*, specialite *(SPE_ID)*, niveau *(NIVQ_ID)*, **pcs_code** *(PCS_CODE_2003)* |
-| `gold_competences.py` | slv_interimaires/competences, slv_interimaires/dim_interimaires, slv_missions/missions | `gld_staffing.fact_competences_dispo` | metier_sk, agence_sk, met_id, rgpcnt_id, nb_qualifies, nb_disponibles, nb_en_mission, taux_couverture, _computed_at |
-| `gold_staffing.py` | slv_interimaires/dim_interimaires, slv_missions, slv_temps | `gld_staffing.fact_activite_int` | interimaire_sk, per_id, mois, nb_missions, nb_agences, nb_clients, heures_travaillees, heures_disponibles, taux_occupation, ca_genere |
-| `gold_staffing.py` | slv_interimaires/fidelisation, slv_interimaires/portefeuille_agences | `gld_staffing.fact_fidelisation_interimaires` | agence_id, categorie_fidelisation, nb_interimaires, anciennete_moy_jours, jours_inactivite_moyen |
+| --- | --- | --- | --- |
+| `gold_dimensions.py` | slv\_interimaires/dim\_interimaires | `gld_shared.dim_interimaires` | interimaire\_sk, per\_id, matricule, nom, prenom, date\_naissance, nationalite, is\_actif, is\_candidat, is\_permanent, agence\_rattachement |
+| `gold_dimensions.py` | raw\_wtmet + raw\_wtqua (Bronze direct) | `gld_shared.dim_metiers` | metier\_sk, met\_id, code\_metier, libelle\_metier, qualification\_code (TQUA\_ID), qualification\_libelle (TQUA\_LIBELLE), niveau (NIVQ\_ID), **pcs\_code** (PCS\_CODE\_2003), **is\_active** (MET\_DELETE=0) |
+| `gold_competences.py` | slv\_interimaires/competences, slv\_interimaires/dim\_interimaires, slv\_agences/dim\_agences, slv\_missions/missions | `gld_staffing.fact_competences_dispo` | metier\_sk, agence\_sk, met\_id, rgpcnt\_id, nb\_qualifies, nb\_disponibles, nb\_en\_mission, taux\_couverture, \_computed\_at |
+| `gold_staffing.py` | slv\_interimaires/dim\_interimaires, slv\_missions, slv\_temps | `gld_staffing.fact_activite_int` | interimaire\_sk, per\_id, mois, nb\_missions, nb\_agences, nb\_clients, heures\_travaillees, heures\_disponibles, taux\_occupation, ca\_genere |
+| `gold_staffing.py` | slv\_missions, slv\_missions/contrats, slv\_temps | `gld_staffing.fact_missions_detail` | mission\_sk, per\_id, cnt\_id, tie\_id, agence\_id, metier\_id, date\_debut, date\_fin, duree\_jours, taux\_horaire\_paye, taux\_horaire\_fact, marge\_horaire, heures\_totales, ca\_mission, cout\_mission, marge\_mission, taux\_marge |
+| `gold_staffing.py` | slv\_interimaires/fidelisation, slv\_interimaires/portefeuille\_agences | `gld_staffing.fact_fidelisation` | per\_id, anciennete\_jours, jours\_depuis\_derniere\_vente, categorie (actif\_recent/actif\_annee/inactif), \_loaded\_at |
 
-> **Prérequis `fact_fidelisation_interimaires`** : nécessite un run `silver_interimaires_detail` après le 2026-03-13 (slv_interimaires/fidelisation absent des partitions antérieures).
+> **Prérequis `fact_fidelisation`** : nécessite un run `silver_interimaires_detail` après le 2026-03-13 (slv\_interimaires/fidelisation absent des partitions antérieures).
 
 ---
 
@@ -261,26 +279,26 @@ date_expiration = COALESCE(
 ### 6.1 Mapping Evolia → Bronze
 
 | Table Evolia | S3 Bronze path | Colonnes extraites | Mode | Delta col | Note |
-|---|---|---|---|---|---|
-| `WTPRH` | `raw_wtprh/…` | PRH_BTS, PER_ID, CNT_ID, TIE_ID, PRH_DTEDEBSEM, LOTPAYE_CODE, CAL_AN, CAL_NPERIODE, LOTFAC_CODE, CALF_AN, CALF_NPERIODE, CNTI_ORDRE, PRH_DTEFINSEM, VENTHEU_DTEDEB, PRH_IFM, PRH_CP, PRH_FLAG_RH, PRH_MODIFDATE | DELTA | PRH_MODIFDATE | — |
-| `WTRHDON` | `raw_wtrhdon/…` | RINT_ID, RHD_LIGNE, RHD_BASEP, RHD_TAUXP, RHD_BASEF, RHD_TAUXF, PRH_BTS, FAC_NUM, BUL_ID, RHD_RAPPEL, RHD_ORIRUB, RHD_PORTEE, RHD_LIBRUB, RHD_EXCLDEP, RHD_SEUILP, RHD_SEUILF, RHD_BASEPROV, RHD_TAUXPROV, RHD_DATED, RHD_DATEF | DELTA | RHD_DATED | FALLBACK 2024-01-01 (49.6M total rows) |
+| --- | --- | --- | --- | --- | --- |
+| `WTPRH` | `raw_wtprh/…` | PRH\_BTS, PER\_ID, CNT\_ID, TIE\_ID, PRH\_DTEDEBSEM, LOTPAYE\_CODE, CAL\_AN, CAL\_NPERIODE, LOTFAC\_CODE, CALF\_AN, CALF\_NPERIODE, CNTI\_ORDRE, PRH\_DTEFINSEM, PRH\_IFM, PRH\_CP, PRH\_FLAG\_RH, PRH\_MODIFDATE | DELTA | PRH\_MODIFDATE | — |
+| `WTRHDON` | `raw_wtrhdon/…` | RINT\_ID, RHD\_LIGNE, RHD\_BASEP, RHD\_TAUXP, RHD\_BASEF, RHD\_TAUXF, PRH\_BTS, FAC\_NUM, BUL\_ID, RHD\_RAPPEL, RHD\_ORIRUB, RHD\_PORTEE, RHD\_LIBRUB, RHD\_EXCLDEP, RHD\_SEUILP, RHD\_SEUILF, RHD\_BASEPROV, RHD\_TAUXPROV, RHD\_DATED, RHD\_DATEF | DELTA | RHD\_DATED | FALLBACK 2024-01-01 (49.6M total rows) |
 
 ### 6.2 Bronze → Silver
 
 | Script | Lire depuis Bronze | Écrire vers Silver | Colonnes Silver |
-|---|---|---|---|
-| `silver_temps.py` | raw_wtprh | `slv_temps/releves_heures` | prh_bts, per_id, cnt_id, tie_id, rgpcnt_id, periode, date_modif, valide, _batch_id, _loaded_at |
-| `silver_temps.py` | raw_wtrhdon | `slv_temps/heures_detail` | prh_bts, rhd_ligne, rubrique, base_paye, taux_paye, base_fact, taux_fact, libelle, _batch_id, _loaded_at |
+| --- | --- | --- | --- |
+| `silver_temps.py` | raw\_wtprh | `slv_temps/releves_heures` | prh\_bts, per\_id, cnt\_id, tie\_id, date\_modif, valide (PRH\_FLAG\_RH), \_batch\_id, \_loaded\_at |
+| `silver_temps.py` | raw\_wtrhdon | `slv_temps/heures_detail` (PER\_ID absent — RGPD) | prh\_bts, rhd\_ligne, rubrique, base\_paye, taux\_paye, base\_fact, taux\_fact, libelle, \_batch\_id, \_loaded\_at |
 
 ### 6.3 Silver → Gold
 
 | Script | Lire depuis Silver | Table Gold | Colonnes Gold |
-|---|---|---|---|
-| `gold_etp.py` | slv_temps/releves_heures (valide=true), slv_temps/heures_detail | `gld_operationnel.fact_etp_hebdo` | agence_id, semaine_debut, nb_releves, nb_interimaires, heures_totales, etp *(SUM(base_paye)/35)* |
-| `gold_operationnel.py` | slv_temps/releves_heures, slv_temps/heures_detail | `gld_operationnel.fact_heures_hebdo` | agence_id, tie_id, semaine_debut, heures_paye, heures_fact, nb_releves, _loaded_at |
-| `gold_ca_mensuel.py` | slv_temps/heures_detail | Agrégation dans `fact_ca_mensuel_client` | nb_heures_facturees |
-| `gold_staffing.py` | slv_temps/releves_heures, slv_temps/heures_detail | `gld_staffing.fact_activite_int` | heures_travaillees, heures_disponibles, taux_occupation |
-| `gold_staffing.py` | idem | `gld_staffing.fact_missions_detail` | heures_totales, ca_mission, cout_mission, marge_mission, taux_marge |
+| --- | --- | --- | --- |
+| `gold_etp.py` | slv\_temps/releves\_heures (valide=true), slv\_temps/heures\_detail | `gld_operationnel.fact_etp_hebdo` | agence\_id, semaine\_debut (DATE\_TRUNC week), nb\_releves, nb\_interimaires, heures\_totales, etp (SUM(base\_paye)/35) |
+| `gold_operationnel.py` | slv\_temps/releves\_heures, slv\_temps/heures\_detail | `gld_operationnel.fact_heures_hebdo` | agence\_id, tie\_id, semaine\_debut, heures\_paye, heures\_fact, nb\_releves, \_loaded\_at |
+| `gold_ca_mensuel.py` | slv\_temps/heures\_detail | Agrégation dans `fact_ca_mensuel_client` | nb\_missions\_facturees (proxy) |
+| `gold_staffing.py` | slv\_temps/releves\_heures, slv\_temps/heures\_detail | `gld_staffing.fact_activite_int` | heures\_travaillees, taux\_occupation |
+| `gold_staffing.py` | idem | `gld_staffing.fact_missions_detail` | heures\_totales, ca\_mission, cout\_mission, marge\_mission, taux\_marge |
 
 ---
 
@@ -289,12 +307,12 @@ date_expiration = COALESCE(
 Toutes produites par `gold_dimensions.py` → schéma `gld_shared` (PostgreSQL frdc1datahub01).
 
 | Dimension | Source principale | Colonnes | Jointure type |
-|---|---|---|---|
-| `dim_calendrier` | Génération DuckDB 2020-2027 | date_id, jour_semaine, nom_jour, semaine_iso, mois, nom_mois, trimestre, annee, is_jour_ouvre, is_jour_ferie | `ON d.mois = DATE_TRUNC('month', f.mois)` |
-| `dim_agences` | Silver slv_agences | agence_sk, rgpcnt_id, nom_agence, marque, branche, secteur, perimetre, zone_geo, ville, is_active | `ON f.agence_sk = d.agence_sk` |
-| `dim_clients` | Silver slv_clients | client_sk, tie_id, raison_sociale, siren, nic, siret, naf_code, naf_libelle, ville, code_postal, statut_client, effectif_tranche | `ON f.client_sk = d.client_sk` |
-| `dim_interimaires` | Silver slv_interimaires | interimaire_sk, per_id, matricule, nom, prenom, ville, code_postal, date_entree, is_actif, is_candidat, is_permanent, agence_rattachement | `ON f.interimaire_sk = d.interimaire_sk` |
-| `dim_metiers` | Bronze raw_wtmet + raw_wtqua | metier_sk, met_id, code_metier, libelle_metier, qualification, specialite, niveau, pcs_code | `ON f.met_id = d.met_id` |
+| --- | --- | --- | --- |
+| `dim_calendrier` | Génération DuckDB 2020-2035 | date\_id, dow, nom\_jour, semaine\_iso, mois, nom\_mois, trimestre, annee, is\_ouvre, is\_ferie | `ON d.mois = DATE_TRUNC('month', f.mois)` |
+| `dim_agences` | Silver slv\_agences | agence\_sk, rgpcnt\_id, nom\_agence, marque, branche, secteur, perimetre, zone\_geo, ville, is\_active | `ON f.agence_sk = d.agence_sk` |
+| `dim_clients` | Silver slv\_clients | client\_sk, tie\_id, raison\_sociale, siren, nic, siret, naf\_code, naf\_libelle (NULL), ville, code\_postal, statut\_client, effectif\_tranche | `ON f.client_sk = d.client_sk` |
+| `dim_interimaires` | Silver slv\_interimaires | interimaire\_sk, per\_id, matricule, nom, prenom, date\_naissance, nationalite, is\_actif, is\_candidat, is\_permanent, agence\_rattachement | `ON f.interimaire_sk = d.interimaire_sk` |
+| `dim_metiers` | Bronze raw\_wtmet + raw\_wtqua | metier\_sk, met\_id, code\_metier, libelle\_metier, qualification\_code, qualification\_libelle, niveau, pcs\_code, is\_active | `ON f.met_id = d.met_id` |
 
 ---
 
@@ -305,139 +323,164 @@ Toutes produites par `gold_dimensions.py` → schéma `gld_shared` (PostgreSQL f
 
 ### 8.1 Datasets Superset recommandés
 
-Chaque dataset correspond à une table ou vue Gold PostgreSQL.
-
 #### Dataset : Scorecard Agences
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_performance` |
 | Tables | `scorecard_agence` JOIN `gld_shared.dim_agences` |
-| Métriques clés | ca_net_ht, taux_marge, nb_missions, taux_transformation, nb_int_actifs |
-| Dimensions | agence_id, mois, marque, branche, zone_geo |
+| Métriques clés | ca\_net\_ht, taux\_marge, nb\_missions, taux\_transformation, nb\_int\_actifs |
+| Dimensions | agence\_id, mois, marque, branche, zone\_geo |
 | Filtres suggérés | mois (date range), branche, marque |
 
 #### Dataset : CA Mensuel Client
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_commercial` |
 | Tables | `fact_ca_mensuel_client` JOIN `gld_shared.dim_clients` JOIN `gld_shared.dim_agences` |
-| Métriques clés | ca_net_ht, nb_heures_facturees, taux_moyen_fact, nb_missions_facturees |
-| Dimensions | mois, tie_id, raison_sociale, naf_code, agence_principale |
+| Métriques clés | ca\_net\_ht, nb\_factures, nb\_missions\_facturees, agence\_principale |
+| Dimensions | mois, tie\_id, raison\_sociale, naf\_code, agence\_principale |
 | Filtres suggérés | mois (date range), agence, secteur NAF |
 
 #### Dataset : Pool Compétences Disponibles
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_staffing` |
 | Tables | `fact_competences_dispo` JOIN `gld_shared.dim_metiers` JOIN `gld_shared.dim_agences` |
-| Métriques clés | nb_qualifies, nb_disponibles, nb_en_mission, taux_couverture |
-| Dimensions | met_id, libelle_metier, pcs_code, qualification, agence_id, zone_geo |
-| Filtres suggérés | agence, pcs_code, qualification |
+| Métriques clés | nb\_qualifies, nb\_disponibles, nb\_en\_mission, taux\_couverture |
+| Dimensions | met\_id, libelle\_metier, pcs\_code, qualification\_libelle, agence\_id, zone\_geo |
+| Filtres suggérés | agence, pcs\_code, qualification\_libelle |
 
 #### Dataset : Activité Intérimaires
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_staffing` |
 | Tables | `fact_activite_int` JOIN `gld_shared.dim_interimaires` |
-| Métriques clés | nb_missions, heures_travaillees, taux_occupation, ca_genere |
-| Dimensions | per_id, mois, agence_rattachement, is_actif |
+| Métriques clés | nb\_missions, heures\_travaillees, taux\_occupation, ca\_genere |
+| Dimensions | per\_id, mois, agence\_rattachement, is\_actif |
 
 #### Dataset : Vue 360° Client
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_clients` |
 | Tables | `vue_360_client` |
-| Métriques clés | ca_ytd, ca_n1, delta_ca_pct, ca_12_mois_glissants, risque_churn, risque_credit |
-| Dimensions | siren, raison_sociale, naf_code, ville, statut |
+| Métriques clés | ca\_ytd, ca\_n1, delta\_ca\_pct, nb\_missions\_actives, nb\_int\_actifs, risque\_churn, risque\_credit |
+| Dimensions | siren, raison\_sociale, naf\_code, ville, secteur\_activite |
 | Colonnes calculées Superset | `delta_ca_pct_color` (rouge si <0, vert si >10%) |
 
 #### Dataset : Rétention & Churn Client
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_clients` |
 | Tables | `fact_retention_client` JOIN `gld_shared.dim_clients` |
-| Métriques clés | ca_net, delta_ca_qoq_pct, jours_inactivite, churn_score_ml |
-| Dimensions | trimestre, risque_churn |
+| Métriques clés | ca\_net, delta\_ca\_qoq\_pct, jours\_inactivite, risque\_churn |
+| Dimensions | trimestre, risque\_churn |
 
 #### Dataset : Heures Opérationnelles
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_operationnel` |
 | Tables | `fact_heures_hebdo` JOIN `gld_shared.dim_agences` JOIN `gld_shared.dim_clients` |
-| Métriques clés | heures_paye, heures_fact, nb_releves |
-| Dimensions | semaine_debut, agence_id, tie_id |
+| Métriques clés | heures\_paye, heures\_fact, nb\_releves |
+| Dimensions | semaine\_debut, agence\_id, tie\_id |
 
 #### Dataset : Missions Détail
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_staffing` |
 | Tables | `fact_missions_detail` JOIN `gld_shared.dim_metiers` JOIN `gld_shared.dim_agences` JOIN `gld_shared.dim_clients` |
-| Métriques clés | taux_marge, marge_mission, heures_totales, duree_jours |
-| Dimensions | date_debut, metier_id, agence_id, tie_id |
+| Métriques clés | taux\_marge, marge\_mission, heures\_totales, duree\_jours |
+| Dimensions | date\_debut, metier\_id, agence\_id, tie\_id |
 
 #### Dataset : ETP Hebdomadaire
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_operationnel` |
 | Tables | `fact_etp_hebdo` JOIN `gld_shared.dim_agences` |
-| Métriques clés | etp, heures_totales, nb_interimaires, nb_releves |
-| Dimensions | semaine_debut, agence_id, marque, branche, zone_geo |
+| Métriques clés | etp, heures\_totales, nb\_interimaires, nb\_releves |
+| Dimensions | semaine\_debut, agence\_id, marque, branche, zone\_geo |
 | Filtres suggérés | semaine (date range), agence, branche |
 
 #### Dataset : Fidélisation Intérimaires
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_staffing` |
-| Tables | `fact_fidelisation_interimaires` JOIN `gld_shared.dim_agences` |
-| Métriques clés | nb_interimaires, anciennete_moy_jours, jours_inactivite_moyen |
-| Dimensions | agence_id, categorie_fidelisation (actif_recent/actif_annee/inactif_long/inactif) |
-| Filtres suggérés | agence, categorie_fidelisation |
+| Tables | `fact_fidelisation` JOIN `gld_shared.dim_interimaires` |
+| Métriques clés | nb\_interimaires, anciennete\_jours, jours\_depuis\_derniere\_vente |
+| Dimensions | per\_id, agence\_rattachement, categorie (actif\_recent/actif\_annee/inactif\_long/inactif) |
+| Filtres suggérés | agence, categorie |
 
 #### Dataset : Concentration Client (Pareto)
+
 | Propriété | Valeur |
-|---|---|
+| --- | --- |
 | Schéma PG | `gld_clients` |
 | Tables | `fact_concentration_client` JOIN `gld_shared.dim_agences` |
-| Métriques clés | taux_concentration, ca_net_top20, ca_net_total, nb_clients_top20 |
-| Dimensions | agence_id, mois |
-| Colonnes calculées Superset | `risque_concentration` (rouge si taux_concentration > 0.80) |
+| Métriques clés | taux\_concentration, ca\_net\_top20, ca\_net\_total, nb\_clients\_top20 |
+| Dimensions | agence\_id, mois |
+| Colonnes calculées Superset | `risque_concentration` (rouge si taux\_concentration > 0.80) |
+
+#### Dataset : Qualité Missions — Ruptures CTT ⚠️ (hors DAG)
+
+| Propriété | Valeur |
+| --- | --- |
+| Schéma PG | `gld_performance` |
+| Tables | `fact_rupture_contrat` JOIN `gld_shared.dim_agences` JOIN `gld_shared.dim_clients` |
+| Métriques clés | taux\_rupture\_pct, taux\_fin\_anticipee\_pct, duree\_moy\_avant\_rupture, nb\_ruptures |
+| Dimensions | agence\_id, tie\_id, mois |
+| Filtres suggérés | mois, agence, client |
 
 ### 8.2 Dashboards proposés
 
 | Dashboard | Datasets utilisés | Public cible |
-|---|---|---|
-| **Tableau de bord Direction** | scorecard_agence, fact_ca_mensuel_client, ranking_agences | Direction, DG |
-| **Performance Agences** | scorecard_agence, ranking_agences, tendances_agence, fact_commandes_pipeline | Directeurs régionaux |
-| **Portefeuille Clients** | vue_360_client, fact_retention_client, fact_ca_mensuel_client | Commerciaux, KAM |
-| **Pilotage Staffing** | fact_competences_dispo, fact_activite_int, fact_missions_detail | Recruteurs, chefs d'agence |
-| **Opérationnel Hebdo** | fact_heures_hebdo, fact_commandes_pipeline | Chefs d'agence, ops |
-| **Risques & Recouvrement** | vue_360_client (risque_credit, encours), fact_retention_client (churn) | Finance, crédit |
+| --- | --- | --- |
+| **Tableau de bord Direction** | scorecard\_agence, fact\_ca\_mensuel\_client, ranking\_agence | Direction, DG |
+| **Performance Agences** | scorecard\_agence, ranking\_agence, tendances\_agence, fact\_commandes\_pipeline | Directeurs régionaux |
+| **Portefeuille Clients** | vue\_360\_client, fact\_retention\_client, fact\_ca\_mensuel\_client | Commerciaux, KAM |
+| **Pilotage Staffing** | fact\_competences\_dispo, fact\_activite\_int, fact\_missions\_detail | Recruteurs, chefs d'agence |
+| **Opérationnel Hebdo** | fact\_heures\_hebdo, fact\_commandes\_pipeline, fact\_etp\_hebdo | Chefs d'agence, ops |
+| **Risques & Recouvrement** | vue\_360\_client (risque\_credit, encours), fact\_retention\_client (churn) | Finance, crédit |
+| **Qualité Missions** | fact\_rupture\_contrat, fact\_ruptures\_early\_term, fact\_delai\_placement | DRH, Direction opérationnelle |
 
 ---
 
 ## 9. Index colonnes RGPD
 
 | Colonne | Table(s) Bronze | Traitement Silver | Présent en Gold | Présent Superset |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `PER_NIR` | PYPERSONNE | 🔴 Pseudonymisé → `nir_pseudo` (SHA-256+salt) | ❌ Non | ❌ Non |
 | `PER_TEL_NTEL` | PYCOORDONNEE | 🔴 Conservé dans `slv_interimaires/coordonnees` uniquement | ❌ Non | ❌ Non |
 | `PER_NOM`, `PER_PRENOM` | PYPERSONNE | 🟡 Conservés → `dim_interimaires.nom/prenom` | ✅ `gld_shared.dim_interimaires` | ✅ Dataset Activité (filtrage OK) |
-| `PER_NAISSANCE` | PYPERSONNE | 🟡 Conservé → Silver seulement | ❌ Non | ❌ Non |
+| `PER_NAISSANCE` | PYPERSONNE | 🟡 Conservé Silver + dim\_interimaires Gold (sans sélection analytique directe) | ✅ `gld_shared.dim_interimaires` | ❌ Non |
+| Contacts clients (nom, email, tel) | WTTIEINT | 🟡 Silver only — `slv_clients/contacts` | ❌ Non | ❌ Non |
 
 **Règle Gold :** aucune donnée `_rgpd_flag=SENSIBLE` ne transite vers PostgreSQL ou Superset.
+
+**Jointure PG possible :** `slv_interimaires/coordonnees` et `slv_clients/contacts` ne sont jamais chargés dans PostgreSQL.
 
 ---
 
 ## 10. Anomalies & Watchlist
 
-| ID | Sévérité | Table | Colonne | Description | Contournement |
-|---|---|---|---|---|---|
-| B-01 | 🟡 WARN | WTEFAC | EFAC_MONTANTHT | Absent du DDL Evolia — NULL en Bronze et Silver | `ca_ht = SUM(LFAC_BASE × LFAC_TAUX)` via WTLFAC |
+| ID | Sévérité | Script / Table | Colonne | Description | Contournement |
+| --- | --- | --- | --- | --- | --- |
+| B-01 | 🟡 WARN | WTEFAC | EFAC\_MONTANTHT | Absent du DDL Evolia → NULL en Bronze et Silver | `ca_ht = SUM(LFAC_BASE × LFAC_TAUX)` via WTLFAC (helper `cte_montants_factures`) |
 | B-02 | 🟡 WARN | WTTIESERV | NAF / NAF2008 | Deux colonnes NAF, NAF2008 plus récent mais parfois vide | `COALESCE(NAF2008, NAF)` dans Silver |
-| B-03 | ℹ️ INFO | WTCOEF | (toutes) | Table vide (count=0 probe 2026-03-12) | LEFT JOIN sans impact |
-| B-04 | ℹ️ INFO | WTRHDON | (volume) | 49.6M lignes total — FALLBACK_SINCE = 2024-01-01 | Delta sur RHD_DATED |
-| B-05 | 🟡 WARN | WTEFAC | EFAC_TAUXTVA | Stocké comme numérique brut (ex: 20 = 20%) | `× 0.01` dans Silver si calcul TTC |
-| B-06 | ℹ️ INFO | WTUGPINT | UGPINT_DATEMODIF | Absent du DDL — full-load (pas de delta) | Full-load accepté (table petite) |
-| B-07 | 🟡 WARN | WTPHAB | PHAB_EXPIR | NULL fréquent → date_expiration calculée via THAB_NBMOIS | `MAKE_INTERVAL(months:=THAB_NBMOIS)` |
-| B-08 | ℹ️ INFO | dim_metiers | naf_libelle | NULL (référentiel NAF non extrait d'Evolia) | Enrichissement SIRENE possible |
-| B-09 | ℹ️ INFO | dim_clients | effectif_tranche | NULL (WTCLPT.CLPT_EFFT non mappé dans dim_clients Gold) | À mapper si besoin analytique |
+| B-03 | ℹ️ INFO | WTCOEF | (toutes) | Table vide (count=0 probe 2026-03-12) — `process_coefficients` commenté dans silver\_clients\_detail | LEFT JOIN sans impact, réévaluer si données apparaissent |
+| B-04 | ℹ️ INFO | WTRHDON | (volume) | 49.6M lignes total — FALLBACK\_SINCE = 2024-01-01 | Delta sur RHD\_DATED |
+| B-05 | 🟡 WARN | WTEFAC | EFAC\_TAUXTVA | Stocké comme numérique brut (ex: 20 = 20%) | `× 0.01` dans Silver si calcul TTC |
+| B-06 | ℹ️ INFO | WTUGPINT | UGPINT\_DATEMODIF | Absent du DDL — full-load (pas de delta) | Full-load accepté (table petite) |
+| B-07 | 🟡 WARN | WTPHAB | PHAB\_EXPIR | NULL fréquent → date\_expiration calculée via THAB\_NBMOIS | `MAKE_INTERVAL(months:=THAB_NBMOIS)` |
+| B-08 | ℹ️ INFO | dim\_metiers | naf\_libelle | NULL (référentiel NAF non extrait d'Evolia) | Enrichissement SIRENE possible |
+| B-09 | ℹ️ INFO | dim\_clients | effectif\_tranche | WTCLPT.CLPT\_EFFT mappé en Silver, non exploité dans Gold actuellement | À connecter si besoin analytique |
+| B-10 | 🔴 CRIT | gold\_qualite\_missions.py | — | Script Phase 4 existant (produit `gld_performance.fact_rupture_contrat`) absent du DAG Airflow | Ajouter dans `gold_facts_group` de `dag_gi_pipeline.py` |
+| B-11 | ℹ️ INFO | silver\_temps | releves\_heures.tie\_id | Jointure tie\_id via releves\_heures à valider par PROBE (G-OP-M03) — fallback JOIN missions | PROBE avant activation `fact_heures_hebdo` avec tie\_id |

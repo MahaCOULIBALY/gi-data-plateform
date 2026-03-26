@@ -18,8 +18,9 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 # #5 — CTE : ajout du ) manquant pour fermer dedup AS (...)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, s3_delete_prefix, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, s3_has_files, s3_delete_prefix, logger
 
+PIPELINE = "silver_competences"
 _SILVER_PATH = "slv_interimaires/competences"
 
 
@@ -146,6 +147,10 @@ def run(cfg: Config) -> dict:
     stats = Stats()
     try:
         with get_duckdb_connection(cfg) as ddb:
+            # Guard : ancre transactionnelle WTPMET — si vide, toutes les sources le sont
+            if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtpmet/{cfg.date_partition}/"):
+                logger.info(json.dumps({"pipeline": PIPELINE, "rows": 0, "status": "empty"}))
+                return stats.finish(cfg, PIPELINE)
             q = build_competences_query(cfg)
             silver_path = f"s3://{cfg.bucket_silver}/{_SILVER_PATH}/**/*.parquet"
             if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
@@ -170,7 +175,7 @@ def run(cfg: Config) -> dict:
         logger.exception(json.dumps({"table": "competences", "error": str(e)}))
         stats.errors.append({"table": "competences", "error": str(e)})
     stats.tables_processed = 1
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

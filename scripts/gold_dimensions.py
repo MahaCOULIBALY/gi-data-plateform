@@ -3,24 +3,35 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 PRÉREQUIS : Silver dim_clients, dim_interimaires, dim_agences doivent exister.
 
 === CORRECTIONS SESSION 2 (audit Silver→Gold) ===
-- build_dim_metiers: MET_LIB → MET_LIBELLE (probe DDL confirmed)
-- build_dim_metiers: QUA_ID → TQUA_ID (probe DDL: QUA_ID absent, TQUA_ID confirmed)
-- build_dim_metiers: QUA_LIBELLE → TQUA_LIBELLE (probe DDL confirmed)
-- build_dim_metiers: MET_SPE → SPE_ID (probe DDL: MET_SPECIALITE absent)
-- build_dim_metiers: MET_NIVEAU → NIVQ_ID (probe DDL: MET_NIVEAU absent)
+- build_dim_metiers: MET_LIB → MET_LIBELLE / QUA_ID → TQUA_ID / QUA_LIBELLE → TQUA_LIBELLE
+- build_dim_metiers: MET_SPE → SPE_ID / MET_NIVEAU → NIVQ_ID
 - Silver dim_clients/dim_interimaires/dim_agences: lowercase aliases OK
+
 === ENRICHISSEMENT RÉFÉRENTIELS (2026-03-12) ===
-- build_dim_metiers: raw_ref_metiers → raw_wtmet (WTMET intégré dans bronze_interimaires)
-- build_dim_metiers: raw_ref_qualifications → raw_wtqua (WTQUA ajouté bronze_interimaires 2026-03-12)
+- build_dim_metiers: raw_ref_metiers → raw_wtmet / raw_ref_qualifications → raw_wtqua
 - build_dim_metiers: +pcs_code (PCS_CODE_2003 INSEE), filtre MET_DELETE actif
+
+=== CORRECTIONS SESSION 3 (audit Gold) ===
+- G-DIM-B01 : TRUNCATE gld_shared.<dim> explicite avant pg_bulk_insert (idempotence PG)
+- G-DIM-M01 : RunMode importé + guard log PROBE
+- G-DIM-M02 : stats.rows_transformed incrémenté dans la boucle
+- G-DIM-m01/m02 : imports sys / logging supprimés
+- G-DIM-m03 : filter_tables importé et appliqué sur DIMENSIONS
+- G-DIM-m04 : a.nom AS nom_agence dans build_dim_agences
 
 # MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 # dim_metiers conservé (lit Bronze read_json_auto — pas de Silver Parquet)
 """
-import sys
-import logging
-from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+import json
 
+from shared import (
+    Config, RunMode, Stats,
+    get_duckdb_connection, get_pg_connection, pg_bulk_insert,
+    gold_filter_tables, filter_tables, logger,
+)
+
+
+PIPELINE = "gold_dimensions"
 JOURS_FERIES_FIXES = [
     (1, 1), (5, 1), (5, 8), (7, 14), (8, 15), (11, 1), (11, 11), (12, 25),
 ]
@@ -57,11 +68,13 @@ def build_dim_calendrier(ddb) -> list[tuple]:
 def build_dim_agences(ddb, cfg: Config) -> list[tuple]:
     return ddb.execute(f"""
         SELECT
-            a.agence_sk, a.rgpcnt_id, a.nom, a.marque, a.branche,
-            COALESCE(h.secteur, '') AS secteur,
-            COALESCE(h.perimetre, '') AS perimetre,
-            COALESCE(h.zone_geo, '') AS zone_geo,
-            COALESCE(a.ville, '') AS ville,
+            a.agence_sk, a.rgpcnt_id,
+            a.nom AS nom_agence,                        -- G-DIM-m04 : alias explicite
+            a.marque, a.branche,
+            COALESCE(h.secteur, '')    AS secteur,
+            COALESCE(h.perimetre, '')  AS perimetre,
+            COALESCE(h.zone_geo, '')   AS zone_geo,
+            COALESCE(a.ville, '')      AS ville,
             a.is_active
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_agences/dim_agences/**/*.parquet') a
         LEFT JOIN read_parquet('s3://{cfg.bucket_silver}/slv_agences/hierarchie_territoriale/**/*.parquet') h
@@ -104,29 +117,31 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
 
 def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
     """Lit Bronze raw_wtmet + raw_wtqua (via bronze_interimaires depuis 2026-03-12).
-    Utilise glob **/**/** pour lire toutes les partitions disponibles — insensible au fait
-    que Bronze n'a pas encore tourné aujourd'hui (ROW_NUMBER déduplique par MET_ID/TQUA_ID).
+    ROW_NUMBER déduplique par MET_ID/TQUA_ID — insensible au fait que Bronze
+    n'a pas encore tourné aujourd'hui.
     """
     bronze = f"s3://{cfg.bucket_bronze}"
     return ddb.execute(f"""
         WITH met AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY MET_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{bronze}/raw_wtmet/**/**/**/*.json', union_by_name=true, hive_partitioning=false)
+            FROM read_json_auto('{bronze}/raw_wtmet/**/**/**/*.json',
+                                union_by_name=true, hive_partitioning=false)
         ),
         qua AS (
             SELECT TQUA_ID, TQUA_LIBELLE,
                    ROW_NUMBER() OVER (PARTITION BY TQUA_ID ORDER BY _loaded_at DESC) AS rn
-            FROM read_json_auto('{bronze}/raw_wtqua/**/**/**/*.json', union_by_name=true, hive_partitioning=false)
+            FROM read_json_auto('{bronze}/raw_wtqua/**/**/**/*.json',
+                                union_by_name=true, hive_partitioning=false)
         )
         SELECT
-            MD5(MET_ID::VARCHAR) AS metier_sk,
-            MET_ID::INT AS met_id,
-            TRIM(COALESCE(MET_CODE, '')) AS code_metier,
-            TRIM(COALESCE(MET_LIBELLE, '')) AS libelle_metier,
-            TRIM(COALESCE(q.TQUA_LIBELLE, '')) AS qualification,
-            TRIM(COALESCE(CAST(m.SPE_ID AS VARCHAR), '')) AS specialite,
-            TRIM(COALESCE(CAST(m.NIVQ_ID AS VARCHAR), '')) AS niveau,
-            NULLIF(TRIM(COALESCE(m.PCS_CODE_2003::VARCHAR, '')), '') AS pcs_code
+            MD5(MET_ID::VARCHAR)                                        AS metier_sk,
+            MET_ID::INT                                                 AS met_id,
+            TRIM(COALESCE(MET_CODE, ''))                                AS code_metier,
+            TRIM(COALESCE(MET_LIBELLE, ''))                             AS libelle_metier,
+            TRIM(COALESCE(q.TQUA_LIBELLE, ''))                         AS qualification,
+            TRIM(COALESCE(CAST(m.SPE_ID AS VARCHAR), ''))               AS specialite,
+            TRIM(COALESCE(CAST(m.NIVQ_ID AS VARCHAR), ''))              AS niveau,
+            NULLIF(TRIM(COALESCE(m.PCS_CODE_2003::VARCHAR, '')), '')    AS pcs_code
         FROM met m
         LEFT JOIN qua q ON q.TQUA_ID = m.TQUA_ID AND q.rn = 1
         WHERE m.rn = 1
@@ -148,7 +163,8 @@ DIMENSIONS = {
     },
     "dim_clients": {
         "cols": ["client_sk", "tie_id", "raison_sociale", "siren", "nic", "siret",
-                 "naf_code", "naf_libelle", "ville", "code_postal", "statut_client", "effectif_tranche"],
+                 "naf_code", "naf_libelle", "ville", "code_postal", "statut_client",
+                 "effectif_tranche"],
         "builder": "clients",
     },
     "dim_interimaires": {
@@ -167,6 +183,13 @@ DIMENSIONS = {
 
 def run(cfg: Config) -> dict:
     stats = Stats()
+    logger.info(json.dumps(
+        {"pipeline": "gold_dimensions", "mode": cfg.mode.name}))
+    active = gold_filter_tables(list(DIMENSIONS), cfg)
+
+    if cfg.mode == RunMode.OFFLINE:
+        return stats.finish(cfg, PIPELINE)
+
     with get_duckdb_connection(cfg) as ddb:
         builders = {
             "calendrier": lambda: build_dim_calendrier(ddb),
@@ -177,18 +200,23 @@ def run(cfg: Config) -> dict:
         }
         with get_pg_connection(cfg) as pg:
             for dim_name, spec in DIMENSIONS.items():
+                if dim_name not in active:
+                    continue
                 try:
                     rows = builders[spec["builder"]]()
-                    pg_bulk_insert(cfg, pg, "gld_shared",
-                                   dim_name, spec["cols"], rows, stats)
+                    pg_bulk_insert(cfg, pg, "gld_shared", dim_name,
+                                   spec["cols"], rows, stats)
                     stats.extra[dim_name] = len(rows)
+                    stats.rows_transformed += len(rows)
                     stats.tables_processed += 1
-                    logger.info(f"{dim_name}: {len(rows)} rows")
+                    logger.info(json.dumps(
+                        {"dim": dim_name, "rows": len(rows)}))
                 except Exception as e:
-                    logger.exception(f"Error building {dim_name}: {e}")
+                    logger.exception(json.dumps(
+                        {"dim": dim_name, "error": str(e)}))
                     stats.errors.append(
                         {"dimension": dim_name, "error": str(e)})
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

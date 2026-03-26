@@ -309,6 +309,19 @@ CREATE TABLE IF NOT EXISTS gld_operationnel.fact_delai_placement (
     PRIMARY KEY (agence_id, semaine_debut, categorie_delai)
 );
 
+CREATE TABLE IF NOT EXISTS gld_operationnel.fact_echus_hebdo (
+    tie_id              INTEGER         NOT NULL,
+    agence_id           INTEGER         NOT NULL,
+    semaine_debut       DATE            NOT NULL,
+    montant_factures    DECIMAL(18,2)   NOT NULL DEFAULT 0,
+    montant_avoirs      DECIMAL(18,2)   NOT NULL DEFAULT 0,
+    montant_echu_ht     DECIMAL(18,2)   NOT NULL DEFAULT 0,
+    nb_factures         INTEGER         NOT NULL DEFAULT 0,
+    _loaded_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tie_id, agence_id, semaine_debut)
+);
+CREATE INDEX IF NOT EXISTS fact_echus_hebdo_tie_id_idx ON gld_operationnel.fact_echus_hebdo (tie_id);
+
 CREATE TABLE IF NOT EXISTS gld_operationnel.fact_conformite_dpae (
     agence_id               INTEGER         NOT NULL,
     mois                    DATE            NOT NULL,
@@ -393,6 +406,15 @@ CREATE TABLE IF NOT EXISTS gld_staffing.fact_fidelisation_interimaires (
 CREATE SCHEMA IF NOT EXISTS ops;
 GRANT ALL ON SCHEMA ops TO gi_gold_user;
 ALTER DEFAULT PRIVILEGES IN SCHEMA ops GRANT ALL ON TABLES TO gi_gold_user;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migrations — colonnes ajoutées après création initiale (idempotentes)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- vue_360_client : ajout adresse complète (2026-03-26)
+ALTER TABLE gld_clients.vue_360_client
+    ADD COLUMN IF NOT EXISTS code_postal      VARCHAR(10),
+    ADD COLUMN IF NOT EXISTS adresse_complete TEXT;
 
 CREATE TABLE IF NOT EXISTS ops.pipeline_watermarks (
     pipeline        VARCHAR(100)    NOT NULL,

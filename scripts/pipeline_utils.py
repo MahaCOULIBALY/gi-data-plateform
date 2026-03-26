@@ -1,8 +1,9 @@
-"""pipeline_utils.py — Utilitaires Bronze : WatermarkStore + with_retry.
+"""pipeline_utils.py — Utilitaires pipeline : WatermarkStore + with_retry + RunRecorder.
 GI Data Lakehouse · Manifeste v2.0
 
-Table cible : ops.pipeline_watermarks (schéma dédié infrastructure,
-séparé des schémas Gold gld_*).
+Tables cibles (schéma ops, séparé des schémas gld_*) :
+  - ops.pipeline_watermarks : bornes delta Bronze (upsert, état courant)
+  - ops.pipeline_runs       : historique d'exécutions toutes couches (append-only)
 """
 import json
 import logging
@@ -154,6 +155,142 @@ class WatermarkStore:
             "table": table_name,
             "error": error_msg[:200],
         }))
+
+
+# ── ops.pipeline_runs — historique append-only ────────────────────────────────
+_TABLE_RUNS = "ops.pipeline_runs"
+
+_DDL_PIPELINE_RUNS = f"""
+CREATE TABLE IF NOT EXISTS {_TABLE_RUNS} (
+    id               BIGSERIAL      PRIMARY KEY,
+    pipeline         VARCHAR(100)   NOT NULL,
+    layer            VARCHAR(20)    NOT NULL,
+    mode             VARCHAR(20)    NOT NULL DEFAULT 'LIVE',
+    status           VARCHAR(20)    NOT NULL,
+    started_at       TIMESTAMPTZ    NOT NULL,
+    ended_at         TIMESTAMPTZ    NOT NULL,
+    duration_s       NUMERIC(10,3)  NOT NULL,
+    tables_processed INTEGER        NOT NULL DEFAULT 0,
+    rows_ingested    BIGINT         NOT NULL DEFAULT 0,
+    rows_transformed BIGINT         NOT NULL DEFAULT 0,
+    rows_rejected    BIGINT         NOT NULL DEFAULT 0,
+    error_count      INTEGER        NOT NULL DEFAULT 0,
+    warning_count    INTEGER        NOT NULL DEFAULT 0,
+    errors           JSONB,
+    warnings         JSONB,
+    extra            JSONB,
+    created_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+"""
+
+_DDL_RUNS_INDEXES = [
+    f"CREATE INDEX IF NOT EXISTS idx_pr_pipeline_started ON {_TABLE_RUNS} (pipeline, started_at DESC);",
+    f"CREATE INDEX IF NOT EXISTS idx_pr_layer_started    ON {_TABLE_RUNS} (layer,    started_at DESC);",
+    f"CREATE INDEX IF NOT EXISTS idx_pr_status_started   ON {_TABLE_RUNS} (status,   started_at DESC);",
+]
+
+_DDL_RUNS_VIEW = """
+CREATE OR REPLACE VIEW ops.v_pipeline_last_run AS
+SELECT DISTINCT ON (pipeline)
+    pipeline, layer, mode, status,
+    started_at, ended_at, duration_s,
+    tables_processed, rows_ingested, rows_transformed,
+    error_count, warning_count, errors
+FROM ops.pipeline_runs
+ORDER BY pipeline, started_at DESC;
+"""
+
+# Flag process-level : la DDL n'est vérifiée qu'une seule fois par process
+_runs_table_ready: bool = False
+
+
+def _ensure_pipeline_runs(conn: psycopg2.extensions.connection) -> None:
+    """Crée ops.pipeline_runs + vue + index si absents (idempotent, IF NOT EXISTS)."""
+    global _runs_table_ready
+    if _runs_table_ready:
+        return
+    with conn.cursor() as cur:
+        cur.execute(_DDL_ENSURE_SCHEMA)
+        cur.execute(_DDL_PIPELINE_RUNS)
+        for stmt in _DDL_RUNS_INDEXES:
+            cur.execute(stmt)
+        cur.execute(_DDL_RUNS_VIEW)
+    conn.commit()
+    _runs_table_ready = True
+
+
+def record_pipeline_run(
+    conn: psycopg2.extensions.connection,
+    pipeline: str,
+    mode: str,
+    stats: dict,
+) -> None:
+    """Insère une ligne dans ops.pipeline_runs (append-only, jamais UPDATE).
+
+    pipeline : nom du script sans .py  (ex: gold_staffing, silver_missions)
+    mode     : cfg.mode.name           (LIVE | PROBE | OFFLINE)
+    stats    : dict retourné par Stats.finish()
+    """
+    _ensure_pipeline_runs(conn)
+
+    layer = pipeline.split("_")[0] if "_" in pipeline else "unknown"
+
+    errors   = stats.get("errors", []) or []
+    warnings = stats.get("warnings", []) or []
+    tables   = stats.get("tables_processed", 0)
+
+    if not errors:
+        status = "success"
+    elif tables > 0:
+        status = "partial"
+    else:
+        status = "failed"
+
+    try:
+        started = datetime.fromisoformat(stats["started_at"])
+        ended   = datetime.fromisoformat(stats["ended_at"])
+        duration_s = round((ended - started).total_seconds(), 3)
+    except Exception:
+        duration_s = 0.0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {_TABLE_RUNS} (
+                pipeline, layer, mode, status,
+                started_at, ended_at, duration_s,
+                tables_processed, rows_ingested, rows_transformed, rows_rejected,
+                error_count, warning_count,
+                errors, warnings, extra
+            ) VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                pipeline, layer, mode, status,
+                stats.get("started_at"), stats.get("ended_at"), duration_s,
+                tables,
+                stats.get("rows_ingested", 0),
+                stats.get("rows_transformed", 0),
+                stats.get("rows_rejected", 0),
+                len(errors),
+                len(warnings),
+                json.dumps(errors)   if errors   else None,
+                json.dumps(warnings) if warnings else None,
+                json.dumps(stats.get("extra", {})) or None,
+            ),
+        )
+    conn.commit()
+    logger.info(json.dumps({
+        "pipeline_run_recorded": True,
+        "pipeline": pipeline,
+        "status": status,
+        "duration_s": duration_s,
+    }))
 
 
 # ── Retry decorator ───────────────────────────────────────────────────────────

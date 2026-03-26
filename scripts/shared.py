@@ -60,6 +60,18 @@ class RunMode(Enum):
     LIVE = "live"     # Pipeline complet — production
 
 
+def gold_filter_tables(names: list[str], cfg: "Config") -> list[str]:
+    """filter_tables pour pipelines Gold — fonctionne avec des noms de tables (str).
+    filter_tables attend des TableConfig(.name) — incompatible avec les pipelines Gold.
+    TABLE_FILTER=fact_etp_hebdo,scorecard_agence → traite uniquement ces tables.
+    """
+    raw = os.environ.get("TABLE_FILTER", "").strip()
+    if not raw:
+        return names
+    allowed = {t.strip().lower() for t in raw.split(",")}
+    return [n for n in names if n.lower() in allowed]
+
+
 def filter_tables(tables: list, cfg: "Config") -> list:
     """Filtre _TABLES selon TABLE_FILTER env var.
     TABLE_FILTER=WTMISS,WTCNTI → traite uniquement ces tables.
@@ -186,11 +198,26 @@ class Stats:
     ended_at: str = ""
     extra: dict = field(default_factory=dict)
 
-    def finish(self) -> dict:
+    def finish(self, cfg: "Config | None" = None, pipeline: str = "") -> dict:
         self.ended_at = datetime.now(timezone.utc).isoformat()
         result = asdict(self)
         logger.info(json.dumps({"stats": result}, default=str))
+        if cfg is not None and pipeline:
+            _record_run(cfg, pipeline, result)
         return result
+
+
+def _record_run(cfg: "Config", pipeline: str, stats: dict) -> None:
+    """Enregistre le run dans ops.pipeline_runs. Non-bloquant : warn si échec."""
+    try:
+        from pipeline_utils import record_pipeline_run  # lazy — pas de dép circulaire
+        with get_pg_connection(cfg) as conn:
+            record_pipeline_run(conn, pipeline, cfg.mode.name, stats)
+    except Exception as exc:
+        logger.warning(json.dumps({
+            "pipeline_run_record_failed": str(exc)[:300],
+            "pipeline": pipeline,
+        }))
 
 
 @dataclass
@@ -338,6 +365,17 @@ def upload_to_s3(cfg: Config, data: list[dict], bucket: str, key: str, stats: St
     stats.bytes_written += len(body_bytes)
 
 
+def s3_has_files(cfg: "Config", bucket: str, prefix: str) -> bool:
+    """Retourne True si au moins un objet S3 existe sous `prefix` dans `bucket`.
+    Utilise MaxKeys=1 — un seul ListObjects suffit, très économique (< 5ms).
+    OFFLINE → True : zéro connexion externe, chaque script gère l'absence de données.
+    """
+    if cfg.mode == RunMode.OFFLINE:
+        return True
+    resp = get_s3_client(cfg).list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    return bool(resp.get("Contents"))
+
+
 def s3_delete_prefix(cfg: "Config", bucket: str, prefix: str) -> int:
     """Purge tous les objets S3 sous `prefix` dans `bucket`.
     Utilise le client boto3 singleton de cfg (mêmes credentials qu'upload_to_s3).
@@ -407,6 +445,7 @@ def pg_bulk_insert(
             cur.execute(
                 f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({ddl_cols})')
             cur.execute(f'TRUNCATE TABLE "{schema}"."{table}"')
+
             def _copy_val(v) -> str:
                 if v is None:
                     return "\\N"

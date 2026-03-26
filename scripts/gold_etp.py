@@ -3,10 +3,21 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 Source : slv_temps/releves_heures (valide=true) + slv_temps/heures_detail
 ETP = SUM(base_paye) / 35 — agrégation hebdomadaire par agence.
 
-# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+=== CORRECTIONS SESSION 3 (audit Gold) ===
+- G-ETP-B01 : TRUNCATE avant pg_bulk_insert (idempotence PG)
+- G-ETP-M01 : RunMode importé + guards OFFLINE/PROBE
+- G-ETP-M02 : try/except autour DuckDB + PG insert
+
+# MIGRÉ : iceberg_scan → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 """
 import json
-from shared import Config, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+
+from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+
+
+PIPELINE = "gold_etp"
+COLS = ["agence_id", "semaine_debut", "nb_releves",
+        "nb_interimaires", "heures_totales", "etp"]
 
 
 def build_etp_query(cfg: Config) -> str:
@@ -38,19 +49,41 @@ def build_etp_query(cfg: Config) -> str:
 
 def run(cfg: Config) -> dict:
     stats = Stats()
-    cols = ["agence_id", "semaine_debut", "nb_releves",
-            "nb_interimaires", "heures_totales", "etp"]
 
-    with get_duckdb_connection(cfg) as ddb:
-        rows = ddb.execute(build_etp_query(cfg)).fetchall()
-        logger.info(json.dumps({"table": "fact_etp_hebdo", "rows": len(rows)}))
-        stats.rows_transformed = len(rows)
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):  # G-ETP-M01
+        logger.info(json.dumps({
+            "mode": cfg.mode.name, "table": "fact_etp_hebdo", "action": "skipped"
+        }))
+        stats.tables_processed += 1
+        return stats.finish(cfg, PIPELINE)
 
-    with get_pg_connection(cfg) as pg:
-        pg_bulk_insert(cfg, pg, "gld_operationnel", "fact_etp_hebdo", cols, rows, stats)
+    rows = []
+    try:
+        with get_duckdb_connection(cfg) as ddb:
+            rows = ddb.execute(build_etp_query(cfg)).fetchall()
+            logger.info(json.dumps(
+                {"table": "fact_etp_hebdo", "rows": len(rows)}))
+    except Exception as e:  # G-ETP-M02
+        logger.exception(json.dumps({"step": "duckdb_build", "error": str(e)}))
+        stats.errors.append({"step": "duckdb_build", "error": str(e)})
+        return stats.finish(cfg, PIPELINE)
+
+    try:
+        with get_pg_connection(cfg) as pg:
+            # G-ETP-B01 : idempotence PG
+            with pg.cursor() as cur:
+                cur.execute("TRUNCATE TABLE gld_operationnel.fact_etp_hebdo")
+            pg.commit()
+            pg_bulk_insert(cfg, pg, "gld_operationnel",
+                           "fact_etp_hebdo", COLS, rows, stats)
+    except Exception as e:  # G-ETP-M02
+        logger.exception(json.dumps({"step": "pg_insert", "error": str(e)}))
+        stats.errors.append({"step": "pg_insert", "error": str(e)})
+        return stats.finish(cfg, PIPELINE)
 
     stats.tables_processed = 1
-    return stats.finish()
+    stats.rows_transformed = len(rows)
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

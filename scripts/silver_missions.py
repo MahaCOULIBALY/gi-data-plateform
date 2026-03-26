@@ -33,8 +33,9 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, filter_tables, s3_delete_prefix, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, filter_tables, s3_has_files, s3_delete_prefix, logger
 
+PIPELINE = "silver_missions"
 DOMAIN = "missions"
 
 
@@ -333,6 +334,10 @@ def _process(ddb, cfg: Config, t: _Table, stats: Stats) -> None:
     silver_path = f"s3://{cfg.bucket_silver}/{t.silver}/**/*.parquet"
     silver_prefix = f"{t.silver}/"
     query = t.sql_fn(cfg) if t.sql_fn is not None else t.sql
+    # Guard : table de missions critique — WARNING si source bronze absente
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_{t.bronze}/{cfg.date_partition}/"):
+        logger.warning(json.dumps({"table": t.name, "rows": 0, "status": "empty"}))
+        return
     try:
         ddb.execute(
             f"CREATE OR REPLACE VIEW src AS "
@@ -383,7 +388,7 @@ def run(cfg: Config) -> dict:
     with get_duckdb_connection(cfg) as ddb:
         for t in filter_tables(_TABLES, cfg):
             _process(ddb, cfg, t, stats)
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

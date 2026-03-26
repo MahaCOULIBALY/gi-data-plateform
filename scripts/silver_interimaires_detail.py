@@ -15,10 +15,16 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 #               run() : passe stats à process_fidelisation (alignement avec les autres fonctions)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, s3_delete_prefix, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, s3_has_files, s3_delete_prefix, logger
+
+
+PIPELINE = "silver_interimaires_detail"
 
 
 def process_evaluations(ddb, cfg: Config, stats: Stats) -> int:
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtpeval/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "evaluations", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     query = f"""
 WITH raw AS (
@@ -54,6 +60,9 @@ FROM raw WHERE rn = 1 AND PER_ID IS NOT NULL
 
 def process_coordonnees(ddb, cfg: Config, stats: Stats) -> int:
     """RGPD : Silver-only, jamais exposé en Gold."""
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_pycoordonnee/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "coordonnees", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     query = f"""
 WITH raw AS (
@@ -91,6 +100,9 @@ def process_ugpint(ddb, cfg: Config, stats: Stats) -> int:
     """Portefeuille agence↔intérimaire (WTUGPINT).
     UGPINT_DATEMODIF absent DDL → full-load, dédup sur (PER_ID, RGPCNT_ID).
     """
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtugpint/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "portefeuille_agences", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     query = f"""
 WITH raw AS (
@@ -128,6 +140,9 @@ def process_fidelisation(ddb, cfg: Config, stats: Stats) -> int:
     """Fidélisation intérimaires via PINT_DERVENDTE (proxy SAL_DATESORTIE absent DDL Evolia).
     Catégories : actif_recent (≤90j), actif_annee (≤365j), inactif_long (>365j), inactif (jamais).
     """
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtpint/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "fidelisation", "rows": 0, "status": "empty"}))
+        return 0
     b = f"s3://{cfg.bucket_bronze}"
     silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/fidelisation/**/*.parquet"
     silver_prefix = "slv_interimaires/fidelisation/"
@@ -202,7 +217,7 @@ def run(cfg: Config) -> dict:
         "portefeuille_agences": c3,
         "fidelisation": c4,
     }
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

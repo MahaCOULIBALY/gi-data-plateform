@@ -11,7 +11,7 @@ Architecture :
                             └── rgpd_audit
 
 Prérequis serveur FRDC1PIPELINE01 :
-  - /opt/gi-data-platform/ déployé (scripts/ + .env)
+  - /opt/groupe-interaction/etl/gi-data-plateform/ déployé (scripts/ + .env)
   - RUN_MODE non requis (default "live" dans shared.py)
   - Variables Airflow ou .env : OVH_S3_*, OVH_PG_*, EVOLIA_*, RGPD_SALT
 """
@@ -21,7 +21,7 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.utils.task_group import TaskGroup
 
-SCRIPTS = "/opt/gi-data-platform/scripts"
+SCRIPTS = "/opt/groupe-interaction/etl/gi-data-plateform/scripts"
 
 _DEFAULT_ARGS = {
     "owner": "data-team",

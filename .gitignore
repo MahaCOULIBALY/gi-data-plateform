@@ -83,6 +83,7 @@ terraform/.terraform.lock.hcl
 # terraform.tfvars est exclu (secrets) — commiter terraform.tfvars.example
 
 # ─── IDEs & outils locaux ─────────────────────────────────────────────────────
+.sfdx/
 .vscode/settings.json
 .vscode/launch.json
 .idea/

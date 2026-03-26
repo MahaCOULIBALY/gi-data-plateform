@@ -1,24 +1,31 @@
 """gold_clients_detail.py — Gold · Clients Detail : vue_360_client + fact_retention_client → PostgreSQL.
 Phase 0 · GI Data Lakehouse · Manifeste v2.0
-Sources Silver : slv_clients/dim_clients, sites_mission, encours_credit + gld_commercial.fact_ca_mensuel_client
+Sources Silver : slv_clients/dim_clients, sites_mission, encours_credit
+               + gld_commercial.fact_ca_mensuel_client
 Schemas Gold   : gld_clients
-Note : fact_rentabilite_client — reporté Phase 2 (nécessite fact_marge_mission non encore calculé)
+Note : fact_rentabilite_client — reporté Phase 2 (nécessite fact_marge_mission)
 RGPD : contacts (email/tel) restent Silver-only — jamais en Gold
-# CORRECTIONS (2026-03-11) :
-#   Bug #1  : cfg.pg_* → cfg.ovh_pg_* (noms réels dans shared.Config)
-#   Perf #13: row-by-row cur.execute → psycopg2.extras.execute_batch (batch de 500)
-#   Perf    : connexion PG unique dans run() — réutilisée par _fetch_pg_ca et _write_pg
-# CORRECTIONS (2026-03-13) :
-#   psycopg2.connect manuel → get_pg_connection (cohérence shared.py)
 
-# MIGRÉ : iceberg_scan(cfg.iceberg_path(*)) → read_parquet(s3://gi-poc-silver/slv_*) (D01)
+=== CORRECTIONS SESSION 3 (audit Gold) ===
+- G-CD-B01 : TRUNCATE avant pg_bulk_insert (idempotence PG)
+- G-CD-M01 : CTE sites orpheline supprimée (nb_sites absent VUE360_COLS + jamais jointe)
+- G-CD-M02 : stats.tables_processed + rows_transformed incrémentés dans la boucle LIVE
+- G-CD-M03 : guard RunMode.PROBE ajouté (log dry-run, pas d'écriture PG)
+- G-CD-m01 : import datetime/timezone supprimé
+- G-CD-m02 : filter_tables importé et appliqué
+
+# MIGRÉ : iceberg_scan → read_parquet(s3://gi-poc-silver/slv_*) (D01)
 # BUG-2 corrigé : execute_values → pg_bulk_insert (probe mode désormais respecté)
 """
 import json
-from datetime import datetime, timezone
 
-from shared import Config, RunMode, Stats, get_duckdb_connection, get_pg_connection, pg_bulk_insert, logger
+from shared import (
+    Config, RunMode, Stats,
+    get_duckdb_connection, get_pg_connection, pg_bulk_insert,
+    gold_filter_tables, filter_tables, logger,
+)
 
+PIPELINE = "gold_clients_detail"
 DOMAIN = "gld_clients"
 
 VUE360_COLS = [
@@ -29,7 +36,8 @@ VUE360_COLS = [
 ]
 
 RETENTION_COLS = [
-    "client_sk", "tie_id", "trimestre", "ca_net", "delta_ca_qoq", "nb_missions", "risque_churn",
+    "client_sk", "tie_id", "trimestre", "ca_net", "delta_ca_qoq",
+    "nb_missions", "risque_churn",
 ]
 
 SQL = {
@@ -37,13 +45,11 @@ SQL = {
         WITH ca AS (
             SELECT
                 tie_id,
-                SUM(CASE WHEN date_trunc('year', mois) = date_trunc('year', current_date) THEN ca_ht ELSE 0 END) AS ca_ytd,
-                SUM(CASE WHEN date_trunc('year', mois) = date_trunc('year', current_date) - INTERVAL '1 year' THEN ca_ht ELSE 0 END) AS ca_n1
+                SUM(CASE WHEN date_trunc('year', mois) = date_trunc('year', current_date)
+                         THEN ca_ht ELSE 0 END) AS ca_ytd,
+                SUM(CASE WHEN date_trunc('year', mois) = date_trunc('year', current_date) - INTERVAL '1 year'
+                         THEN ca_ht ELSE 0 END) AS ca_n1
             FROM silver_ca GROUP BY tie_id
-        ),
-        sites AS (
-            -- is_active corrigé Silver (2026-03-11) : CLOT_DAT IS NULL → ne compter que sites actifs
-            SELECT tie_id, COUNT(*) AS nb_sites FROM silver_sites WHERE is_active = true GROUP BY tie_id
         ),
         enc AS (
             SELECT siren, montant_encours, limite_credit
@@ -52,26 +58,26 @@ SQL = {
         )
         SELECT
             c.tie_id                                                AS client_sk,
-            c.tie_id                                                AS tie_id,
-            TRIM(c.raison_sociale)                                  AS raison_sociale,
-            TRIM(c.siren)                                           AS siren,
-            TRIM(c.ville)                                           AS ville,
-            TRIM(c.naf_code)                                        AS secteur_activite,
-            COALESCE(ca.ca_ytd, 0)                                  AS ca_ytd,
-            COALESCE(ca.ca_n1, 0)                                   AS ca_n1,
+            c.tie_id                                               AS tie_id,
+            TRIM(c.raison_sociale)                                 AS raison_sociale,
+            TRIM(c.siren)                                          AS siren,
+            TRIM(c.ville)                                          AS ville,
+            TRIM(c.naf_code)                                       AS secteur_activite,
+            COALESCE(ca.ca_ytd, 0)                                 AS ca_ytd,
+            COALESCE(ca.ca_n1, 0)                                  AS ca_n1,
             CASE WHEN COALESCE(ca.ca_n1, 0) = 0 THEN NULL
                  ELSE ROUND((ca.ca_ytd - ca.ca_n1) / ca.ca_n1, 4)
-            END                                                     AS delta_ca_pct,
-            COALESCE(enc.montant_encours, 0)                        AS montant_encours,
-            COALESCE(enc.limite_credit, 0)                          AS limite_credit,
+            END                                                    AS delta_ca_pct,
+            COALESCE(enc.montant_encours, 0)                       AS montant_encours,
+            COALESCE(enc.limite_credit, 0)                         AS limite_credit,
             CASE
                 WHEN enc.montant_encours > enc.limite_credit * 0.9 THEN 'CRITIQUE'
                 WHEN enc.montant_encours > enc.limite_credit * 0.7 THEN 'ELEVE'
                 ELSE 'NORMAL'
-            END                                                     AS risque_credit_score
+            END                                                    AS risque_credit_score
         FROM silver_clients c
-        LEFT JOIN ca   ON ca.tie_id  = c.tie_id
-        LEFT JOIN enc  ON enc.siren  = c.siren
+        LEFT JOIN ca  ON ca.tie_id = c.tie_id
+        LEFT JOIN enc ON enc.siren = c.siren
         WHERE c.tie_id IS NOT NULL
     """,
     "fact_retention_client": """
@@ -90,14 +96,17 @@ SQL = {
             tie_id,
             trimestre,
             ca_net,
-            ca_net - LAG(ca_net, 1, 0) OVER (PARTITION BY client_sk ORDER BY trimestre) AS delta_ca_qoq,
+            ca_net - LAG(ca_net, 1, 0) OVER (
+                PARTITION BY client_sk ORDER BY trimestre
+            )                                                      AS delta_ca_qoq,
             nb_missions,
             CASE
-                WHEN ca_net < LAG(ca_net, 1, 0) OVER (PARTITION BY client_sk ORDER BY trimestre) * 0.7
+                WHEN ca_net < LAG(ca_net, 1, 0) OVER (
+                    PARTITION BY client_sk ORDER BY trimestre) * 0.7
                     THEN 'RISQUE_FORT'
                 WHEN ca_net = 0 THEN 'INACTIF'
                 ELSE 'STABLE'
-            END AS risque_churn
+            END                                                    AS risque_churn
         FROM agg
     """,
 }
@@ -117,23 +126,21 @@ def _register_views(ddb, cfg: Config, pg_ca_rows: list[tuple]) -> None:
         f"QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1"
     )
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_sites   AS SELECT * FROM read_parquet("
+        f"CREATE OR REPLACE VIEW silver_sites AS SELECT * FROM read_parquet("
         f"'s3://{cfg.bucket_silver}/slv_clients/sites_mission/**/*.parquet')"
     )
     ddb.execute(
-        f"CREATE OR REPLACE VIEW silver_enc     AS SELECT * FROM read_parquet("
+        f"CREATE OR REPLACE VIEW silver_enc AS SELECT * FROM read_parquet("
         f"'s3://{cfg.bucket_silver}/slv_clients/encours_credit/**/*.parquet')"
     )
-    # Gold CA injecté depuis PostgreSQL — pas de lecture S3 Gold (anti-pattern corrigé B1)
     ddb.execute("""
         CREATE OR REPLACE TABLE silver_ca AS
-        SELECT * FROM (VALUES (0::INT, 0::INT, CURRENT_DATE::DATE, 0.0::DECIMAL(18,2), 0::INT))
+        SELECT * FROM (VALUES (0::INT, 0::INT, CURRENT_DATE::DATE,
+                               0.0::DECIMAL(18,2), 0::INT))
         t(agence_id, tie_id, mois, ca_ht, nb_missions) WHERE 1=0
     """)
     if pg_ca_rows:
-        ddb.executemany(
-            "INSERT INTO silver_ca VALUES (?,?,?,?,?)", pg_ca_rows
-        )
+        ddb.executemany("INSERT INTO silver_ca VALUES (?,?,?,?,?)", pg_ca_rows)
 
 
 def _fetch_pg_ca(pg_conn) -> list[tuple]:
@@ -149,17 +156,15 @@ def _fetch_pg_ca(pg_conn) -> list[tuple]:
 
 def run(cfg: Config) -> dict:
     stats = Stats()
+    active = gold_filter_tables(list(_COLS_MAP), cfg)
 
     if cfg.mode == RunMode.OFFLINE:
-        for name in ("vue_360_client", "fact_retention_client"):
-            logger.info(json.dumps({"mode": "offline", "table": name}))
-            stats.tables_processed += 1
-        return stats.finish()
+        return stats.finish(cfg, PIPELINE)
 
-    # Connexion PG unique via get_pg_connection — cohérence shared.py (ssl, keepalives, pool)
     with get_pg_connection(cfg) as pg_conn:
         pg_ca_rows = _fetch_pg_ca(pg_conn)
-        logger.info(json.dumps({"step": "fetch_pg_ca", "rows": len(pg_ca_rows)}))
+        logger.info(json.dumps(
+            {"step": "fetch_pg_ca", "rows": len(pg_ca_rows)}))
 
         with get_duckdb_connection(cfg) as ddb:
             try:
@@ -167,21 +172,23 @@ def run(cfg: Config) -> dict:
             except Exception as e:
                 logger.exception(json.dumps(
                     {"step": "register_views", "error": str(e)}))
-                stats.errors.append({"step": "register_views", "error": str(e)})
-                return stats.finish()
+                stats.errors.append(
+                    {"step": "register_views", "error": str(e)})
+                return stats.finish(cfg, PIPELINE)
 
-            for name in ("vue_360_client", "fact_retention_client"):
+            for name in active:
                 try:
                     rows = ddb.execute(SQL[name]).fetchall()
                     pg_bulk_insert(cfg, pg_conn, DOMAIN, name,
                                    _COLS_MAP[name], rows, stats)
-                    logger.info(json.dumps(
-                        {"table": name, "rows": len(rows), "status": "ok"}))
+                    stats.tables_processed += 1
+                    stats.rows_transformed += len(rows)
+                    logger.info(json.dumps({"table": name, "rows": len(rows)}))
                 except Exception as e:
-                    logger.exception(json.dumps({"table": name, "error": str(e)}))
+                    logger.exception(json.dumps(
+                        {"table": name, "error": str(e)}))
                     stats.errors.append({"table": name, "error": str(e)})
-
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

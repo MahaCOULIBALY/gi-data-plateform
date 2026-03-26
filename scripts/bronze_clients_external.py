@@ -17,6 +17,7 @@ from shared import (
 )
 from pipeline_utils import with_retry
 
+PIPELINE = "bronze_clients_external"
 SIRENE_ENDPOINT = "https://api.insee.fr/entreprises/sirene/V3.11/siret"
 SIRENE_RATE_LIMIT = 30  # req/min → 2s between requests
 
@@ -150,7 +151,7 @@ def run(cfg: Config) -> dict:
     ext = ExternalConfig()
     run_sirene(cfg, ext, stats)
     run_salesforce(cfg, ext, stats)
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":

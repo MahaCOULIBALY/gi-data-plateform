@@ -18,8 +18,9 @@ Phase 3 · GI Data Lakehouse · Manifeste v2.0
 # #3 — Idempotence : s3_delete_prefix avant COPY (dim_agences + hierarchie_territoriale)
 """
 import json
-from shared import Config, RunMode, Stats, get_duckdb_connection, s3_delete_prefix, logger
+from shared import Config, RunMode, Stats, get_duckdb_connection, s3_has_files, s3_delete_prefix, logger
 
+PIPELINE = "silver_agences_light"
 _PATH_AGENCES = "slv_agences/dim_agences"
 _PATH_HIER = "slv_agences/hierarchie_territoriale"
 
@@ -29,6 +30,11 @@ def run(cfg: Config) -> dict:
     b = f"s3://{cfg.bucket_bronze}"
 
     with get_duckdb_connection(cfg) as ddb:
+
+        # Guard : source principale vide → skip sans polluer stats.errors
+        if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_pyregroupecnt/{cfg.date_partition}/"):
+            logger.info(json.dumps({"pipeline": PIPELINE, "rows": 0, "status": "empty"}))
+            return stats.finish(cfg, PIPELINE)
 
         # ── dim_agences ────────────────────────────────────────────────────────
         # DT-04 résolu : LEFT JOIN raw_agence_gestion pour marque/branche/nom_commercial/code_comm
@@ -167,7 +173,7 @@ WHERE ag.rgpcnt_id IS NOT NULL
         stats.rows_transformed = c1 + c2
         stats.extra = {"dim_agences": c1, "hierarchie": c2}
 
-    return stats.finish()
+    return stats.finish(cfg, PIPELINE)
 
 
 if __name__ == "__main__":
