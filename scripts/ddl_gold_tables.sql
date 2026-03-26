@@ -556,3 +556,37 @@ CREATE TABLE IF NOT EXISTS gld_commercial.fact_ca_secteur_naf (
 );
 CREATE INDEX IF NOT EXISTS fact_ca_secteur_naf_section_idx
     ON gld_commercial.fact_ca_secteur_naf (naf_section);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 3 KPI completion (2026-03-26) — Recouvrement & DSO (tâches #15-#16)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- fact_dso_client : DSO par agence/client/mois (gold_recouvrement.py)
+-- encours_ht = SUM(factures HT) - SUM(montant_regle depuis slv_clients/facturation_detail)
+-- dso_jours  = encours_ht / (ca_mensuel / nb_jours_mois)
+-- montant_echu : encours sur factures dont date_echeance < snapshot courant
+CREATE TABLE IF NOT EXISTS gld_operationnel.fact_dso_client (
+    agence_id            INTEGER        NOT NULL,
+    tie_id               INTEGER        NOT NULL,
+    mois                 DATE           NOT NULL,
+    encours_ht           DECIMAL(18,2)  NOT NULL DEFAULT 0,
+    dso_jours            DECIMAL(8,1),
+    nb_factures_ouvertes INTEGER        NOT NULL DEFAULT 0,
+    montant_echu         DECIMAL(18,2)  NOT NULL DEFAULT 0,
+    _loaded_at           TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, tie_id, mois)
+);
+CREATE INDEX IF NOT EXISTS fact_dso_client_tie_id_idx
+    ON gld_operationnel.fact_dso_client (tie_id);
+
+-- fact_balance_agee : balance âgée par agence/mois/tranche (gold_recouvrement.py)
+-- tranche : '0-30j' / '31-60j' / '61-90j' / '>90j' — calculé sur retard à snapshot courant
+CREATE TABLE IF NOT EXISTS gld_operationnel.fact_balance_agee (
+    agence_id    INTEGER        NOT NULL,
+    mois         DATE           NOT NULL,
+    tranche      VARCHAR(20)    NOT NULL,
+    montant_echu DECIMAL(18,2)  NOT NULL DEFAULT 0,
+    nb_factures  INTEGER        NOT NULL DEFAULT 0,
+    _loaded_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, mois, tranche)
+);

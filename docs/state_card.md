@@ -1,6 +1,6 @@
 # State Card — Pipeline GI Data Platform
 
-> Dernière mise à jour : **2026-03-26** · Auteur : M. COULIBALY
+> Dernière mise à jour : **2026-03-26** · Auteur : M. COULIBALY (Phase 3 — tâches #15-#16)
 > Architecture : Bronze (Evolia/SQL Server) → Silver (Parquet S3) → Gold (PostgreSQL)
 
 ---
@@ -148,6 +148,20 @@ L'enrichissement SIRENE ne s'exécute jamais même si `SIRENE_API_TOKEN` est con
 
 ---
 
+### 🟡 B5 — montant_regle NULL dans slv_clients/facturation_detail
+
+**Impact :** `gold_recouvrement.fact_dso_client` — `encours_ht` surestimé (aucune déduction
+des paiements). DSO potentiellement > réalité. `fact_balance_agee` non affecté (basé sur date_echeance).
+
+**Cause :** Colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` absentes du DDL Evolia WTEFAC (probe 2026-03-26).
+`EFAC_TIERS` et `EFAC_AGENCE` également absents — remplacés par `TIE_ID` / `RGPCNT_ID`.
+
+**Action :** `SELECT TOP 1 EFAC_MNTPAI, EFAC_TYPEPAI, EFAC_TIERS, EFAC_AGENCE FROM WTEFAC` en probe.
+Si confirmées, ajouter dans `_COLS["WTEFAC"]` de `bronze_missions.py` et mettre à jour
+`process_facturation_detail()` dans `silver_clients_detail.py`.
+
+---
+
 ## Décisions d'architecture actives
 
 | ID | Décision | Raison |
@@ -187,93 +201,44 @@ L'enrichissement SIRENE ne s'exécute jamais même si `SIRENE_API_TOKEN` est con
 > Phases 1 et 2 terminées — commit `6256a76` sur `feature/kpi-completion`.
 > Catalogue KPI complet : [docs/CATALOGUE_KPI_GOLD.md](CATALOGUE_KPI_GOLD.md)
 
-### Phase 3 — Recouvrement & DSO (tâches #15-#16)
+### ✅ Phase 3 — Recouvrement & DSO (tâches #15-#16) — commit `feature/kpi-completion`
 
-#### Tâche #15 — Silver `slv_clients/facturation_detail`
+#### ✅ Tâche #15 — Silver `slv_clients/facturation_detail`
 
-**Fichier** : `scripts/silver_clients_detail.py` (ajouter `_build_wtefac_sql()` + `FACTU_DETAIL`)
+**Fichier modifié** : [scripts/silver_clients_detail.py](../scripts/silver_clients_detail.py)
+**Fonction ajoutée** : `process_facturation_detail()` — stats.tables_processed = 4
 
-**Source Bronze** : table `WTEFAC` (règlements/paiements factures)
+**Source Bronze** : `raw_wtefac` (ingéré par `bronze_missions.py` — non dupliqué)
 
-- Chemin S3 : `raw_wtefac/YYYY/MM/DD/*.json.gz`
-- Destination : `s3://gi-poc-silver/slv_clients/facturation_detail/`
+**Colonnes produites** :
 
-**Colonnes Silver à produire** :
-
-| Colonne | Source Bronze | Type |
-| ------- | ------------- | ---- |
+| Colonne | Source Bronze réelle | Note |
+| ------- | -------------------- | ---- |
 | `efac_num` | `EFAC_NUM` | VARCHAR |
-| `tie_id` | `EFAC_TIERS` | `TRY_CAST AS INT` |
-| `rgpcnt_id` | `EFAC_AGENCE` | `TRY_CAST AS INT` |
-| `date_paiement` | `EFAC_DATPAI` | `TRY_CAST AS DATE` |
-| `montant_regle` | `EFAC_MNTPAI` | `DECIMAL(18,2)` |
-| `type_reglement` | `EFAC_TYPEPAI` | VARCHAR |
-| `retard_jours` | calculé depuis `date_echeance` (jointure factures) | INT, peut être NULL |
+| `tie_id` | `TIE_ID` | TRY_CAST AS INT (EFAC_TIERS absent DDL) |
+| `rgpcnt_id` | `RGPCNT_ID` | TRY_CAST AS INT (EFAC_AGENCE absent DDL) |
+| `date_paiement` | `EFAC_DTEREGLF` | TRY_CAST AS DATE (EFAC_DATPAI absent DDL) |
+| `montant_regle` | `NULL` | EFAC_MNTPAI absent DDL — probe requis |
+| `type_reglement` | `NULL` | EFAC_TYPEPAI absent DDL — probe requis |
+| `retard_jours` | calculé | LEFT JOIN slv_facturation/factures sur efac_num |
 
-> **PROBE requis** : vérifier les noms exacts des colonnes `WTEFAC` via `DESCRIBE silver` ou DDL Evolia.
-> Noms probables : `EFAC_NUM`, `EFAC_TIERS`, `EFAC_AGENCE`, `EFAC_DATPAI`, `EFAC_MNTPAI`, `EFAC_TYPEPAI`.
+> **Blocker B5** : `montant_regle` NULL — colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` non confirmées
+> dans le DDL Evolia WTEFAC (probe 2026-03-26). DSO surestimé jusqu'à confirmation.
+> Action : probe `SELECT TOP 1 EFAC_MNTPAI FROM WTEFAC` sur Evolia pour valider.
 
-#### Tâche #16 — Gold `gold_recouvrement.py` (NOUVEAU)
+#### ✅ Tâche #16 — Gold `gold_recouvrement.py`
 
-**Fichier à créer** : `scripts/gold_recouvrement.py`
-
-**Prérequis** : Tâche #15 terminée (slv_clients/facturation_detail disponible en S3).
+**Fichier créé** : [scripts/gold_recouvrement.py](../scripts/gold_recouvrement.py)
+**DDL ajouté** : section Phase 3 dans [scripts/ddl_gold_tables.sql](../scripts/ddl_gold_tables.sql)
 
 **Tables Gold** : `gld_operationnel.fact_dso_client` + `gld_operationnel.fact_balance_agee`
 
-**DDL à ajouter dans `ddl_gold_tables.sql`** (section "Phase 3") :
-
-```sql
-CREATE TABLE IF NOT EXISTS gld_operationnel.fact_dso_client (
-    agence_id            INTEGER        NOT NULL,
-    tie_id               INTEGER        NOT NULL,
-    mois                 DATE           NOT NULL,
-    encours_ht           DECIMAL(18,2)  NOT NULL DEFAULT 0,
-    dso_jours            DECIMAL(8,1),
-    nb_factures_ouvertes INTEGER        NOT NULL DEFAULT 0,
-    montant_echu         DECIMAL(18,2)  NOT NULL DEFAULT 0,
-    _loaded_at           TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (agence_id, tie_id, mois)
-);
-
-CREATE TABLE IF NOT EXISTS gld_operationnel.fact_balance_agee (
-    agence_id    INTEGER        NOT NULL,
-    mois         DATE           NOT NULL,
-    tranche      VARCHAR(20)    NOT NULL,  -- '0-30j' / '31-60j' / '61-90j' / '>90j'
-    montant_echu DECIMAL(18,2)  NOT NULL DEFAULT 0,
-    nb_factures  INTEGER        NOT NULL DEFAULT 0,
-    _loaded_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (agence_id, mois, tranche)
-);
-```
-
-**Logique DSO** :
-
-```text
-DSO (jours) = encours_non_payé / (ca_mensuel / nb_jours_mois)
-encours = SUM(montant factures) - SUM(montant réglé via facturation_detail)
-```
-
-**Logique balance âgée** — tranches de retard au snapshot courant :
-
-```sql
-CASE
-  WHEN retard_jours BETWEEN 0 AND 30  THEN '0-30j'
-  WHEN retard_jours BETWEEN 31 AND 60 THEN '31-60j'
-  WHEN retard_jours BETWEEN 61 AND 90 THEN '61-90j'
-  ELSE '>90j'
-END AS tranche
-```
-
-**Pattern à suivre** : même structure que `gold_operationnel.py`
-
-- `build_dso_query(cfg)` + `build_balance_agee_query(cfg)`
-- `_TABLE_MAP` ou dict `_new_tables` avec COLS
-- `filter_tables`, guards `RunMode.OFFLINE/PROBE`, `TRUNCATE` + `pg_bulk_insert`
+**Logique DSO** : `encours_ht / (ca_mensuel / nb_jours_mois)` — snapshot = premier jour du mois courant.
+**Balance âgée** : tranches `0-30j` / `31-60j` / `61-90j` / `>90j` sur `DATEDIFF(date_echeance, snapshot)`.
 
 ---
 
-### Phase 4 — Fidélisation intérimaires (tâches #17-#18)
+### 🔵 Phase 4 — Fidélisation intérimaires (tâches #17-#18) — À FAIRE
 
 **Tâche #17** — `silver_interimaires_detail.py` : enrichir `slv_interimaires/fidelisation` avec
 `taux_fidelisation_pct` = nb_missions_12m / NULLIF(anciennete_mois, 0).
