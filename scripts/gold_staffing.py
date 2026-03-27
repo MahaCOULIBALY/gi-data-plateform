@@ -224,7 +224,7 @@ def build_dynamique_vivier_query(cfg: Config) -> str:
             f.per_id,
             COALESCE(p.rgpcnt_id, di.agence_rattachement)::INT     AS agence_id,
             f.categorie_fidelisation,
-            TRY_CAST(f.premiere_mission      AS DATE)              AS premiere_mission,
+            TRY_CAST(f.date_premiere_vente   AS DATE)              AS premiere_mission,
             TRY_CAST(f.date_derniere_vente   AS DATE)              AS date_derniere_vente
         FROM read_parquet('{slv}/slv_interimaires/fidelisation/**/*.parquet') f
         LEFT JOIN portefeuille    p  ON p.per_id  = f.per_id
