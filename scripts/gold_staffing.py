@@ -181,13 +181,15 @@ def build_fidelisation_query(cfg: Config) -> str:
         -- G-ST-M02 : anciennete_jours calculé si absent Silver
         ROUND(AVG(COALESCE(
             TRY_CAST(f.anciennete_jours AS DECIMAL),
-            NULL -- Silver non confirmé — laisser NULL jusqu'à PROBE
+            NULL
         )), 1)::DECIMAL(10,1)                                            AS anciennete_moy_jours,
         -- G-ST-M02 : jours_depuis_derniere_vente calculé depuis date_derniere_vente si absent
         ROUND(AVG(COALESCE(
             TRY_CAST(f.jours_depuis_derniere_vente AS DECIMAL),
             (CURRENT_DATE - TRY_CAST(f.date_derniere_vente AS DATE))
-        )), 1)::DECIMAL(10,1)                                            AS jours_inactivite_moyen
+        )), 1)::DECIMAL(10,1)                                            AS jours_inactivite_moyen,
+        -- Phase 4 : taux de fidélisation moyen par agence/catégorie
+        ROUND(AVG(f.taux_fidelisation_pct), 4)::DECIMAL(10,4)           AS taux_fidelisation_pct
     FROM read_parquet('{slv}/slv_interimaires/fidelisation/**/*.parquet') f
     LEFT JOIN portefeuille    p  ON p.per_id  = f.per_id
     LEFT JOIN dim_int_current di ON di.per_id = f.per_id
@@ -331,7 +333,7 @@ def run(cfg: Config) -> dict:
                      "taux_horaire_fact", "marge_horaire", "heures_totales",
                      "ca_mission", "cout_mission", "marge_mission", "taux_marge"]
     fidelisation_cols = ["agence_id", "categorie_fidelisation", "nb_interimaires",
-                         "anciennete_moy_jours", "jours_inactivite_moyen"]
+                         "anciennete_moy_jours", "jours_inactivite_moyen", "taux_fidelisation_pct"]
     vivier_cols = ["agence_id", "mois", "nb_nouveaux", "nb_perdus",
                    "croissance_nette", "pool_actif", "pool_total",
                    "taux_renouvellement_vivier_pct"]

@@ -396,9 +396,13 @@ CREATE TABLE IF NOT EXISTS gld_staffing.fact_fidelisation_interimaires (
     nb_interimaires         INTEGER         NOT NULL DEFAULT 0,
     anciennete_moy_jours    DECIMAL(10,1),
     jours_inactivite_moyen  DECIMAL(10,1),
+    taux_fidelisation_pct   DECIMAL(10,4),
     _loaded_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     PRIMARY KEY (agence_id, categorie_fidelisation)
 );
+-- Phase 4 : migration idempotente sur table existante
+ALTER TABLE gld_staffing.fact_fidelisation_interimaires
+    ADD COLUMN IF NOT EXISTS taux_fidelisation_pct DECIMAL(10,4);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ops — Watermarks pipeline (schema existant, table requise par purge_bronze.py)

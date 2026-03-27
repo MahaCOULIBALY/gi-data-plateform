@@ -139,12 +139,14 @@ FROM raw WHERE rn = 1 AND PER_ID IS NOT NULL AND RGPCNT_ID IS NOT NULL
 def process_fidelisation(ddb, cfg: Config, stats: Stats) -> int:
     """Fidélisation intérimaires via PINT_DERVENDTE (proxy SAL_DATESORTIE absent DDL Evolia).
     Catégories : actif_recent (≤90j), actif_annee (≤365j), inactif_long (>365j), inactif (jamais).
+    Phase 4 : nb_missions_12m + taux_fidelisation_pct depuis slv_missions/missions.
     """
     if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtpint/{cfg.date_partition}/"):
         logger.info(json.dumps({"table": "fidelisation", "rows": 0, "status": "empty"}))
         return 0
     b = f"s3://{cfg.bucket_bronze}"
-    silver_path = f"s3://{cfg.bucket_silver}/slv_interimaires/fidelisation/**/*.parquet"
+    slv = f"s3://{cfg.bucket_silver}"
+    silver_path = f"{slv}/slv_interimaires/fidelisation/**/*.parquet"
     silver_prefix = "slv_interimaires/fidelisation/"
     query = f"""
 WITH raw AS (
@@ -152,33 +154,59 @@ WITH raw AS (
         ROW_NUMBER() OVER (PARTITION BY PER_ID ORDER BY _loaded_at DESC) AS rn
     FROM read_json_auto('{b}/raw_wtpint/{cfg.date_partition}/*.json',
         union_by_name=true, hive_partitioning=false)
+),
+missions_12m AS (
+    SELECT
+        per_id,
+        COUNT(DISTINCT cnt_id) AS nb_missions_12m
+    FROM read_parquet('{slv}/slv_missions/missions/**/*.parquet')
+    WHERE TRY_CAST(date_debut AS DATE) >= CURRENT_DATE - INTERVAL '12 months'
+    GROUP BY per_id
+),
+base AS (
+    SELECT
+        CAST(PER_ID AS INT) AS per_id,
+        TRY_CAST(PINT_CREATDTE  AS DATE) AS date_premiere_vente,
+        TRY_CAST(PINT_PREVENDTE AS DATE) AS date_avant_derniere_vente,
+        TRY_CAST(PINT_DERVENDTE AS DATE) AS date_derniere_vente,
+        CASE WHEN PINT_DERVENDTE IS NOT NULL AND PINT_CREATDTE IS NOT NULL
+            THEN DATEDIFF('day',
+                TRY_CAST(PINT_CREATDTE  AS DATE),
+                TRY_CAST(PINT_DERVENDTE AS DATE))
+            ELSE NULL END AS anciennete_jours,
+        CASE WHEN PINT_DERVENDTE IS NOT NULL
+            THEN DATEDIFF('day',
+                TRY_CAST(PINT_DERVENDTE AS DATE),
+                CURRENT_DATE)
+            ELSE NULL END AS jours_depuis_derniere_vente,
+        CASE
+            WHEN PINT_DERVENDTE IS NULL THEN 'inactif'
+            WHEN DATEDIFF('day', TRY_CAST(PINT_DERVENDTE AS DATE), CURRENT_DATE) <= 90
+                THEN 'actif_recent'
+            WHEN DATEDIFF('day', TRY_CAST(PINT_DERVENDTE AS DATE), CURRENT_DATE) <= 365
+                THEN 'actif_annee'
+            ELSE 'inactif_long'
+        END AS categorie_fidelisation,
+        CURRENT_TIMESTAMP AS _loaded_at
+    FROM raw
+    WHERE rn = 1 AND PER_ID IS NOT NULL
 )
 SELECT
-    CAST(PER_ID AS INT) AS per_id,
-    TRY_CAST(PINT_CREATDTE  AS DATE) AS date_premiere_vente,
-    TRY_CAST(PINT_PREVENDTE AS DATE) AS date_avant_derniere_vente,
-    TRY_CAST(PINT_DERVENDTE AS DATE) AS date_derniere_vente,
-    CASE WHEN PINT_DERVENDTE IS NOT NULL AND PINT_CREATDTE IS NOT NULL
-        THEN DATEDIFF('day',
-            TRY_CAST(PINT_CREATDTE  AS DATE),
-            TRY_CAST(PINT_DERVENDTE AS DATE))
-        ELSE NULL END AS anciennete_jours,
-    CASE WHEN PINT_DERVENDTE IS NOT NULL
-        THEN DATEDIFF('day',
-            TRY_CAST(PINT_DERVENDTE AS DATE),
-            CURRENT_DATE)
-        ELSE NULL END AS jours_depuis_derniere_vente,
-    CASE
-        WHEN PINT_DERVENDTE IS NULL THEN 'inactif'
-        WHEN DATEDIFF('day', TRY_CAST(PINT_DERVENDTE AS DATE), CURRENT_DATE) <= 90
-            THEN 'actif_recent'
-        WHEN DATEDIFF('day', TRY_CAST(PINT_DERVENDTE AS DATE), CURRENT_DATE) <= 365
-            THEN 'actif_annee'
-        ELSE 'inactif_long'
-    END AS categorie_fidelisation,
-    CURRENT_TIMESTAMP AS _loaded_at
-FROM raw
-WHERE rn = 1 AND PER_ID IS NOT NULL
+    b.per_id,
+    b.date_premiere_vente,
+    b.date_avant_derniere_vente,
+    b.date_derniere_vente,
+    b.anciennete_jours,
+    b.jours_depuis_derniere_vente,
+    b.categorie_fidelisation,
+    COALESCE(m.nb_missions_12m, 0)::INT                              AS nb_missions_12m,
+    ROUND(
+        COALESCE(m.nb_missions_12m, 0)::DECIMAL
+        / NULLIF(b.anciennete_jours / 30.0, 0),
+    4)::DECIMAL(10,4)                                                AS taux_fidelisation_pct,
+    b._loaded_at
+FROM base b
+LEFT JOIN missions_12m m ON m.per_id = b.per_id
 """
     try:
         if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
