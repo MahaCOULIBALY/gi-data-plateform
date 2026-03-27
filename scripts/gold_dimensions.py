@@ -94,7 +94,7 @@ def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
                       AND LENGTH(nic) = 5
                  THEN TRIM(siren) || nic ELSE NULL END              AS siret,
             naf_code,
-            NULLIF(TRIM(COALESCE(naf_libelle, '')), '')             AS naf_libelle,
+            NULLIF(TRIM(COALESCE(naf_libelle::VARCHAR, '')), '')      AS naf_libelle,
             ville, code_postal, statut_client,
             effectif_tranche
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')

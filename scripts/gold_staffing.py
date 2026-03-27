@@ -204,19 +204,33 @@ def build_dynamique_vivier_query(cfg: Config) -> str:
       - date_derniere_vente : date de sortie estimée (dernier placement)
       - categorie_fidelisation : ACTIF_RECENT / ACTIF / DORMANT / INACTIF
     Pool actif/total calculé sur l'état courant du vivier (snapshot).
+    agence_id résolu depuis portefeuille_agences (même logique que build_fidelisation_query) :
+    fidelisation Parquet n'expose pas agence_id directement (probe 2026-03-27).
     """
     slv = f"s3://{cfg.bucket_silver}"
     return f"""
-    WITH fidel AS (
+    WITH portefeuille AS (
+        SELECT per_id, rgpcnt_id
+        FROM read_parquet('{slv}/slv_interimaires/portefeuille_agences/**/*.parquet')
+    ),
+    dim_int_current AS (
+        SELECT per_id, agence_rattachement
+        FROM read_parquet('{slv}/slv_interimaires/dim_interimaires/**/*.parquet')
+        WHERE is_current = true AND agence_rattachement IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
+    ),
+    fidel AS (
         SELECT
-            per_id,
-            agence_id::INT                                          AS agence_id,
-            categorie_fidelisation,
-            TRY_CAST(premiere_mission      AS DATE)                AS premiere_mission,
-            TRY_CAST(date_derniere_vente   AS DATE)                AS date_derniere_vente
-        FROM read_parquet('{slv}/slv_interimaires/fidelisation/**/*.parquet')
-        WHERE agence_id IS NOT NULL
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY _loaded_at DESC NULLS LAST) = 1
+            f.per_id,
+            COALESCE(p.rgpcnt_id, di.agence_rattachement)::INT     AS agence_id,
+            f.categorie_fidelisation,
+            TRY_CAST(f.premiere_mission      AS DATE)              AS premiere_mission,
+            TRY_CAST(f.date_derniere_vente   AS DATE)              AS date_derniere_vente
+        FROM read_parquet('{slv}/slv_interimaires/fidelisation/**/*.parquet') f
+        LEFT JOIN portefeuille    p  ON p.per_id  = f.per_id
+        LEFT JOIN dim_int_current di ON di.per_id = f.per_id
+        WHERE COALESCE(p.rgpcnt_id, di.agence_rattachement) IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY f.per_id ORDER BY f._loaded_at DESC NULLS LAST) = 1
     ),
     entrees AS (
         SELECT agence_id,

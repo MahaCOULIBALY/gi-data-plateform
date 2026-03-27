@@ -65,7 +65,7 @@ def build_competences_dispo_query(cfg: Config) -> str:
     SELECT
         MD5(b.met_id::VARCHAR)          AS metier_sk,
         COALESCE(ag.agence_sk,
-                 MD5(b.rgpcnt_id::VARCHAR))  AS agence_sk,   -- fallback si agence inconnue
+                 MD5(COALESCE(b.rgpcnt_id, 0)::VARCHAR))  AS agence_sk,   -- 0 = agence non identifiée (B1)
         b.met_id,
         b.rgpcnt_id,
         COUNT(DISTINCT b.per_id)                             AS nb_qualifies,
