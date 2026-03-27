@@ -21,8 +21,8 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.utils.task_group import TaskGroup
 
-SCRIPTS  = "/opt/groupe-interaction/etl/gi-data-plateform/scripts"
-PYTHON   = "/opt/groupe-interaction/etl/gi-data-plateform/.venv/bin/python"
+SCRIPTS = "/opt/groupe-interaction/etl/gi-data-plateform/scripts"
+PYTHON  = "/opt/groupe-interaction/etl/gi-data-plateform/.venv/bin/python"
 
 _DEFAULT_ARGS = {
     "owner": "data-team",
@@ -35,12 +35,11 @@ _DEFAULT_ARGS = {
 }
 
 
-def _bash(task_id: str, script: str, sla_minutes: int = 20) -> BashOperator:
+def _bash(task_id: str, script: str) -> BashOperator:
     """Crée un BashOperator standardisé vers scripts/ avec le venv pipeline."""
     return BashOperator(
         task_id=task_id,
         bash_command=f"cd {SCRIPTS} && {PYTHON} {script}",
-        sla=timedelta(minutes=sla_minutes),
     )
 
 
@@ -58,54 +57,52 @@ with DAG(
 
     # ── BRONZE (5 sources parallèles) ─────────────────────────────────────
     with TaskGroup("bronze", tooltip="Extraction Evolia → S3 Bronze") as bronze_group:
-        bro_agences     = _bash("bronze_agences",          "bronze_agences.py",          sla_minutes=15)
-        bro_missions    = _bash("bronze_missions",         "bronze_missions.py",          sla_minutes=30)
-        bro_interims    = _bash("bronze_interimaires",     "bronze_interimaires.py",      sla_minutes=30)
-        bro_clients     = _bash("bronze_clients",          "bronze_clients.py",           sla_minutes=15)
-        bro_clients_ext = _bash("bronze_clients_external", "bronze_clients_external.py",  sla_minutes=20)
+        bro_agences     = _bash("bronze_agences",          "bronze_agences.py")
+        bro_missions    = _bash("bronze_missions",         "bronze_missions.py")
+        bro_interims    = _bash("bronze_interimaires",     "bronze_interimaires.py")
+        bro_clients     = _bash("bronze_clients",          "bronze_clients.py")
+        bro_clients_ext = _bash("bronze_clients_external", "bronze_clients_external.py")
 
     # ── SILVER ────────────────────────────────────────────────────────────
     with TaskGroup("silver", tooltip="Transformation Bronze → Silver Parquet") as silver_group:
         # Parallèle — indépendants
-        slv_agences    = _bash("silver_agences_light",       "silver_agences_light.py",       sla_minutes=10)
-        slv_missions   = _bash("silver_missions",            "silver_missions.py",            sla_minutes=20)
-        slv_temps      = _bash("silver_temps",               "silver_temps.py",               sla_minutes=30)
-        slv_interims   = _bash("silver_interimaires",        "silver_interimaires.py",        sla_minutes=15)
-        slv_int_detail = _bash("silver_interimaires_detail", "silver_interimaires_detail.py", sla_minutes=15)
-        slv_comp       = _bash("silver_competences",         "silver_competences.py",         sla_minutes=10)
-        slv_factures   = _bash("silver_factures",            "silver_factures.py",            sla_minutes=20)
+        slv_agences    = _bash("silver_agences_light",       "silver_agences_light.py")
+        slv_missions   = _bash("silver_missions",            "silver_missions.py")
+        slv_temps      = _bash("silver_temps",               "silver_temps.py")
+        slv_interims   = _bash("silver_interimaires",        "silver_interimaires.py")
+        slv_int_detail = _bash("silver_interimaires_detail", "silver_interimaires_detail.py")
+        slv_comp       = _bash("silver_competences",         "silver_competences.py")
+        slv_factures   = _bash("silver_factures",            "silver_factures.py")
 
         # Chaîne clients : SCD2 → enrichissement BAN/géocode → détail
-        slv_clients_scd2   = _bash("silver_clients",        "silver_clients.py",        sla_minutes=15)
-        slv_clients_enrich = _bash("enrich_ban_geocode",    "enrich_ban_geocode.py",    sla_minutes=20)
-        slv_clients_detail = _bash("silver_clients_detail", "silver_clients_detail.py", sla_minutes=10)
+        slv_clients_scd2   = _bash("silver_clients",        "silver_clients.py")
+        slv_clients_enrich = _bash("enrich_ban_geocode",    "enrich_ban_geocode.py")
+        slv_clients_detail = _bash("silver_clients_detail", "silver_clients_detail.py")
 
         slv_clients_scd2 >> slv_clients_enrich >> slv_clients_detail
 
     # ── GOLD DIMENSIONS (après tout le Silver) ────────────────────────────
-    gold_dims = _bash("gold_dimensions", "gold_dimensions.py", sla_minutes=15)
+    gold_dims = _bash("gold_dimensions", "gold_dimensions.py")
 
     # ── GOLD FACTS (parallèle — lisent Silver + dim tables) ──────────────
     with TaskGroup("gold_facts", tooltip="Tables Gold factuelles Phase 0-3") as gold_facts_group:
-        gld_ca          = _bash("gold_ca_mensuel",         "gold_ca_mensuel.py",         sla_minutes=20)
-        gld_staffing    = _bash("gold_staffing",           "gold_staffing.py",           sla_minutes=20)
-        gld_ops         = _bash("gold_operationnel",       "gold_operationnel.py",       sla_minutes=15)
-        gld_etp         = _bash("gold_etp",                "gold_etp.py",                sla_minutes=10)
-        gld_scorecard   = _bash("gold_scorecard_agence",   "gold_scorecard_agence.py",   sla_minutes=15)
-        gld_comp        = _bash("gold_competences",        "gold_competences.py",        sla_minutes=15)
-        gld_retention   = _bash("gold_retention_client",   "gold_retention_client.py",   sla_minutes=15)
-        # Phase 2 — qualité missions (DMM, coeff, renouvellement)
-        gld_qualite     = _bash("gold_qualite_missions",   "gold_qualite_missions.py",   sla_minutes=15)
-        # Phase 3 — recouvrement DSO
-        gld_recouvrement = _bash("gold_recouvrement",      "gold_recouvrement.py",       sla_minutes=15)
+        gld_ca           = _bash("gold_ca_mensuel",       "gold_ca_mensuel.py")
+        gld_staffing     = _bash("gold_staffing",         "gold_staffing.py")
+        gld_ops          = _bash("gold_operationnel",     "gold_operationnel.py")
+        gld_etp          = _bash("gold_etp",              "gold_etp.py")
+        gld_scorecard    = _bash("gold_scorecard_agence", "gold_scorecard_agence.py")
+        gld_comp         = _bash("gold_competences",      "gold_competences.py")
+        gld_retention    = _bash("gold_retention_client", "gold_retention_client.py")
+        gld_qualite      = _bash("gold_qualite_missions", "gold_qualite_missions.py")
+        gld_recouvrement = _bash("gold_recouvrement",     "gold_recouvrement.py")
 
     # ── GOLD VIEWS (lisent Gold PG — dépendent des facts) ─────────────────
     with TaskGroup("gold_views", tooltip="Vues Gold enrichies (lit PostgreSQL)") as gold_views_group:
-        gld_vue360     = _bash("gold_vue360_client",  "gold_vue360_client.py",  sla_minutes=15)
-        gld_cli_detail = _bash("gold_clients_detail", "gold_clients_detail.py", sla_minutes=15)
+        gld_vue360     = _bash("gold_vue360_client",  "gold_vue360_client.py")
+        gld_cli_detail = _bash("gold_clients_detail", "gold_clients_detail.py")
 
     # ── CLEANUP ───────────────────────────────────────────────────────────
-    rgpd = _bash("rgpd_audit", "rgpd_audit.py", sla_minutes=10)
+    rgpd = _bash("rgpd_audit", "rgpd_audit.py")
 
     # ── GRAPHE DE DÉPENDANCES ─────────────────────────────────────────────
     bronze_group >> silver_group >> gold_dims >> gold_facts_group >> gold_views_group >> rgpd
