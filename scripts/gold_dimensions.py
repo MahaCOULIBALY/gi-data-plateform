@@ -84,7 +84,7 @@ def build_dim_agences(ddb, cfg: Config) -> list[tuple]:
 
 def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
     # siret calculé depuis siren(9) + nic(5) — pas de colonne siret en Silver
-    # naf_libelle / effectif_tranche : absents Silver → NULL en attendant référentiel NAF Phase 2
+    # naf_libelle : alimenté depuis Salesforce Code_NAF_Name via silver_clients (2026-03-26)
     return ddb.execute(f"""
         SELECT
             client_sk, tie_id, raison_sociale,
@@ -94,7 +94,7 @@ def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
                       AND LENGTH(nic) = 5
                  THEN TRIM(siren) || nic ELSE NULL END              AS siret,
             naf_code,
-            NULL::VARCHAR                                           AS naf_libelle,
+            NULLIF(TRIM(COALESCE(naf_libelle, '')), '')             AS naf_libelle,
             ville, code_postal, statut_client,
             effectif_tranche
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')

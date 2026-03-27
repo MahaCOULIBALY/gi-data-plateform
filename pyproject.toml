@@ -24,6 +24,7 @@ dependencies = [
     "pymssql>=2.3.13",
     "pyspark>=4.1.1",
     "pytz>=2026.1.post1",
+    "simple-salesforce>=1.12.9",
 ]
 
 [project.optional-dependencies]

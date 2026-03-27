@@ -1,4 +1,4 @@
-"""silver_clients.py — Bronze → Iceberg OVH · dim_clients SCD Type 2.
+"""silver_clients.py — Bronze → Silver Parquet · dim_clients SCD Type 2.
 Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # FinOps (2026-03-05) : lecture partitionnée Bronze ({cfg.date_partition})
 # CORRECTIONS DDL (probe 2026-03-05) :
@@ -14,6 +14,11 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # #1 — SCD2 : existing lu depuis Silver avant _apply_scd2 (était hardcodé [])
 #             historical recalculé depuis existing réel → historique préservé
 # #3 — Idempotence : s3_delete_prefix avant COPY (snapshot SCD2 atomique)
+# SALESFORCE (2026-03-26) :
+# LEFT JOIN Bronze raw_sf_accounts sur Id_Evolia__c = TIE_ID
+# +naf_libelle (Code_NAF_Name) ajouté au tracking SCD2
+# +statut_client : COALESCE(Evolia CLPT_PROS, SF Statut_du_Compte__c, 'INCONNU')
+# has_sf_data : skip du JOIN si raw_sf_accounts absent (run sans SF activé)
 """
 import hashlib
 import json
@@ -25,15 +30,41 @@ from shared import Config, RunMode, Stats, get_duckdb_connection, hash_sk, s3_ha
 
 PIPELINE = "silver_clients"
 # TIES_SIREN/NIC et naf_code ajoutés au tracking SCD2 (NIC ajouté 2026-03-11)
-SCD2_TRACKED_COLS = ("raison_sociale", "siren", "nic", "naf_code",
+# naf_libelle ajouté au tracking SCD2 (Salesforce 2026-03-26)
+SCD2_TRACKED_COLS = ("raison_sociale", "siren", "nic", "naf_code", "naf_libelle",
                      "adresse_complete", "ville", "code_postal",
                      "statut_client", "ca_potentiel")
 
 _SILVER_PATH = "slv_clients/dim_clients"
 
 
-def build_staging_query(cfg: Config) -> str:
+def build_staging_query(cfg: Config, has_sf_data: bool = False) -> str:
     b = f"s3://{cfg.bucket_bronze}"
+    if has_sf_data:
+        sf_cte = f"""
+,
+raw_sf AS (
+    SELECT
+        TRY_CAST(Id_Evolia__c AS INT)  AS evolia_id,
+        Code_NAF_Name,
+        Statut_du_Compte__c,
+        ROW_NUMBER() OVER (PARTITION BY Id_Evolia__c ORDER BY _loaded_at DESC) AS rn
+    FROM read_json_auto('{b}/raw_sf_accounts/{cfg.date_partition}/*.json',
+        union_by_name=true, hive_partitioning=false)
+    WHERE Id_Evolia__c IS NOT NULL AND Id_Evolia__c != ''
+)"""
+        sf_join = "LEFT JOIN raw_sf sf ON sf.evolia_id = t.TIE_ID::INT AND sf.rn = 1"
+        naf_libelle_col = "TRIM(COALESCE(sf.Code_NAF_Name, ''))                         AS naf_libelle,"
+        statut_col = """TRIM(COALESCE(
+        NULLIF(TRIM(c.CLPT_PROS::VARCHAR), 'INCONNU'),
+        sf.Statut_du_Compte__c,
+        'INCONNU'))                                                AS statut_client,"""
+    else:
+        sf_cte = ""
+        sf_join = ""
+        naf_libelle_col = "''::VARCHAR                                                    AS naf_libelle,"
+        statut_col = "TRIM(COALESCE(c.CLPT_PROS::VARCHAR, 'INCONNU'))               AS statut_client,"
+
     return f"""
 WITH raw_ties AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY TIE_ID, TIES_SERV ORDER BY _loaded_at DESC) AS rn
@@ -43,23 +74,25 @@ WITH raw_ties AS (
 raw_clpt AS (
     SELECT * FROM read_json_auto('{b}/raw_wtclpt/{cfg.date_partition}/*.json',
         union_by_name=true, hive_partitioning=false)
-)
+){sf_cte}
 SELECT
     t.TIE_ID::INT                                                  AS tie_id,
     TRIM(t.TIES_DESIGNATION)                                       AS raison_sociale,
     TRIM(COALESCE(t.TIES_SIREN, ''))                              AS siren,
     CASE WHEN LEN(TRIM(t.TIES_NIC)) = 5 THEN TRIM(t.TIES_NIC) ELSE NULL END AS nic,
     TRIM(COALESCE(t.NAF, COALESCE(t.NAF2008, '')))               AS naf_code,
+    {naf_libelle_col}
     CONCAT_WS(' ', t.TIES_ADR1, t.TIES_ADR2, t.TIES_CODEP, t.TIES_VILLE) AS adresse_complete,
     TRIM(t.TIES_VILLE)                                             AS ville,
     TRIM(t.TIES_CODEP)                                             AS code_postal,
-    TRIM(COALESCE(c.CLPT_PROS::VARCHAR, 'INCONNU'))               AS statut_client,
+    {statut_col}
     TRY_CAST(c.CLPT_CAPT AS DECIMAL(18,2))                        AS ca_potentiel,
     TRY_CAST(c.CLPT_DCREA AS DATE)                                 AS date_creation_fiche,
     TRIM(c.CLPT_EFFT::VARCHAR)                                     AS effectif_tranche,
     t._batch_id                                                    AS _source_raw_id
 FROM raw_ties t
 LEFT JOIN raw_clpt c ON c.TIE_ID::INT = t.TIE_ID::INT
+{sf_join}
 WHERE t.rn = 1 AND t.TIE_ID IS NOT NULL
 """
 
@@ -101,6 +134,7 @@ def _apply_scd2(
             "siren": rd.get("siren") or None,
             "nic": rd.get("nic") or None,
             "naf_code": rd.get("naf_code") or None,
+            "naf_libelle": rd.get("naf_libelle") or None,
             "adresse_complete": rd.get("adresse_complete", ""),
             "ville": rd.get("ville", ""),
             "code_postal": rd.get("code_postal", ""),
@@ -132,7 +166,9 @@ def run(cfg: Config) -> dict:
             logger.info(json.dumps({"pipeline": PIPELINE, "rows": 0, "status": "empty"}))
             return stats.finish(cfg, PIPELINE)
 
-        res = ddb.execute(build_staging_query(cfg))
+        has_sf_data = s3_has_files(cfg, cfg.bucket_bronze, f"raw_sf_accounts/{cfg.date_partition}/")
+        logger.info(json.dumps({"pipeline": PIPELINE, "salesforce_enrichment": has_sf_data}))
+        res = ddb.execute(build_staging_query(cfg, has_sf_data=has_sf_data))
         cols = [d[0] for d in res.description]
         staging = [dict(zip(cols, row)) for row in res.fetchall()]
         if not staging:
@@ -158,7 +194,7 @@ def run(cfg: Config) -> dict:
         # Normalisation schema — garantit que toutes les colonnes ajoutées après le 1er run
         # sont présentes dans TOUS les records (JSONL union_by_name ne suffit pas si les
         # nouvelles colonnes n'apparaissent qu'en fin de fichier, hors de la fenêtre de sampling)
-        _schema_defaults = {"effectif_tranche": None}
+        _schema_defaults = {"effectif_tranche": None, "naf_libelle": None}
         for r in all_records:
             for k, v in _schema_defaults.items():
                 r.setdefault(k, v)
