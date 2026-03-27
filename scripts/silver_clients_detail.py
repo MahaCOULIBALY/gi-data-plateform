@@ -18,6 +18,13 @@ Phase 1 · GI Data Lakehouse · Manifeste v2.0
 # #3 — Idempotence : s3_delete_prefix avant chaque COPY
 # #4 — stats.tables_processed = 3 (process_coefficients commenté → 3 tables actives)
 # #5 — CTE : ajout du ) manquant dans les 3 process_ pour fermer raw AS (...)
+# Phase 3 (2026-03-26) — Tâche #15 :
+# process_facturation_detail : WTEFAC → slv_clients/facturation_detail (DSO/recouvrement)
+# WTEFAC ingéré par bronze_missions.py (non dupliqué dans bronze_clients.py).
+# DDL probe : EFAC_TIERS/EFAC_AGENCE/EFAC_DATPAI/EFAC_MNTPAI/EFAC_TYPEPAI absents →
+#   colonnes réelles : TIE_ID, RGPCNT_ID, EFAC_DTEREGLF (date règlement final).
+#   montant_regle + type_reglement déclarés NULL (colonnes DDL non confirmées).
+#   stats.tables_processed passe de 3 à 4.
 """
 import json
 from shared import Config, RunMode, Stats, get_duckdb_connection, s3_has_files, s3_delete_prefix, logger
@@ -159,20 +166,78 @@ FROM raw WHERE rn = 1 AND ENCGRP_ID IS NOT NULL
     return count
 
 
+def process_facturation_detail(ddb, cfg: Config, stats: Stats) -> int:
+    """WTEFAC → slv_clients/facturation_detail — règlements clients (DSO/recouvrement).
+    Bronze : raw_wtefac (ingéré par bronze_missions.py — non dupliqué dans bronze_clients.py).
+    retard_jours : LEFT JOIN slv_facturation/factures pour date_echeance normalisée.
+    """
+    if not s3_has_files(cfg, cfg.bucket_bronze, f"raw_wtefac/{cfg.date_partition}/"):
+        logger.info(json.dumps({"table": "facturation_detail", "rows": 0, "status": "empty"}))
+        return 0
+    b = f"s3://{cfg.bucket_bronze}"
+    s = f"s3://{cfg.bucket_silver}"
+    silver_path = f"{s}/slv_clients/facturation_detail/**/*.parquet"
+    query = f"""
+WITH raw AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY EFAC_NUM ORDER BY _loaded_at DESC) AS rn
+    FROM read_json_auto('{b}/raw_wtefac/{cfg.date_partition}/*.json',
+        union_by_name=true, hive_partitioning=false)
+),
+factures AS (
+    SELECT efac_num, date_echeance
+    FROM read_parquet('{s}/slv_facturation/factures/**/*.parquet')
+)
+SELECT
+    TRIM(raw.EFAC_NUM)                                  AS efac_num,
+    TRY_CAST(raw.TIE_ID         AS INT)                 AS tie_id,
+    TRY_CAST(raw.RGPCNT_ID      AS INT)                 AS rgpcnt_id,
+    TRY_CAST(raw.EFAC_DTEREGLF  AS DATE)                AS date_paiement,
+    -- montant_regle / type_reglement : colonnes DDL Evolia non confirmées (probe 2026-03-26)
+    -- EFAC_MNTPAI / EFAC_TYPEPAI absents du DDL → NULL en attente de confirmation probe
+    NULL::DECIMAL(18,2)                                 AS montant_regle,
+    NULL::VARCHAR                                       AS type_reglement,
+    CASE
+        WHEN TRY_CAST(raw.EFAC_DTEREGLF AS DATE) IS NOT NULL
+             AND f.date_echeance IS NOT NULL
+        THEN DATEDIFF('day', f.date_echeance,
+                      TRY_CAST(raw.EFAC_DTEREGLF AS DATE))::INT
+    END                                                 AS retard_jours,
+    CURRENT_TIMESTAMP                                   AS _loaded_at
+FROM raw
+LEFT JOIN factures f ON f.efac_num = TRIM(raw.EFAC_NUM)
+WHERE raw.rn = 1 AND raw.EFAC_NUM IS NOT NULL
+"""
+    if cfg.mode in (RunMode.OFFLINE, RunMode.PROBE):
+        count = ddb.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        logger.info(json.dumps({"mode": cfg.mode.value,
+                    "table": "facturation_detail", "rows": count}))
+        return count
+    s3_delete_prefix(cfg, cfg.bucket_silver, "slv_clients/facturation_detail/")
+    ddb.execute(
+        f"COPY ({query}) TO '{silver_path}' "
+        f"(FORMAT PARQUET, COMPRESSION ZSTD, OVERWRITE_OR_IGNORE TRUE)"
+    )
+    count = ddb.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{silver_path}')").fetchone()[0]
+    logger.info(json.dumps({"table": "facturation_detail", "rows": count}))
+    return count
+
+
 def run(cfg: Config) -> dict:
     stats = Stats()
     with get_duckdb_connection(cfg) as ddb:
         stats.extra["sites_mission"] = process_sites_mission(ddb, cfg, stats)
         stats.extra["contacts"] = process_contacts(ddb, cfg, stats)
         stats.extra["encours_credit"] = process_encours_credit(ddb, cfg, stats)
+        stats.extra["facturation_detail"] = process_facturation_detail(ddb, cfg, stats)
         # process_coefficients commenté (WTCOEF vide en source → Bronze sans fichier S3)
         # try:
         #     stats.extra["coefficients"] = process_coefficients(ddb, cfg, stats)
         # except Exception as e:
         #     logger.warning(json.dumps({"warning": "coefficients skipped", "error": str(e)}))
         #     stats.extra["coefficients"] = 0
-        # correction #4 : était 4 (coefficients inactif)
-        stats.tables_processed = 3
+        # Phase 3 (2026-03-26) : +facturation_detail → 4 tables actives
+        stats.tables_processed = 4
         stats.rows_transformed = sum(stats.extra.values())
     return stats.finish(cfg, PIPELINE)
 

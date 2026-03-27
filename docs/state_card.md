@@ -1,6 +1,6 @@
 # State Card — Pipeline GI Data Platform
 
-> Dernière mise à jour : **2026-03-26** · Auteur : M. COULIBALY
+> Dernière mise à jour : **2026-03-26** · Auteur : M. COULIBALY (Phase 3 — tâches #15-#16)
 > Architecture : Bronze (Evolia/SQL Server) → Silver (Parquet S3) → Gold (PostgreSQL)
 
 ---
@@ -148,6 +148,29 @@ L'enrichissement SIRENE ne s'exécute jamais même si `SIRENE_API_TOKEN` est con
 
 ---
 
+### ✅ B5 — montant_regle NULL dans slv_clients/facturation_detail (RÉSOLU 2026-03-26)
+
+**Probe exécuté** : `RUN_MODE=probe python probe_ddl.py` — WTEFAC : 31 colonnes réelles, WARN.
+
+**Résultat** : Les 5 colonnes B5 sont **définitivement absentes** de WTEFAC côté Evolia :
+`EFAC_TIERS`, `EFAC_AGENCE`, `EFAC_DATPAI`, `EFAC_MNTPAI`, `EFAC_TYPEPAI` → toutes `ABSENT`.
+
+**Décision** : L'implémentation Silver est correcte et définitive :
+
+- `tie_id` ← `TIE_ID`, `rgpcnt_id` ← `RGPCNT_ID`, `date_paiement` ← `EFAC_DTEREGLF`
+- `montant_regle = NULL::DECIMAL(18,2)` et `type_reglement = NULL::VARCHAR` sont **définitifs**
+- `fact_dso_client.encours_ht` = SUM(factures HT) sans déduction (pas de données paiement Evolia)
+
+**Impact résiduel** : DSO surestimé si des règlements existent en dehors d'Evolia (ex. virements
+tracés dans un autre système). Si une source de paiements est identifiée ultérieurement, une
+nouvelle Silver table dédiée devra être créée (table séparée de WTEFAC).
+
+**Fix collatéral** : `probe_ddl.py` corrigé — `_get_actual_columns()` utilisait `?` (paramètre
+positionnel non supporté par FreeTDS/DB-Lib dans `INFORMATION_SCHEMA`). Remplacé par f-string.
+Probe passe maintenant à **39 PASS / 1 WARN / 5 FAIL** (vs 0 PASS / 45 FAIL avant fix).
+
+---
+
 ## Décisions d'architecture actives
 
 | ID | Décision | Raison |
@@ -179,3 +202,67 @@ L'enrichissement SIRENE ne s'exécute jamais même si `SIRENE_API_TOKEN` est con
 
 5. **[Qualité]** Corriger les 2 warnings pyright dans `silver_competences.py` (lignes 153, 164) :
    `fetchone()` peut retourner `None` → utiliser `(fetchone() or (0,))[0]`.
+
+---
+
+## Roadmap KPI — Phases 3-5 (feature/kpi-completion)
+
+> Phases 1 et 2 terminées — commit `6256a76` sur `feature/kpi-completion`.
+> Catalogue KPI complet : [docs/CATALOGUE_KPI_GOLD.md](CATALOGUE_KPI_GOLD.md)
+
+### ✅ Phase 3 — Recouvrement & DSO (tâches #15-#16) — commit `feature/kpi-completion`
+
+#### ✅ Tâche #15 — Silver `slv_clients/facturation_detail`
+
+**Fichier modifié** : [scripts/silver_clients_detail.py](../scripts/silver_clients_detail.py)
+**Fonction ajoutée** : `process_facturation_detail()` — stats.tables_processed = 4
+
+**Source Bronze** : `raw_wtefac` (ingéré par `bronze_missions.py` — non dupliqué)
+
+**Colonnes produites** :
+
+| Colonne | Source Bronze réelle | Note |
+| ------- | -------------------- | ---- |
+| `efac_num` | `EFAC_NUM` | VARCHAR |
+| `tie_id` | `TIE_ID` | TRY_CAST AS INT (EFAC_TIERS absent DDL) |
+| `rgpcnt_id` | `RGPCNT_ID` | TRY_CAST AS INT (EFAC_AGENCE absent DDL) |
+| `date_paiement` | `EFAC_DTEREGLF` | TRY_CAST AS DATE (EFAC_DATPAI absent DDL) |
+| `montant_regle` | `NULL` | EFAC_MNTPAI absent DDL — probe requis |
+| `type_reglement` | `NULL` | EFAC_TYPEPAI absent DDL — probe requis |
+| `retard_jours` | calculé | LEFT JOIN slv_facturation/factures sur efac_num |
+
+> **Blocker B5** : `montant_regle` NULL — colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` non confirmées
+> dans le DDL Evolia WTEFAC (probe 2026-03-26). DSO surestimé jusqu'à confirmation.
+> Action : probe `SELECT TOP 1 EFAC_MNTPAI FROM WTEFAC` sur Evolia pour valider.
+
+#### ✅ Tâche #16 — Gold `gold_recouvrement.py`
+
+**Fichier créé** : [scripts/gold_recouvrement.py](../scripts/gold_recouvrement.py)
+**DDL ajouté** : section Phase 3 dans [scripts/ddl_gold_tables.sql](../scripts/ddl_gold_tables.sql)
+
+**Tables Gold** : `gld_operationnel.fact_dso_client` + `gld_operationnel.fact_balance_agee`
+
+**Logique DSO** : `encours_ht / (ca_mensuel / nb_jours_mois)` — snapshot = premier jour du mois courant.
+**Balance âgée** : tranches `0-30j` / `31-60j` / `61-90j` / `>90j` sur `DATEDIFF(date_echeance, snapshot)`.
+
+---
+
+### 🔵 Phase 4 — Fidélisation intérimaires (tâches #17-#18) — À FAIRE
+
+**Tâche #17** — `silver_interimaires_detail.py` : enrichir `slv_interimaires/fidelisation` avec
+`taux_fidelisation_pct` = nb_missions_12m / NULLIF(anciennete_mois, 0).
+
+**Tâche #18** — `gold_staffing.py` : compléter `fact_fidelisation_interimaires` avec
+`taux_fidelisation_pct` (ajouter colonne en DDL via `ALTER TABLE … ADD COLUMN IF NOT EXISTS`).
+
+---
+
+### Phase 5 — Finitions (tâches #19-#21)
+
+**Tâche #19** — `gold_ca_mensuel.py` : remplir `nb_heures_facturees` / `taux_moyen_fact`
+via `WTLFAC` (voir TODO B-02 ligne 18 — actuellement `NULL::DECIMAL`).
+
+**Tâche #20** — `fact_concentration_client` : ajouter `ca_net_top5` + `taux_concentration_top5`
+(PERCENT_RANK <= 0.05).
+
+**Tâche #21** — Finaliser DDL : index manquants, `COMMENT ON COLUMN`, nettoyage migrations.

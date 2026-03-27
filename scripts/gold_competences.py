@@ -36,7 +36,7 @@ def build_competences_dispo_query(cfg: Config) -> str:
     dim_int AS (
         SELECT per_id, agence_rattachement AS rgpcnt_id, is_actif
         FROM read_parquet('{slv}/slv_interimaires/dim_interimaires/**/*.parquet')
-        WHERE is_current = true AND is_actif = true
+        WHERE is_current = true AND is_actif = true AND agence_rattachement IS NOT NULL
         QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
     -- G-COMP-M03 : agence_sk canonique depuis Silver dim_agences (pas recomputed)
@@ -65,7 +65,7 @@ def build_competences_dispo_query(cfg: Config) -> str:
     SELECT
         MD5(b.met_id::VARCHAR)          AS metier_sk,
         COALESCE(ag.agence_sk,
-                 MD5(b.rgpcnt_id::VARCHAR))  AS agence_sk,   -- fallback si agence inconnue
+                 MD5(COALESCE(b.rgpcnt_id, 0)::VARCHAR))  AS agence_sk,   -- 0 = agence non identifiée (B1)
         b.met_id,
         b.rgpcnt_id,
         COUNT(DISTINCT b.per_id)                             AS nb_qualifies,

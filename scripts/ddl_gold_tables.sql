@@ -416,6 +416,35 @@ ALTER TABLE gld_clients.vue_360_client
     ADD COLUMN IF NOT EXISTS code_postal      VARCHAR(10),
     ADD COLUMN IF NOT EXISTS adresse_complete TEXT;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 1 KPI completion (2026-03-26)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- fact_delai_placement : refonte grain + distribution opérationnelle
+-- Raison : retrait categorie_delai (dimension) remplacée par KPIs % actionnables.
+-- La PK passe de (agence_id, semaine_debut, categorie_delai) à (agence_id, semaine_debut).
+-- DROP + CREATE nécessaire car modification de la clé primaire.
+DROP TABLE IF EXISTS gld_operationnel.fact_delai_placement;
+CREATE TABLE gld_operationnel.fact_delai_placement (
+    agence_id               INTEGER         NOT NULL,
+    semaine_debut           DATE            NOT NULL,
+    nb_missions             INTEGER         NOT NULL DEFAULT 0,
+    delai_moyen_heures      DECIMAL(10,2),
+    delai_median_heures     DECIMAL(10,2),
+    pct_moins_4h            DECIMAL(6,1),   -- % placements en < 4h  (réactivité excellente)
+    pct_meme_jour           DECIMAL(6,1),   -- % placements en ≤ 24h (même journée)
+    pct_plus_3j             DECIMAL(6,1),   -- % placements > 72h    (alerte opérationnelle)
+    _loaded_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, semaine_debut)
+);
+
+-- fact_conformite_dpae : ajout colonnes conformes/retard + correction taux (2026-03-26)
+-- Raison : taux_conformite_dpae était calculé sur nb_transmises (erroné — inclut les retards).
+-- Correction : taux = nb_dpae_conformes (ecart_heures <= 0) / nb_missions.
+ALTER TABLE gld_operationnel.fact_conformite_dpae
+    ADD COLUMN IF NOT EXISTS nb_dpae_conformes  INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS nb_dpae_retard     INTEGER NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS ops.pipeline_watermarks (
     pipeline        VARCHAR(100)    NOT NULL,
     table_name      VARCHAR(200)    NOT NULL,
@@ -424,4 +453,140 @@ CREATE TABLE IF NOT EXISTS ops.pipeline_watermarks (
     rows_loaded     BIGINT,
     _updated_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     PRIMARY KEY (pipeline, table_name)
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 2 KPI completion (2026-03-26) — KPIs Gold purs (tâches #10→#14)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ref_naf_sections : référentiel INSEE sections NAF A-U pour Superset (seed_ref_naf.py)
+CREATE TABLE IF NOT EXISTS gld_shared.ref_naf_sections (
+    section_code    CHAR(1)         PRIMARY KEY,            -- 'A'→'U'
+    libelle         VARCHAR(100)    NOT NULL,
+    division_min    VARCHAR(2)      NOT NULL,               -- ex. '01'
+    division_max    VARCHAR(2)      NOT NULL,               -- ex. '03'
+    _loaded_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- fact_duree_mission : DMM par agence/client/métier/mois (gold_qualite_missions.py)
+-- Clé logique (agence_id, tie_id, metier_id, mois) — metier_id nullable → UNIQUE NULLS NOT DISTINCT
+CREATE TABLE IF NOT EXISTS gld_performance.fact_duree_mission (
+    agence_id               INTEGER         NOT NULL,
+    tie_id                  INTEGER         NOT NULL,
+    metier_id               INTEGER,
+    mois                    DATE            NOT NULL,
+    nb_missions             INTEGER         NOT NULL DEFAULT 0,
+    dmm_jours               DECIMAL(10,1),
+    dmm_semaines            DECIMAL(10,1),
+    duree_mediane_jours     DECIMAL(10,1),
+    nb_missions_1j          INTEGER         NOT NULL DEFAULT 0,
+    nb_missions_1semaine    INTEGER         NOT NULL DEFAULT 0,
+    nb_missions_1mois       INTEGER         NOT NULL DEFAULT 0,
+    nb_missions_long        INTEGER         NOT NULL DEFAULT 0,
+    profil_duree            VARCHAR(10),                    -- MICRO / COURTE / MOYENNE / LONGUE
+    _loaded_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    UNIQUE NULLS NOT DISTINCT (agence_id, tie_id, metier_id, mois)
+);
+CREATE INDEX IF NOT EXISTS fact_duree_mission_agence_mois_idx
+    ON gld_performance.fact_duree_mission (agence_id, mois);
+
+-- fact_coeff_facturation : coeff THF/THP pondéré par heures (gold_qualite_missions.py)
+-- Clé logique (agence_id, tie_id, metier_id, mois) — metier_id nullable → UNIQUE NULLS NOT DISTINCT
+CREATE TABLE IF NOT EXISTS gld_performance.fact_coeff_facturation (
+    agence_id               INTEGER         NOT NULL,
+    tie_id                  INTEGER         NOT NULL,
+    metier_id               INTEGER,
+    mois                    DATE            NOT NULL,
+    nb_missions             INTEGER         NOT NULL DEFAULT 0,
+    coeff_moyen_pondere     DECIMAL(10,3),                  -- THF*h / THP*h (pondéré heures)
+    coeff_moyen_simple      DECIMAL(10,3),                  -- AVG(THF/THP)
+    thf_moyen               DECIMAL(10,2),
+    thp_moyen               DECIMAL(10,2),
+    marge_coeff_pct         DECIMAL(8,1),                   -- (coeff-1)*100
+    niveau_coeff            VARCHAR(10),                    -- BON / MOYEN / A_REVOIR
+    _loaded_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    UNIQUE NULLS NOT DISTINCT (agence_id, tie_id, metier_id, mois)
+);
+CREATE INDEX IF NOT EXISTS fact_coeff_facturation_agence_mois_idx
+    ON gld_performance.fact_coeff_facturation (agence_id, mois);
+
+-- fact_renouvellement_mission : taux de reconduction chez même client (gold_qualite_missions.py)
+CREATE TABLE IF NOT EXISTS gld_commercial.fact_renouvellement_mission (
+    agence_id               INTEGER         NOT NULL,
+    tie_id                  INTEGER         NOT NULL,
+    mois                    DATE            NOT NULL,
+    nb_missions             INTEGER         NOT NULL DEFAULT 0,
+    nb_renouvellements      INTEGER         NOT NULL DEFAULT 0,
+    taux_renouvellement_pct DECIMAL(6,1),
+    ecart_moyen_jours       DECIMAL(6,0),
+    _loaded_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, tie_id, mois)
+);
+CREATE INDEX IF NOT EXISTS fact_renouvellement_mission_agence_mois_idx
+    ON gld_commercial.fact_renouvellement_mission (agence_id, mois);
+
+-- fact_dynamique_vivier : entrées/sorties/croissance nette du pool intérimaires (gold_staffing.py)
+CREATE TABLE IF NOT EXISTS gld_staffing.fact_dynamique_vivier (
+    agence_id                       INTEGER         NOT NULL,
+    mois                            DATE            NOT NULL,
+    nb_nouveaux                     INTEGER         NOT NULL DEFAULT 0,
+    nb_perdus                       INTEGER         NOT NULL DEFAULT 0,
+    croissance_nette                INTEGER         NOT NULL DEFAULT 0,
+    pool_actif                      INTEGER         NOT NULL DEFAULT 0,   -- ACTIF_RECENT snapshot
+    pool_total                      INTEGER         NOT NULL DEFAULT 0,
+    taux_renouvellement_vivier_pct  DECIMAL(6,1),
+    _loaded_at                      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, mois)
+);
+
+-- fact_ca_secteur_naf : ventilation CA par section NAF INSEE A-U (gold_ca_mensuel.py)
+CREATE TABLE IF NOT EXISTS gld_commercial.fact_ca_secteur_naf (
+    agence_id           INTEGER         NOT NULL,
+    mois                DATE            NOT NULL,
+    naf_code            VARCHAR(10)     NOT NULL DEFAULT '',
+    naf_division        VARCHAR(2)      NOT NULL DEFAULT '',
+    naf_section         CHAR(2)         NOT NULL DEFAULT 'XX',
+    secteur_libelle     VARCHAR(100)    NOT NULL DEFAULT 'Non classifié',
+    nb_clients          INTEGER         NOT NULL DEFAULT 0,
+    ca_net_ht           DECIMAL(18,2)   NOT NULL DEFAULT 0,
+    nb_missions         INTEGER         NOT NULL DEFAULT 0,
+    part_ca_agence_pct  DECIMAL(6,1),
+    _loaded_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, mois, naf_code)
+);
+CREATE INDEX IF NOT EXISTS fact_ca_secteur_naf_section_idx
+    ON gld_commercial.fact_ca_secteur_naf (naf_section);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 3 KPI completion (2026-03-26) — Recouvrement & DSO (tâches #15-#16)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- fact_dso_client : DSO par agence/client/mois (gold_recouvrement.py)
+-- encours_ht = SUM(factures HT) - SUM(montant_regle depuis slv_clients/facturation_detail)
+-- dso_jours  = encours_ht / (ca_mensuel / nb_jours_mois)
+-- montant_echu : encours sur factures dont date_echeance < snapshot courant
+CREATE TABLE IF NOT EXISTS gld_operationnel.fact_dso_client (
+    agence_id            INTEGER        NOT NULL,
+    tie_id               INTEGER        NOT NULL,
+    mois                 DATE           NOT NULL,
+    encours_ht           DECIMAL(18,2)  NOT NULL DEFAULT 0,
+    dso_jours            DECIMAL(8,1),
+    nb_factures_ouvertes INTEGER        NOT NULL DEFAULT 0,
+    montant_echu         DECIMAL(18,2)  NOT NULL DEFAULT 0,
+    _loaded_at           TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, tie_id, mois)
+);
+CREATE INDEX IF NOT EXISTS fact_dso_client_tie_id_idx
+    ON gld_operationnel.fact_dso_client (tie_id);
+
+-- fact_balance_agee : balance âgée par agence/mois/tranche (gold_recouvrement.py)
+-- tranche : '0-30j' / '31-60j' / '61-90j' / '>90j' — calculé sur retard à snapshot courant
+CREATE TABLE IF NOT EXISTS gld_operationnel.fact_balance_agee (
+    agence_id    INTEGER        NOT NULL,
+    mois         DATE           NOT NULL,
+    tranche      VARCHAR(20)    NOT NULL,
+    montant_echu DECIMAL(18,2)  NOT NULL DEFAULT 0,
+    nb_factures  INTEGER        NOT NULL DEFAULT 0,
+    _loaded_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agence_id, mois, tranche)
 );

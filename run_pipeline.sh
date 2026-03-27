@@ -239,8 +239,9 @@ elif [[ "$CMD" == "gold-probe" ]]; then
     _run "probe_pg (connectivité PostgreSQL)"  bash -c "RUN_MODE=probe uv run scripts/probe_pg.py"
 
     for script in gold_dimensions gold_ca_mensuel gold_clients_detail \
-                  gold_competences gold_etp gold_operationnel gold_qualite_missions \
-                  gold_retention_client gold_scorecard_agence gold_staffing gold_vue360_client; do
+                  gold_competences gold_etp gold_operationnel gold_recouvrement \
+                  gold_qualite_missions gold_retention_client gold_scorecard_agence \
+                  gold_staffing gold_vue360_client; do
         _run "$script" bash -c "RUN_MODE=probe uv run scripts/${script}.py" || true
     done
 
@@ -253,8 +254,9 @@ elif [[ "$CMD" == "gold" ]]; then
     _banner "GOLD — LIVE"
 
     for script in gold_dimensions gold_ca_mensuel gold_clients_detail \
-                  gold_competences gold_etp gold_operationnel gold_qualite_missions \
-                  gold_retention_client gold_scorecard_agence gold_staffing gold_vue360_client; do
+                  gold_competences gold_etp gold_operationnel gold_recouvrement \
+                  gold_qualite_missions gold_retention_client gold_scorecard_agence \
+                  gold_staffing gold_vue360_client; do
         _run "$script" bash -c "RUN_MODE=live uv run scripts/${script}.py"
     done
 
