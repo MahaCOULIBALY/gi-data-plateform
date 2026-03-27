@@ -10,6 +10,9 @@ Phase 2 · GI Data Lakehouse · Manifeste v2.0
 # #1 — SCD2 : existing lu depuis Silver avant la boucle (était hardcodé [])
 #             current_by_id / historical alimentés depuis Silver réel
 # #3 — Idempotence : s3_delete_prefix avant COPY (snapshot SCD2 atomique)
+# B1 (2026-03-27) : agence_rattachement alimenté depuis raw_wtugpint (full-history /**)
+#   RGPCNT_ID absent de WTPINT — WTUGPINT est la source canonique rattachement agence↔intérimaire
+#   SCD2 loop : "agence_rattachement": None → rd.get("agence_rattachement")
 """
 import hashlib
 import json
@@ -46,6 +49,16 @@ raw_pint AS (
     SELECT *, ROW_NUMBER() OVER (PARTITION BY PER_ID ORDER BY _loaded_at DESC) AS rn
     FROM read_json_auto('{b}/raw_wtpint/{cfg.date_partition}/*.json',
         union_by_name=true, hive_partitioning=false)
+),
+-- B1 : rattachement agence depuis WTUGPINT (full-history — RGPCNT_ID absent WTPINT)
+raw_ugpint AS (
+    SELECT
+        CAST(PER_ID    AS INT) AS per_id,
+        CAST(RGPCNT_ID AS INT) AS rgpcnt_id,
+        ROW_NUMBER() OVER (PARTITION BY CAST(PER_ID AS INT) ORDER BY _loaded_at DESC) AS rn
+    FROM read_json_auto('{b}/raw_wtugpint/**/*.json',
+        union_by_name=true, hive_partitioning=false)
+    WHERE PER_ID IS NOT NULL AND RGPCNT_ID IS NOT NULL
 )
 SELECT
     p.PER_ID::INT                                                  AS per_id,
@@ -64,11 +77,12 @@ SELECT
     COALESCE(TRY_CAST(s.SAL_ACTIF AS BOOLEAN), false)              AS is_actif,
     COALESCE(TRY_CAST(i.PINT_CANDIDAT AS BOOLEAN), false)          AS is_candidat,
     COALESCE(TRY_CAST(i.PINT_PERMANENT AS BOOLEAN), false)         AS is_permanent,
-    NULL::INT                                                      AS agence_rattachement,
+    ug.rgpcnt_id                                                   AS agence_rattachement,
     p._batch_id                                                    AS _source_raw_id
 FROM raw_per p
-LEFT JOIN raw_sal s  ON s.PER_ID::INT = p.PER_ID::INT AND s.rn = 1
-LEFT JOIN raw_pint i ON i.PER_ID::INT = p.PER_ID::INT AND i.rn = 1
+LEFT JOIN raw_sal    s  ON s.PER_ID::INT  = p.PER_ID::INT  AND s.rn  = 1
+LEFT JOIN raw_pint   i  ON i.PER_ID::INT  = p.PER_ID::INT  AND i.rn  = 1
+LEFT JOIN raw_ugpint ug ON ug.per_id      = p.PER_ID::INT  AND ug.rn = 1
 WHERE p.rn = 1 AND p.PER_ID IS NOT NULL
 """
 
@@ -145,7 +159,7 @@ def run(cfg: Config) -> dict:
                 "is_actif": rd.get("is_actif", False),
                 "is_candidat": rd.get("is_candidat", False),
                 "is_permanent": rd.get("is_permanent", False),
-                "agence_rattachement": None,
+                "agence_rattachement": rd.get("agence_rattachement"),
                 "is_current": True,
                 "valid_from": now.isoformat(),
                 "valid_to": None,

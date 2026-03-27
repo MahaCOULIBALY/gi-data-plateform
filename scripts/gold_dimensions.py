@@ -115,6 +115,41 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
     """).fetchall()
 
 
+def build_dim_habilitations(ddb, cfg: Config) -> list[tuple]:
+    """Référentiel habilitations (WTTHAB) — dédupliqué par code THAB_ID.
+    Phase 5 · tâche #22.
+    """
+    return ddb.execute(f"""
+        SELECT
+            MD5(code)                AS habilitation_sk,
+            code                     AS thab_id,
+            MAX(libelle)             AS libelle,
+            BOOL_OR(is_active)       AS is_active
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/competences/**/*.parquet')
+        WHERE type_competence = 'HABILITATION' AND code != ''
+        GROUP BY code
+        ORDER BY code
+    """).fetchall()
+
+
+def build_dim_diplomes(ddb, cfg: Config) -> list[tuple]:
+    """Référentiel diplômes (WTTDIP) — dédupliqué par code TDIP_ID.
+    Phase 5 · tâche #23.
+    """
+    return ddb.execute(f"""
+        SELECT
+            MD5(code)                AS diplome_sk,
+            code                     AS tdip_id,
+            MAX(libelle)             AS libelle,
+            MAX(niveau)              AS niveau,
+            BOOL_OR(is_active)       AS is_active
+        FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/competences/**/*.parquet')
+        WHERE type_competence = 'DIPLOME' AND code != ''
+        GROUP BY code
+        ORDER BY code
+    """).fetchall()
+
+
 def build_dim_metiers(ddb, cfg: Config) -> list[tuple]:
     """Lit Bronze raw_wtmet + raw_wtqua (via bronze_interimaires depuis 2026-03-12).
     ROW_NUMBER déduplique par MET_ID/TQUA_ID — insensible au fait que Bronze
@@ -178,6 +213,14 @@ DIMENSIONS = {
                  "qualification", "specialite", "niveau", "pcs_code"],
         "builder": "metiers",
     },
+    "dim_habilitations": {
+        "cols": ["habilitation_sk", "thab_id", "libelle", "is_active"],
+        "builder": "habilitations",
+    },
+    "dim_diplomes": {
+        "cols": ["diplome_sk", "tdip_id", "libelle", "niveau", "is_active"],
+        "builder": "diplomes",
+    },
 }
 
 
@@ -192,11 +235,13 @@ def run(cfg: Config) -> dict:
 
     with get_duckdb_connection(cfg) as ddb:
         builders = {
-            "calendrier": lambda: build_dim_calendrier(ddb),
-            "agences": lambda: build_dim_agences(ddb, cfg),
-            "clients": lambda: build_dim_clients(ddb, cfg),
-            "interimaires": lambda: build_dim_interimaires(ddb, cfg),
-            "metiers": lambda: build_dim_metiers(ddb, cfg),
+            "calendrier":    lambda: build_dim_calendrier(ddb),
+            "agences":       lambda: build_dim_agences(ddb, cfg),
+            "clients":       lambda: build_dim_clients(ddb, cfg),
+            "interimaires":  lambda: build_dim_interimaires(ddb, cfg),
+            "metiers":       lambda: build_dim_metiers(ddb, cfg),
+            "habilitations": lambda: build_dim_habilitations(ddb, cfg),
+            "diplomes":      lambda: build_dim_diplomes(ddb, cfg),
         }
         with get_pg_connection(cfg) as pg:
             for dim_name, spec in DIMENSIONS.items():

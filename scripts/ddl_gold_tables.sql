@@ -88,6 +88,24 @@ CREATE TABLE IF NOT EXISTS gld_shared.dim_metiers (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS dim_metiers_met_id_idx ON gld_shared.dim_metiers (met_id);
 
+-- Phase 5 — Référentiels partagés habilitations + diplômes (#22-#23)
+CREATE TABLE IF NOT EXISTS gld_shared.dim_habilitations (
+    habilitation_sk VARCHAR(32)     PRIMARY KEY,        -- MD5(thab_id)
+    thab_id         VARCHAR(50)     NOT NULL UNIQUE,
+    libelle         VARCHAR(255)    NOT NULL DEFAULT '',
+    is_active       BOOLEAN         NOT NULL DEFAULT true,
+    _loaded_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS gld_shared.dim_diplomes (
+    diplome_sk      VARCHAR(32)     PRIMARY KEY,        -- MD5(tdip_id)
+    tdip_id         VARCHAR(50)     NOT NULL UNIQUE,
+    libelle         VARCHAR(255)    NOT NULL DEFAULT '',
+    niveau          VARCHAR(50),
+    is_active       BOOLEAN         NOT NULL DEFAULT true,
+    _loaded_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- gld_commercial — KPIs commerciaux, CA, marges
 -- ─────────────────────────────────────────────────────────────────────────────

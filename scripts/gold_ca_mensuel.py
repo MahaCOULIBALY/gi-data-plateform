@@ -60,21 +60,31 @@ _TABLES = {
 
 
 def build_ca_mensuel_query(cfg: Config) -> str:
+    slv = f"s3://{cfg.bucket_silver}"
     return f"""
     WITH factures AS (
-        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_facturation/factures/**/*.parquet')
+        SELECT * FROM read_parquet('{slv}/slv_facturation/factures/**/*.parquet')
     ),
     {cte_montants_factures(cfg)},
+    heures_fac AS (
+        -- B-02 : heures facturées depuis WTLFAC.LFAC_BASE (quantité base)
+        SELECT
+            fac_num,
+            COALESCE(SUM(base::DECIMAL(12,2)), 0)::DECIMAL(12,2) AS heures_calc
+        FROM read_parquet('{slv}/slv_facturation/lignes_factures/**/*.parquet')
+        WHERE fac_num IS NOT NULL
+        GROUP BY fac_num
+    ),
     facinfo AS (
         SELECT tie_id::INT AS tie_id,
                DATE_TRUNC('month', TRY_CAST(date_debut AS DATE)) AS mois_mission,
                COUNT(DISTINCT CONCAT(per_id::VARCHAR, '|', cnt_id::VARCHAR)) AS nb_missions_fac
-        FROM read_parquet('s3://{cfg.bucket_silver}/slv_missions/missions/**/*.parquet')
+        FROM read_parquet('{slv}/slv_missions/missions/**/*.parquet')
         WHERE date_debut IS NOT NULL
         GROUP BY 1, 2
     ),
     dim_clients AS (
-        SELECT * FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
+        SELECT * FROM read_parquet('{slv}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
         QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
     ),
@@ -85,11 +95,13 @@ def build_ca_mensuel_query(cfg: Config) -> str:
             DATE_TRUNC('month', TRY_CAST(f.date_facture AS DATE))  AS mois,
             f.type_facture,
             COALESCE(mt.montant_ht_calc, 0)::DECIMAL(18,2)        AS montant_ht,
+            COALESCE(hf.heures_calc, 0)::DECIMAL(12,2)            AS heures_ht,
             f.efac_num,
             f.rgpcnt_id::INT                                       AS rgpcnt_id,
             COALESCE(fi.nb_missions_fac, 0)                        AS nb_missions_fac
         FROM factures f
         LEFT JOIN montants    mt ON mt.fac_num    = f.efac_num
+        LEFT JOIN heures_fac  hf ON hf.fac_num    = f.efac_num
         LEFT JOIN facinfo     fi ON fi.tie_id     = f.tie_id::INT
             AND fi.mois_mission = DATE_TRUNC('month', TRY_CAST(f.date_facture AS DATE))
         LEFT JOIN dim_clients  c ON c.tie_id      = f.tie_id::INT
@@ -97,15 +109,18 @@ def build_ca_mensuel_query(cfg: Config) -> str:
     )
     SELECT
         client_sk, tie_id, mois,
-        COALESCE(SUM(CASE WHEN type_facture = 'F' THEN montant_ht ELSE 0 END), 0)    AS ca_ht,
-        COALESCE(SUM(CASE WHEN type_facture = 'A' THEN montant_ht ELSE 0 END), 0)    AS avoir_ht,
-        COALESCE(SUM(CASE WHEN type_facture = 'F' THEN montant_ht ELSE 0 END), 0)
-        - COALESCE(SUM(CASE WHEN type_facture = 'A' THEN montant_ht ELSE 0 END), 0)  AS ca_net_ht,
-        COUNT(DISTINCT CASE WHEN type_facture = 'F' THEN efac_num END)                AS nb_factures,
-        COALESCE(SUM(nb_missions_fac), 0)                                             AS nb_missions_facturees,
-        NULL::DECIMAL(10,2)                                                            AS nb_heures_facturees,
-        NULL::DECIMAL(10,2)                                                            AS taux_moyen_fact,
-        MODE(rgpcnt_id)                                                               AS agence_principale
+        COALESCE(SUM(CASE WHEN type_facture = 'F' THEN montant_ht ELSE 0 END), 0)::DECIMAL(18,2)    AS ca_ht,
+        COALESCE(SUM(CASE WHEN type_facture = 'A' THEN montant_ht ELSE 0 END), 0)::DECIMAL(18,2)    AS avoir_ht,
+        (COALESCE(SUM(CASE WHEN type_facture = 'F' THEN montant_ht ELSE 0 END), 0)
+        - COALESCE(SUM(CASE WHEN type_facture = 'A' THEN montant_ht ELSE 0 END), 0))::DECIMAL(18,2) AS ca_net_ht,
+        COUNT(DISTINCT CASE WHEN type_facture = 'F' THEN efac_num END)                               AS nb_factures,
+        COALESCE(SUM(nb_missions_fac), 0)                                                            AS nb_missions_facturees,
+        COALESCE(SUM(CASE WHEN type_facture = 'F' THEN heures_ht ELSE 0 END), 0)::DECIMAL(12,2)     AS nb_heures_facturees,
+        ROUND(
+            COALESCE(SUM(CASE WHEN type_facture = 'F' THEN montant_ht ELSE 0 END), 0)
+            / NULLIF(SUM(CASE WHEN type_facture = 'F' THEN heures_ht ELSE 0 END), 0)
+        , 4)::DECIMAL(10,4)                                                                          AS taux_moyen_fact,
+        MODE(rgpcnt_id)                                                                              AS agence_principale
     FROM base
     WHERE mois IS NOT NULL
     GROUP BY client_sk, tie_id, mois
