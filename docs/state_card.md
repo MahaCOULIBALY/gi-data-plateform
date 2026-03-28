@@ -1,6 +1,6 @@
 # State Card — Pipeline GI Data Platform
 
-> Dernière mise à jour : **2026-03-26** · Auteur : M. COULIBALY (Phase 3 — tâches #15-#16)
+> Dernière mise à jour : **2026-03-27** · Auteur : M. COULIBALY (session B1/B3/Phase 4-5 + déploiement Airflow)
 > Architecture : Bronze (Evolia/SQL Server) → Silver (Parquet S3) → Gold (PostgreSQL)
 
 ---
@@ -9,118 +9,121 @@
 
 | Couche | Statut | Notes |
 | --- | --- | --- |
-| Bronze | ✅ Stable | 30+ tables · Celery Worker frdc1pipeline01 |
-| Silver | ✅ Stable | Guard source vide déployé sur tous les scripts |
-| Gold | 🟡 Partiel | fact_competences_dispo corrigé · CA validation activée |
+| Bronze | ✅ Stable | 30+ tables · FreeTDS/pymssql · frdc1pipeline01 |
+| Silver | ✅ Stable | Guard source vide · Parquet S3 · Partiellement à relancer (B1, Phase 4) |
+| Gold | ✅ Stable | 12/12 pipelines success · 0 rows_rejected · dernière run 2026-03-27 |
+| Airflow | ✅ Actif | `gi_pipeline` · LocalExecutor · 05h00 UTC · redémarré 2026-03-27 |
+| Git | ✅ Synchro | `main` @ 54830c3 · remote GitHub à jour |
 
 ---
 
-## Bugs résolus — session 2026-03-26
+## Session 2026-03-27 — B1 + B3 + Phase 4 + Phase 5
 
-### ✅ T1 — Bug silver_temps : source bronze vide non gérée
+### ✅ DDL appliqué (avnadmin)
 
-**Fichiers :** [scripts/shared.py](../scripts/shared.py) · [scripts/silver_temps.py](../scripts/silver_temps.py)
-
-**Cause :** `read_json_auto(…/*.json)` levait `IOException` quand aucun fichier JSON n'existait
-sur S3 pour la partition du jour → `stats.errors` pollué → statut pipeline `partial`.
-
-**Fix :**
-
-- Ajout de `s3_has_files(cfg, bucket, prefix)` dans `shared.py` (MaxKeys=1, < 5ms)
-- Guard appliqué dans `silver_temps._process()` → `logger.info({…, "status": "empty"})` + `return`
-
-**Étendu :** Guard généralisé à **tous les scripts Silver** (voir section dédiée ci-dessous).
+| Table | Résultat |
+| --- | --- |
+| `gld_shared.dim_habilitations` | **CREATE TABLE** (nouvelle) |
+| `gld_shared.dim_diplomes` | **CREATE TABLE** (nouvelle) |
+| `gld_staffing.fact_fidelisation_interimaires` | **ALTER TABLE** — colonne `taux_fidelisation_pct DECIMAL(10,4)` ajoutée |
+| Toutes les autres | NOTICE "already exists" — safe |
 
 ---
 
-### ✅ T2 — gold_competences : fact_competences_dispo retournait 0 lignes
+### ✅ Phase 5 — dim_habilitations + dim_diplomes en Gold (#22-#23)
 
-**Fichier :** [scripts/gold_competences.py](../scripts/gold_competences.py)
+**Fichiers :** [scripts/gold_dimensions.py](../scripts/gold_dimensions.py) · [scripts/ddl_gold_tables.sql](../scripts/ddl_gold_tables.sql)
 
-**Cause racine :** `silver_interimaires.py:67` force `agence_rattachement = NULL::INT`
-→ `dim_int.rgpcnt_id` toujours NULL → `WHERE b.rgpcnt_id IS NOT NULL` filtrait 100% des lignes.
+**Source :** `slv_interimaires/competences` filtré par `type_competence` (déjà peuplé par `silver_competences.py`).
 
-**Fix :** Suppression de `AND b.rgpcnt_id IS NOT NULL` dans la clause WHERE finale.
-Les compétences remontent avec `rgpcnt_id = NULL` et `agence_sk = MD5(NULL)` (fallback déjà en place).
-Quand `agence_rattachement` sera alimenté en Silver, la ventilation par agence sera automatique.
-
-**Blocker résiduel :** `agence_rattachement` toujours NULL en Silver (source DDL Evolia absente). Voir B1.
-
----
-
-### ✅ T3 — Validation CA mensuel systématiquement skippée
-
-**Fichiers :** [scripts/gold_ca_mensuel.py](../scripts/gold_ca_mensuel.py) · [data/validation/pyramid_ca_mensuel.csv](../data/validation/pyramid_ca_mensuel.csv)
-
-**Cause :** `data/validation/pyramid_ca_mensuel.csv` absent → warning à chaque run Gold.
-
-**Fix :**
-
-- Fichier CSV créé avec 12 mois (2025-04 → 2026-03), valeurs `ca_net_ht = 0` (non calibrées)
-- Logique de validation ajustée : mois avec `ca_net_ht = 0` → statut `UNCALIBRATED` (ignorés)
-  au lieu de générer de faux `FAIL` (ancien diviseur `max(abs(py), 1)` remplacé par `abs(py)`)
-
-**Action requise :** Calibrer les valeurs de référence depuis le système legacy ou les premières
-semaines de données Gold réelles. Remplacer les `0` mois par mois dans le CSV.
-
----
-
-### ✅ T4 — SIRENE_API_TOKEN non documenté
-
-**Fichiers :** [.env.example](../.env.example) · [docs/DEPLOY.md](DEPLOY.md)
-
-**Fix :**
-
-- Variable `SIRENE_API_TOKEN` ajoutée dans `.env.example` (section "Enrichissement externe")
-- Section dédiée ajoutée dans `DEPLOY.md §8` : procédure INSEE complète (création app, OAuth2,
-  durée de vie 7 jours, prérequis `data/sirets_clients.json`)
-
----
-
-## Refactor — Guard source vide · Tous les pipelines Silver
-
-**Fichier central :** [scripts/shared.py](../scripts/shared.py) — `s3_has_files(cfg, bucket, prefix)`
-
-Comportement uniforme : si Bronze est vide pour la partition du jour → skip propre,
-sans `stats.errors`, sans casser le statut du pipeline.
-
-| Script | Source gardée | Niveau log | Particularité |
+| Dimension | PK | Colonnes | Source Silver |
 | --- | --- | --- | --- |
-| `silver_temps.py` | `raw_{bronze}/{dp}/` par table | INFO | Refactoré depuis guard inline |
-| `silver_agences_light.py` | `raw_pyregroupecnt/{dp}/` | INFO | Skip pipeline entier |
-| `silver_clients.py` | `raw_wttieserv/{dp}/` | INFO | Skip early — SCD2 conserve Silver intact |
-| `silver_clients_detail.py` | 3 × source spécifique | INFO | Guard indépendant par fonction |
-| `silver_competences.py` | `raw_wtpmet/{dp}/` (ancre) | INFO | WTMET/WTTHAB en `/**/` non concernés |
-| `silver_interimaires.py` | `raw_pypersonne/{dp}/` | INFO | Skip early — SCD2 conserve Silver intact |
-| `silver_interimaires_detail.py` | 4 × source spécifique | INFO | Guard indépendant par fonction |
-| `silver_factures.py` | `raw_{bronze}/{dp}/` par table | **WARNING** | Table critique CA |
-| `silver_missions.py` | `raw_{bronze}/{dp}/` par table | **WARNING** | Table critique, includes FIN_MISSION |
+| `gld_shared.dim_habilitations` | `thab_id` | habilitation_sk, thab_id, libelle, is_active | type=HABILITATION · WTTHAB |
+| `gld_shared.dim_diplomes` | `tdip_id` | diplome_sk, tdip_id, libelle, niveau, is_active | type=DIPLOME · WTTDIP |
+
+**Actif dans le DAG :** `gold_dimensions` les inclut dans `DIMENSIONS` + `builders`. Elles seront alimentées au prochain run Gold.
+
+---
+
+### ✅ Phase 4 — taux_fidelisation_pct (#17-#18)
+
+**Fichiers :** [scripts/silver_interimaires_detail.py](../scripts/silver_interimaires_detail.py) · [scripts/gold_staffing.py](../scripts/gold_staffing.py)
+
+**Silver :** `process_fidelisation` enrichi avec CTE `missions_12m` → `nb_missions_12m` + `taux_fidelisation_pct = nb_missions_12m / NULLIF(anciennete_jours/30, 0)`.
+
+**Gold :** `build_fidelisation_query` agrège `AVG(taux_fidelisation_pct)` par `(agence_id, categorie_fidelisation)`.
+
+**DDL :** `ALTER TABLE fact_fidelisation_interimaires ADD COLUMN IF NOT EXISTS taux_fidelisation_pct` — appliqué ✅.
+
+**Action requise :** relancer `silver_interimaires_detail.py` (voir section "Prochaines actions").
+
+---
+
+### ✅ B3 — nb_heures_facturees + taux_moyen_fact (TODO B-02)
+
+**Fichier :** [scripts/gold_ca_mensuel.py](../scripts/gold_ca_mensuel.py)
+
+**Fix :** CTE `heures_fac` — `SUM(base)` depuis `slv_facturation/lignes_factures` (WTLFAC.LFAC_BASE = quantité heures).
+
+| Colonne | Avant | Après |
+| --- | --- | --- |
+| `nb_heures_facturees` | `NULL::DECIMAL(10,2)` | `SUM(heures_ht) DECIMAL(12,2)` |
+| `taux_moyen_fact` | `NULL::DECIMAL(10,2)` | `ca_ht / NULLIF(heures_ht, 0) DECIMAL(10,4)` |
+
+**Action requise :** relancer `./run_pipeline.sh gold` (pas de DDL nécessaire).
+
+---
+
+### ✅ B1 — agence_rattachement depuis WTUGPINT
+
+**Fichier :** [scripts/silver_interimaires.py](../scripts/silver_interimaires.py)
+
+**Fix :** CTE `raw_ugpint` lit `raw_wtugpint/**/*.json` (full-history Bronze) → `RGPCNT_ID` le plus récent par `per_id`. Boucle SCD2 : `None` → `rd.get("agence_rattachement")`.
+
+**Run tenté :** `SILVER_DATE_PARTITION='**' python scripts/silver_interimaires.py` → `status: empty`
+
+**Cause :** Guard `s3_has_files(cfg, bucket, f"raw_pypersonne/{cfg.date_partition}/")` avec `date_partition='**'` cherche le prefix S3 littéral `raw_pypersonne/**/` — inexistant (S3 ne comprend pas les globs dans les préfixes de listing). Voir Blocker B6.
+
+**Action requise :** relancer avec une date réelle (voir B6).
+
+---
+
+### ✅ Airflow — déploiement complet
+
+| Action | Résultat |
+| --- | --- |
+| `dags_folder` → `/opt/groupe-interaction/etl/gi-data-plateform/dags` | ✅ airflow.cfg |
+| Symlink `dag_gi_pipeline.py` corrigé | ✅ `gi-data-plateform` (sans typo) |
+| 72 DAGs exemple supprimés de la DB | ✅ |
+| `schedule_interval` → `schedule` (Airflow 3.x) | ✅ |
+| `sla=` retiré du BashOperator | ✅ |
+| Python `.venv/bin/python` explicite | ✅ |
+| `gold_qualite_missions` + `gold_recouvrement` ajoutés au DAG | ✅ |
+| Scheduler + Webserver redémarrés | ✅ |
+| `airflow dags reserialize` → `Sync 1 DAGs : gi_pipeline` | ✅ |
 
 ---
 
 ## Blockers ouverts
 
-### 🔴 B1 — agence_rattachement NULL dans silver_interimaires
+### ✅ B6 — Guard s3_has_files incompatible avec SILVER_DATE_PARTITION='**' (RÉSOLU 2026-03-27)
 
-**Impact :** `gold_competences.fact_competences_dispo` remonte les données mais sans ventilation
-par agence (`rgpcnt_id = NULL`). `gold_staffing` et `gold_scorecard_agence` potentiellement affectés.
+**Fix :** `shared.py` — `s3_has_files` retourne `True` si `"**" in prefix` (bypass guard, S3 ne supporte pas les globs dans les préfixes de listing).
 
-**Cause :** `RGPCNT_ID` absent du DDL Evolia `WTPINT` → `NULL::INT` hardcodé en Silver.
-Source alternative probable : `WTUGPINT` (table `slv_interimaires/portefeuille_agences`).
+---
 
-**Mitigation :** Utiliser `WTUGPINT.RGPCNT_ID` comme source de `agence_rattachement` dans
-`silver_interimaires.py` (jointure PER_ID). À tester en probe.
+### 🔴 B1-pending — Silver agence_rattachement à propager
+
+B6 résolu. Code correct, Silver à régénérer.
+
+**Action :** `SILVER_DATE_PARTITION='**' python scripts/silver_interimaires.py`
+Puis `./run_pipeline.sh gold` pour propager dans `dim_interimaires`, `gold_competences`, `gold_staffing`, `gold_scorecard_agence`.
 
 ---
 
 ### 🟡 B2 — pyramid_ca_mensuel.csv non calibré
 
-**Impact :** Validation Gold CA exécutée mais tous les mois en statut `UNCALIBRATED`.
-Aucune vraie vérification de cohérence du CA jusqu'à calibration.
-
-**Action :** Extraire les CA nets mensuels réels (12 derniers mois) depuis Gold PostgreSQL
-et mettre à jour `data/validation/pyramid_ca_mensuel.csv`. Tolérance actuelle : 0.5%.
-
+**Action :** Extraire les CA nets mensuels réels depuis Gold PostgreSQL :
 ```sql
 SELECT TO_CHAR(mois, 'YYYY-MM') AS mois, SUM(ca_net_ht::NUMERIC) AS ca_net_ht
 FROM gld_commercial.fact_ca_mensuel_client
@@ -129,45 +132,21 @@ GROUP BY 1 ORDER BY 1 DESC LIMIT 12;
 
 ---
 
-### 🟡 B3 — nb_heures_facturees et taux_moyen_fact NULL dans fact_ca_mensuel_client
+### ✅ B3 — nb_heures_facturees + taux_moyen_fact (RÉSOLU 2026-03-27)
 
-**Fichier :** [scripts/gold_ca_mensuel.py](../scripts/gold_ca_mensuel.py) — TODO B-02 existant
-
-**Cause :** `montant_ht` NULL en Silver factures → reconstitution via `SUM(lfac_base * lfac_taux)`
-non encore implémentée. Colonnes `nb_heures_facturees` et `taux_moyen_fact` déclarées `NULL`.
+Code déployé. Actif au prochain run Gold.
 
 ---
 
-### 🟡 B4 — data/sirets_clients.json absent
+### ✅ B4 — data/sirets_clients.json absent
 
-**Impact :** `bronze_clients_external.run_sirene()` skip silencieusement (warning non-bloquant).
-L'enrichissement SIRENE ne s'exécute jamais même si `SIRENE_API_TOKEN` est configuré.
-
-**Action :** Créer `data/sirets_clients.json` avec la liste des SIRETs clients actifs à enrichir
-(tableau JSON de chaînes). Source probable : export `gld_commercial.fact_ca_mensuel_client`.
+Toujours absent. SIRENE skip non-bloquant — priorité basse.
 
 ---
 
-### ✅ B5 — montant_regle NULL dans slv_clients/facturation_detail (RÉSOLU 2026-03-26)
+### ✅ B5 — montant_regle NULL (RÉSOLU 2026-03-26)
 
-**Probe exécuté** : `RUN_MODE=probe python probe_ddl.py` — WTEFAC : 31 colonnes réelles, WARN.
-
-**Résultat** : Les 5 colonnes B5 sont **définitivement absentes** de WTEFAC côté Evolia :
-`EFAC_TIERS`, `EFAC_AGENCE`, `EFAC_DATPAI`, `EFAC_MNTPAI`, `EFAC_TYPEPAI` → toutes `ABSENT`.
-
-**Décision** : L'implémentation Silver est correcte et définitive :
-
-- `tie_id` ← `TIE_ID`, `rgpcnt_id` ← `RGPCNT_ID`, `date_paiement` ← `EFAC_DTEREGLF`
-- `montant_regle = NULL::DECIMAL(18,2)` et `type_reglement = NULL::VARCHAR` sont **définitifs**
-- `fact_dso_client.encours_ht` = SUM(factures HT) sans déduction (pas de données paiement Evolia)
-
-**Impact résiduel** : DSO surestimé si des règlements existent en dehors d'Evolia (ex. virements
-tracés dans un autre système). Si une source de paiements est identifiée ultérieurement, une
-nouvelle Silver table dédiée devra être créée (table séparée de WTEFAC).
-
-**Fix collatéral** : `probe_ddl.py` corrigé — `_get_actual_columns()` utilisait `?` (paramètre
-positionnel non supporté par FreeTDS/DB-Lib dans `INFORMATION_SCHEMA`). Remplacé par f-string.
-Probe passe maintenant à **39 PASS / 1 WARN / 5 FAIL** (vs 0 PASS / 45 FAIL avant fix).
+Colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` définitivement absentes du DDL Evolia. Décision finale.
 
 ---
 
@@ -175,94 +154,53 @@ Probe passe maintenant à **39 PASS / 1 WARN / 5 FAIL** (vs 0 PASS / 45 FAIL ava
 
 | ID | Décision | Raison |
 | --- | --- | --- |
-| D01 | Silver → Parquet S3 (migré depuis Iceberg REST) | Iceberg REST OVH instable en prod ; Parquet + read_parquet DuckDB fiable |
-| D02 | `s3_has_files` guard centralisé dans `shared.py` | DRY — single source of truth, < 5ms par appel (MaxKeys=1) |
-| D03 | WARNING pour missions/factures, INFO pour le reste | Missions/factures = impact direct CA ; autres = données de référence |
-| D04 | SCD2 skip early si Bronze vide (clients, interimaires) | Préserve le Silver existant intact — sémantique SCD2 correcte |
-| D05 | `agence_sk` fallback = `MD5(rgpcnt_id)` si dim_agences inconnue | Évite les NULLs en Gold ; jointures Gold toujours possibles |
-| D06 | `UNCALIBRATED` au lieu de `FAIL` pour mois sans référence | Évite faux positifs validation CA ; permet activation progressive |
-| D07 | WTRHDON delta via `RHD_DATED` (proxy, sémantique date métier) | Pas de DATEMODIF en DDL ; limitation documentée |
-| D08 | `WTUG.UG_GPS` : `CAST(… AS NVARCHAR(MAX))` | pyodbc ne supporte pas SQL Server type -151 (geography) |
+| D01 | Silver → Parquet S3 (migré depuis Iceberg REST) | Iceberg REST OVH instable en prod |
+| D02 | `s3_has_files` guard centralisé dans `shared.py` | DRY — < 5ms par appel (MaxKeys=1) |
+| D03 | WARNING pour missions/factures, INFO pour le reste | Missions/factures = impact direct CA |
+| D04 | SCD2 skip early si Bronze vide (clients, interimaires) | Préserve le Silver existant intact |
+| D05 | `agence_sk` fallback = `MD5(rgpcnt_id)` si dim_agences inconnue | Évite les NULLs en Gold |
+| D06 | `UNCALIBRATED` au lieu de `FAIL` pour mois sans référence | Évite faux positifs validation CA |
+| D07 | WTRHDON delta via `RHD_DATED` (proxy, sémantique date métier) | Pas de DATEMODIF en DDL |
+| D08 | `WTUG.UG_GPS` : `CAST(… AS NVARCHAR(MAX))` | pyodbc ne supporte pas SQL Server type -151 |
+| D09 | Airflow standalone sur frdc1pipeline01 (LocalExecutor) | Bronze nécessite accès LAN → SRV-SQL2:1433 |
+| D10 | Python venv pipeline explicite dans BashOperator | Évite collision Python 3.11 Airflow / 3.12 pipeline |
+| D11 | `raw_wtugpint/**/*.json` full-history dans silver_interimaires | WTUGPINT full-load, pas de delta DDL |
+
+---
+
+## Roadmap KPI
+
+### ✅ Phase 1 — Opérationnel (tâches #1-#8) — TERMINÉ
+
+### ✅ Phase 2 — Qualité missions (tâches #9-#14) — TERMINÉ
+
+### ✅ Phase 3 — Recouvrement DSO (tâches #15-#16) — TERMINÉ
+
+### ✅ Phase 4 — Fidélisation intérimaires (tâches #17-#18) — CODE OK · DDL appliqué · Silver à relancer
+
+### ✅ Phase 5 — Référentiels partagés (tâches #22-#23) — CODE OK · DDL appliqué · Gold à relancer
+
+### 🔵 Phase 6 — API intérimaire (tâche #24)
+
+`GET /interimaires/{per_id}` — faisable sur Gold PostgreSQL.
+V1 : identité + lieu + qualification + missions (immédiat).
+V2 : + habilitations + diplômes (après Phase 5 propagée en Gold).
+
+### 🔵 Phase 7 — Finitions (tâches #19-#21)
+
+- **#19** : ~~`nb_heures_facturees` via WTLFAC~~ → **RÉSOLU en B3**
+- **#20** : `fact_concentration_client` — ajouter `ca_net_top5` + `taux_concentration_top5`
+- **#21** : DDL — index manquants, `COMMENT ON COLUMN`, nettoyage migrations
 
 ---
 
 ## Prochaines actions recommandées
 
-1. **[B1 — Priorité haute]** Alimenter `agence_rattachement` depuis `WTUGPINT` dans
-   `silver_interimaires.py` → débloque la ventilation par agence dans tout le Gold.
-
-2. **[B2 — Priorité moyenne]** Calibrer `pyramid_ca_mensuel.csv` avec les vraies valeurs
-   Gold (requête SQL ci-dessus) → active la validation de cohérence CA.
-
-3. **[B3 — Priorité moyenne]** Implémenter TODO B-02 dans `gold_ca_mensuel.py` :
-   reconstitution `montant_ht = SUM(lfac_base * lfac_taux)` depuis `silver_factures/lignes_factures`.
-
-4. **[B4 — Priorité basse]** Créer `data/sirets_clients.json` + configurer `SIRENE_API_TOKEN`
-   → active l'enrichissement SIRENE en production.
-
-5. **[Qualité]** Corriger les 2 warnings pyright dans `silver_competences.py` (lignes 153, 164) :
-   `fetchone()` peut retourner `None` → utiliser `(fetchone() or (0,))[0]`.
-
----
-
-## Roadmap KPI — Phases 3-5 (feature/kpi-completion)
-
-> Phases 1 et 2 terminées — commit `6256a76` sur `feature/kpi-completion`.
-> Catalogue KPI complet : [docs/CATALOGUE_KPI_GOLD.md](CATALOGUE_KPI_GOLD.md)
-
-### ✅ Phase 3 — Recouvrement & DSO (tâches #15-#16) — commit `feature/kpi-completion`
-
-#### ✅ Tâche #15 — Silver `slv_clients/facturation_detail`
-
-**Fichier modifié** : [scripts/silver_clients_detail.py](../scripts/silver_clients_detail.py)
-**Fonction ajoutée** : `process_facturation_detail()` — stats.tables_processed = 4
-
-**Source Bronze** : `raw_wtefac` (ingéré par `bronze_missions.py` — non dupliqué)
-
-**Colonnes produites** :
-
-| Colonne | Source Bronze réelle | Note |
-| ------- | -------------------- | ---- |
-| `efac_num` | `EFAC_NUM` | VARCHAR |
-| `tie_id` | `TIE_ID` | TRY_CAST AS INT (EFAC_TIERS absent DDL) |
-| `rgpcnt_id` | `RGPCNT_ID` | TRY_CAST AS INT (EFAC_AGENCE absent DDL) |
-| `date_paiement` | `EFAC_DTEREGLF` | TRY_CAST AS DATE (EFAC_DATPAI absent DDL) |
-| `montant_regle` | `NULL` | EFAC_MNTPAI absent DDL — probe requis |
-| `type_reglement` | `NULL` | EFAC_TYPEPAI absent DDL — probe requis |
-| `retard_jours` | calculé | LEFT JOIN slv_facturation/factures sur efac_num |
-
-> **Blocker B5** : `montant_regle` NULL — colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` non confirmées
-> dans le DDL Evolia WTEFAC (probe 2026-03-26). DSO surestimé jusqu'à confirmation.
-> Action : probe `SELECT TOP 1 EFAC_MNTPAI FROM WTEFAC` sur Evolia pour valider.
-
-#### ✅ Tâche #16 — Gold `gold_recouvrement.py`
-
-**Fichier créé** : [scripts/gold_recouvrement.py](../scripts/gold_recouvrement.py)
-**DDL ajouté** : section Phase 3 dans [scripts/ddl_gold_tables.sql](../scripts/ddl_gold_tables.sql)
-
-**Tables Gold** : `gld_operationnel.fact_dso_client` + `gld_operationnel.fact_balance_agee`
-
-**Logique DSO** : `encours_ht / (ca_mensuel / nb_jours_mois)` — snapshot = premier jour du mois courant.
-**Balance âgée** : tranches `0-30j` / `31-60j` / `61-90j` / `>90j` sur `DATEDIFF(date_echeance, snapshot)`.
-
----
-
-### 🔵 Phase 4 — Fidélisation intérimaires (tâches #17-#18) — À FAIRE
-
-**Tâche #17** — `silver_interimaires_detail.py` : enrichir `slv_interimaires/fidelisation` avec
-`taux_fidelisation_pct` = nb_missions_12m / NULLIF(anciennete_mois, 0).
-
-**Tâche #18** — `gold_staffing.py` : compléter `fact_fidelisation_interimaires` avec
-`taux_fidelisation_pct` (ajouter colonne en DDL via `ALTER TABLE … ADD COLUMN IF NOT EXISTS`).
-
----
-
-### Phase 5 — Finitions (tâches #19-#21)
-
-**Tâche #19** — `gold_ca_mensuel.py` : remplir `nb_heures_facturees` / `taux_moyen_fact`
-via `WTLFAC` (voir TODO B-02 ligne 18 — actuellement `NULL::DECIMAL`).
-
-**Tâche #20** — `fact_concentration_client` : ajouter `ca_net_top5` + `taux_concentration_top5`
-(PERCENT_RANK <= 0.05).
-
-**Tâche #21** — Finaliser DDL : index manquants, `COMMENT ON COLUMN`, nettoyage migrations.
+| Priorité | Action | Commande |
+| --- | --- | --- |
+| 🔴 Immédiat | Relancer Silver interimaires (B1 + Phase 4) | `SILVER_DATE_PARTITION='**' python scripts/silver_interimaires.py && python scripts/silver_interimaires_detail.py` |
+| 🔴 Immédiat | Relancer Gold complet (B3 + Phase 4 + Phase 5) | `./run_pipeline.sh gold` |
+| 🟡 Moyen terme | Calibrer `pyramid_ca_mensuel.csv` (B2) | Requête SQL ci-dessus |
+| 🟡 Moyen terme | Démarrer Phase 6 — API intérimaire | FastAPI/Flask sur Gold PG |
+| 🔵 Basse | `data/sirets_clients.json` + SIRENE (B4) | Export SIRETs depuis Gold |
+| 🔵 Basse | Phase 7 #20-#21 — finitions DDL | — |

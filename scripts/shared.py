@@ -369,8 +369,11 @@ def s3_has_files(cfg: "Config", bucket: str, prefix: str) -> bool:
     """Retourne True si au moins un objet S3 existe sous `prefix` dans `bucket`.
     Utilise MaxKeys=1 — un seul ListObjects suffit, très économique (< 5ms).
     OFFLINE → True : zéro connexion externe, chaque script gère l'absence de données.
+    B6 : si le prefix contient '**' (glob full-history), S3 ne peut pas lister → True bypass.
     """
     if cfg.mode == RunMode.OFFLINE:
+        return True
+    if "**" in prefix:
         return True
     resp = get_s3_client(cfg).list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
     return bool(resp.get("Contents"))
