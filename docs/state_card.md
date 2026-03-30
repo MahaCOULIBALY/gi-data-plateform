@@ -1,6 +1,6 @@
 # State Card — Pipeline GI Data Platform
 
-> Dernière mise à jour : **2026-03-27** · Auteur : M. COULIBALY (session B1/B3/Phase 4-5 + déploiement Airflow)
+> Dernière mise à jour : **2026-03-30** · Auteur : M. COULIBALY (session B6b — JSON type accumulation SCD2 + Gold Green 12/12)
 > Architecture : Bronze (Evolia/SQL Server) → Silver (Parquet S3) → Gold (PostgreSQL)
 
 ---
@@ -10,10 +10,37 @@
 | Couche | Statut | Notes |
 | --- | --- | --- |
 | Bronze | ✅ Stable | 30+ tables · FreeTDS/pymssql · frdc1pipeline01 |
-| Silver | ✅ Stable | Guard source vide · Parquet S3 · Partiellement à relancer (B1, Phase 4) |
-| Gold | ✅ Stable | 12/12 pipelines success · 0 rows_rejected · dernière run 2026-03-27 |
-| Airflow | ✅ Actif | `gi_pipeline` · LocalExecutor · 05h00 UTC · redémarré 2026-03-27 |
-| Git | ✅ Synchro | `main` @ 54830c3 · remote GitHub à jour |
+| Silver | ✅ Stable | `agence_rattachement` BIGINT propagé · `effectif_tranche` corrigé · 1.24M dim_interimaires · 1.56M dim_clients |
+| Gold | ✅ Green | **12/12 pipelines · 0 erreur · 0 rows_rejected** · dernière run 2026-03-30 |
+| Airflow | ✅ Actif | `gi_pipeline` · LocalExecutor · 05h00 UTC |
+| Git | ✅ Synchro | `main` @ 6816630 · remote GitHub à jour |
+
+---
+
+## Session 2026-03-30 — B6b + Gold Green 12/12
+
+### ✅ B6b — JSON type accumulation dans SCD2 JSONL (RÉSOLU 2026-03-30)
+
+**Cause :** DuckDB `read_json_auto` inférait `JSON` (pas `BIGINT`/`VARCHAR`) quand la fenêtre de sampling ne voyait que des `null` — `new_records` étaient placés en fin de fichier JSONL après 1.1M+ lignes existantes. Chaque re-run SCD2 ajoutait un niveau d'encodage JSON supplémentaire (5 niveaux détectés sur `agence_rattachement`).
+
+**Fix :**
+
+| Fichier | Correctif |
+| --- | --- |
+| `silver_interimaires.py` | Décode `agence_rattachement` JSON imbriqué→int + `new_records` en tête de `all_records` |
+| `silver_clients.py` | Idem pour `effectif_tranche` JSON imbriqué→str |
+| `gold_dimensions.py` | `TRY_CAST(agence_rattachement AS INTEGER)` + `LEFT(effectif_tranche, 50)` |
+| `gold_competences.py` | `TRY_CAST(agence_rattachement::VARCHAR AS INTEGER)` dans CTE `dim_int` |
+| `gold_vue360_client.py` | `LEFT(effectif_tranche, 50)` colonne `effectif` |
+
+**Résultat :** `agence_rattachement` = `BIGINT` · 519 267 valeurs renseignées sur 522 278 actifs. Gold 12/12 Green.
+
+---
+
+### ✅ B6 — Guard s3_has_files + `SILVER_DATE_PARTITION='**'` (RÉSOLU 2026-03-30)
+
+**Fix :** `shared.py` — bypass `if "**" in prefix: return True`.
+Silver full-history relancé avec succès.
 
 ---
 
@@ -112,18 +139,16 @@
 
 ---
 
-### 🔴 B1-pending — Silver agence_rattachement à propager
+### ✅ B1 — agence_rattachement propagé en Gold (RÉSOLU 2026-03-30)
 
-B6 résolu. Code correct, Silver à régénérer.
-
-**Action :** `SILVER_DATE_PARTITION='**' python scripts/silver_interimaires.py`
-Puis `./run_pipeline.sh gold` pour propager dans `dim_interimaires`, `gold_competences`, `gold_staffing`, `gold_scorecard_agence`.
+Silver régénéré (B6b fix) · `agence_rattachement` = BIGINT · 519 267 valeurs renseignées dans `dim_interimaires`.
 
 ---
 
 ### 🟡 B2 — pyramid_ca_mensuel.csv non calibré
 
 **Action :** Extraire les CA nets mensuels réels depuis Gold PostgreSQL :
+
 ```sql
 SELECT TO_CHAR(mois, 'YYYY-MM') AS mois, SUM(ca_net_ht::NUMERIC) AS ca_net_ht
 FROM gld_commercial.fact_ca_mensuel_client
@@ -132,15 +157,19 @@ GROUP BY 1 ORDER BY 1 DESC LIMIT 12;
 
 ---
 
-### ✅ B3 — nb_heures_facturees + taux_moyen_fact (RÉSOLU 2026-03-27)
+### ✅ B3 — nb_heures_facturees + taux_moyen_fact (PROPAGÉ 2026-03-30)
 
-Code déployé. Actif au prochain run Gold.
+`gold_ca_mensuel` actif · 291 lignes `fact_ca_mensuel_client`.
 
 ---
 
-### ✅ B4 — data/sirets_clients.json absent
+### ✅ B4 — Enrichissement clients SIRENE (FERMÉ — non pertinent)
 
-Toujours absent. SIRENE skip non-bloquant — priorité basse.
+**Décision 2026-03-30 :** Salesforce est la référence client. SIRENE supprimé de la roadmap.
+
+- `SALESFORCE_ENABLED=1` configuré dans `.env` · SF tourne quotidiennement
+- `naf_libelle` ← `Code_NAF__r.name` (SF) · 103 K/150 K actifs couverts (68%)
+- 32% gap = clients Evolia sans `Id_Evolia__c` dans SF → sujet gouvernance métier, pas technique
 
 ---
 
@@ -176,15 +205,26 @@ Colonnes `EFAC_MNTPAI` / `EFAC_TYPEPAI` définitivement absentes du DDL Evolia. 
 
 ### ✅ Phase 3 — Recouvrement DSO (tâches #15-#16) — TERMINÉ
 
-### ✅ Phase 4 — Fidélisation intérimaires (tâches #17-#18) — CODE OK · DDL appliqué · Silver à relancer
+### ✅ Phase 4 — Fidélisation intérimaires (tâches #17-#18) — PROPAGÉ EN PROD (2026-03-30)
 
-### ✅ Phase 5 — Référentiels partagés (tâches #22-#23) — CODE OK · DDL appliqué · Gold à relancer
+`taux_fidelisation_pct` alimenté · `fact_fidelisation_interimaires` : 450 lignes.
 
-### 🔵 Phase 6 — API intérimaire (tâche #24)
+### ✅ Phase 5 — Référentiels partagés (tâches #22-#23) — PROPAGÉ EN PROD (2026-03-30)
 
-`GET /interimaires/{per_id}` — faisable sur Gold PostgreSQL.
-V1 : identité + lieu + qualification + missions (immédiat).
-V2 : + habilitations + diplômes (après Phase 5 propagée en Gold).
+`dim_habilitations` : 266 · `dim_diplomes` : 36.
+
+### 🔵 Phase 6 — FastAPI serving layer (tâche #24)
+
+Serving layer complet sur Gold PostgreSQL — toutes les dimensions + KPIs.
+
+| Endpoint | Périmètre |
+| --- | --- |
+| `/clients/{tie_id}` | vue_360_client + fact_retention_client + fact_ca_mensuel |
+| `/interimaires/{per_id}` | identité + lieu + qualification + missions + habilitations + diplômes |
+| `/agences/{agence_id}` | scorecard_agence + ranking + tendances |
+| `/metiers/{metier_id}` | dim_metiers + fact_competences_dispo |
+| `/referentiels/` | dim_habilitations + dim_diplomes + dim_metiers |
+| `/kpis/agence/{agence_id}` | CA, DSO, fidélisation, conformité DPAE |
 
 ### 🔵 Phase 7 — Finitions (tâches #19-#21)
 
@@ -196,11 +236,11 @@ V2 : + habilitations + diplômes (après Phase 5 propagée en Gold).
 
 ## Prochaines actions recommandées
 
-| Priorité | Action | Commande |
-| --- | --- | --- |
-| 🔴 Immédiat | Relancer Silver interimaires (B1 + Phase 4) | `SILVER_DATE_PARTITION='**' python scripts/silver_interimaires.py && python scripts/silver_interimaires_detail.py` |
-| 🔴 Immédiat | Relancer Gold complet (B3 + Phase 4 + Phase 5) | `./run_pipeline.sh gold` |
-| 🟡 Moyen terme | Calibrer `pyramid_ca_mensuel.csv` (B2) | Requête SQL ci-dessus |
-| 🟡 Moyen terme | Démarrer Phase 6 — API intérimaire | FastAPI/Flask sur Gold PG |
-| 🔵 Basse | `data/sirets_clients.json` + SIRENE (B4) | Export SIRETs depuis Gold |
-| 🔵 Basse | Phase 7 #20-#21 — finitions DDL | — |
+| Priorité | Jalon | Action | Statut |
+| --- | --- | --- | --- |
+| 🔴 Haute | Jalon 1 | **B2** — Calibrer `pyramid_ca_mensuel.csv` (requête SQL Gold PG) | 🟡 En cours |
+| 🟡 Moyenne | Jalon 1 | **Phase 7 #20** — `fact_concentration_client` : `ca_net_top5` + `taux_concentration_top5` | ⏳ Pending |
+| 🟡 Moyenne | Jalon 1 | **Phase 7 #21** — DDL finitions : index manquants + `COMMENT ON COLUMN` | ⏳ Pending |
+| 🟡 Moyenne | Jalon 1 | **Superset** — Connexion datasource PostgreSQL Gold + dashboards KPI | ⏳ Pending |
+| 🔵 Basse | Jalon 2 | **Phase 6** — FastAPI serving layer : toutes dimensions + KPIs | ⏳ Pending |
+| 🔵 Phase 2+ | Architecture | Migration Silver Parquet → Iceberg · K8s · Kafka · MDM | — |

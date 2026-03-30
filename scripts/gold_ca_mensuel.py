@@ -45,6 +45,7 @@ CA_COLUMNS = [
 CONCENTRATION_COLUMNS = [
     "agence_id", "mois", "nb_clients", "nb_clients_top20",
     "ca_net_total", "ca_net_top20", "taux_concentration",
+    "ca_net_top5", "taux_concentration_top5",
 ]
 NAF_SECTEUR_COLUMNS = [
     "agence_id", "mois", "naf_code", "naf_division",
@@ -161,7 +162,11 @@ def build_concentration_query(cfg: Config) -> str:
                PERCENT_RANK() OVER (
                    PARTITION BY b.agence_id, b.mois
                    ORDER BY b.ca_net_ht DESC
-               ) AS pct_rank
+               ) AS pct_rank,
+               DENSE_RANK() OVER (
+                   PARTITION BY b.agence_id, b.mois
+                   ORDER BY b.ca_net_ht DESC
+               ) AS rnk
         FROM base b JOIN totals t ON t.agence_id = b.agence_id AND t.mois = b.mois
     )
     SELECT
@@ -174,7 +179,13 @@ def build_concentration_query(cfg: Config) -> str:
         ROUND(
             COALESCE(SUM(ca_net_ht) FILTER (WHERE pct_rank <= 0.2), 0)
             / NULLIF(MAX(ca_total), 0),
-        4)::DECIMAL(8,4)                                            AS taux_concentration
+        4)::DECIMAL(8,4)                                            AS taux_concentration,
+        COALESCE(SUM(ca_net_ht) FILTER (WHERE rnk <= 5),
+                 0)::DECIMAL(18,2)                                  AS ca_net_top5,
+        ROUND(
+            COALESCE(SUM(ca_net_ht) FILTER (WHERE rnk <= 5), 0)
+            / NULLIF(MAX(ca_total), 0),
+        4)::DECIMAL(8,4)                                            AS taux_concentration_top5
     FROM ranked
     WHERE mois IS NOT NULL
     GROUP BY 1, 2

@@ -11,18 +11,19 @@
 
 ## Connexion & Datasets à enregistrer
 
-**Database** : PostgreSQL Gold (`gi-poc-warehouse`) — connexion déjà configurée.
+**Database** : PostgreSQL Gold — `gi_data` (`postgresql-161a1420-of9dcfaf6.database.cloud.ovh.net:20184`) — connexion déjà configurée via le dashboard Performance Agences.
 
 | Dataset | Schema | Table | Usage |
 |---|---|---|---|
 | Durée Mission | gld_performance | fact_duree_mission | DMM par métier/agence/mois |
 | Rupture Contrat | gld_performance | fact_rupture_contrat | Taux de rupture CTT |
-| DSO Client | gld_commercial | fact_dso_client | Délai moyen de paiement |
-| Balance Âgée | gld_commercial | fact_balance_agee | Encours par tranche de retard |
+| DSO Client | **gld_operationnel** | fact_dso_client | Délai moyen de paiement |
+| Balance Âgée | **gld_operationnel** | fact_balance_agee | Encours par tranche de retard |
 | Renouvellement Mission | gld_commercial | fact_renouvellement_mission | Taux de reconduction |
 | Dynamique Vivier | gld_staffing | fact_dynamique_vivier | Nouveaux inscrits, croissance |
 | Coeff Facturation | gld_performance | fact_coeff_facturation | Coeff par métier/client |
 | CA Secteur NAF | gld_commercial | fact_ca_secteur_naf | CA par secteur d'activité |
+| Concentration Client | **gld_clients** | fact_concentration_client | Top-5 et Top-20 par agence/mois |
 
 ---
 
@@ -57,7 +58,7 @@ SELECT
     SUM(f.nb_missions)             AS nb_missions
 FROM gld_performance.fact_duree_mission f
 JOIN gld_shared.dim_agences da ON da.rgpcnt_id = f.agence_id
-JOIN gld_shared.dim_metiers dm ON dm.metier_id = f.metier_id
+JOIN gld_shared.dim_metiers dm ON dm.met_id = f.metier_id
 WHERE f.mois >= CURRENT_DATE - INTERVAL '3 months'
 GROUP BY 1, 2
 ORDER BY SUM(f.nb_missions) DESC
@@ -233,10 +234,10 @@ ORDER BY f.nb_missions DESC
 
 | KPI | SQL | Format |
 |---|---|---|
-| DSO global | `SELECT ROUND(AVG(dso_moyen_jours)) FROM gld_commercial.fact_dso_client WHERE mois = (SELECT MAX(mois) FROM gld_commercial.fact_dso_client)` | X jours |
-| Encours total | `SELECT SUM(encours_total) FROM gld_commercial.fact_balance_agee` | € |
-| Encours > 60j | `SELECT SUM(montant_60_90j + montant_plus_90j) FROM gld_commercial.fact_balance_agee` | € |
-| Factures en retard | `SELECT SUM(nb_en_retard) FROM gld_commercial.fact_dso_client WHERE mois = (SELECT MAX(mois) FROM gld_commercial.fact_dso_client)` | N factures |
+| DSO global | `SELECT ROUND(AVG(dso_jours), 1) FROM gld_operationnel.fact_dso_client WHERE mois = (SELECT MAX(mois) FROM gld_operationnel.fact_dso_client)` | X,X jours |
+| Encours total échu | `SELECT SUM(montant_echu) FROM gld_operationnel.fact_balance_agee WHERE mois = (SELECT MAX(mois) FROM gld_operationnel.fact_balance_agee)` | € |
+| Encours > 60j | `SELECT SUM(montant_echu) FROM gld_operationnel.fact_balance_agee WHERE mois = (SELECT MAX(mois) FROM gld_operationnel.fact_balance_agee) AND tranche IN ('61-90j', '>90j')` | € |
+| Factures ouvertes | `SELECT SUM(nb_factures_ouvertes) FROM gld_operationnel.fact_dso_client WHERE mois = (SELECT MAX(mois) FROM gld_operationnel.fact_dso_client)` | N factures |
 
 **Type** : Big Number with Trendline
 **Alerte** : DSO > 45j → couleur rouge, DSO ≤ 30j → vert
@@ -245,56 +246,59 @@ ORDER BY f.nb_missions DESC
 
 ### Chart 2 — Stacked Bar : Balance Âgée par Agence
 
+> Note : `fact_balance_agee` stocke les tranches en format narrow (`tranche` VARCHAR + `montant_echu`).
+> Le pivot vers le format wide est réalisé via `FILTER`.
+
 **SQL Custom** :
 ```sql
 SELECT
-    da.nom                          AS agence,
-    SUM(b.montant_non_echu)        AS non_echu,
-    SUM(b.montant_0_30j)           AS retard_0_30j,
-    SUM(b.montant_30_60j)          AS retard_30_60j,
-    SUM(b.montant_60_90j)          AS retard_60_90j,
-    SUM(b.montant_plus_90j)        AS retard_plus_90j,
-    SUM(b.encours_total)           AS total
-FROM gld_commercial.fact_balance_agee b
+    da.nom_agence                                                    AS agence,
+    SUM(b.montant_echu) FILTER (WHERE b.tranche = '0-30j')          AS retard_0_30j,
+    SUM(b.montant_echu) FILTER (WHERE b.tranche = '31-60j')         AS retard_31_60j,
+    SUM(b.montant_echu) FILTER (WHERE b.tranche = '61-90j')         AS retard_61_90j,
+    SUM(b.montant_echu) FILTER (WHERE b.tranche = '>90j')           AS retard_plus_90j,
+    SUM(b.montant_echu)                                              AS total_echu
+FROM gld_operationnel.fact_balance_agee b
 JOIN gld_shared.dim_agences da ON da.rgpcnt_id = b.agence_id
-GROUP BY da.nom
-ORDER BY SUM(b.encours_total) DESC
+WHERE b.mois = (SELECT MAX(mois) FROM gld_operationnel.fact_balance_agee)
+GROUP BY da.nom_agence
+ORDER BY SUM(b.montant_echu) DESC
 LIMIT 20
 ```
 **Type** : Bar Chart Stacked (horizontal)
-**Couleurs** : non_echu=#BDC3C7, 0-30j=#F39C12, 30-60j=#E67E22, 60-90j=#E74C3C, >90j=#922B21
-**Options** : Show data labels, Sort par total DESC
+**Couleurs** : 0-30j=#F39C12, 31-60j=#E67E22, 61-90j=#E74C3C, >90j=#922B21
+**Options** : Show data labels, Sort par total_echu DESC
 
 ---
 
-### Chart 3 — Tableau : Balance Âgée Détaillée par Client
+### Chart 3 — Tableau : Encours DSO Détaillé par Client
+
+> Note : `fact_balance_agee` n'a pas de granularité client (`tie_id` absent).
+> Ce tableau utilise `fact_dso_client` qui dispose du détail client.
 
 **SQL Custom** :
 ```sql
 SELECT
     dc.raison_sociale               AS client,
-    da.nom                          AS agence,
-    b.encours_total,
-    b.montant_non_echu,
-    b.montant_0_30j,
-    b.montant_30_60j,
-    b.montant_60_90j,
-    b.montant_plus_90j,
-    b.taux_vetusite_pct,
-    b.niveau_risque
-FROM gld_commercial.fact_balance_agee b
-JOIN gld_shared.dim_agences da ON da.rgpcnt_id = b.agence_id
-JOIN gld_shared.dim_clients dc ON dc.tie_id = b.tie_id AND dc.is_current
-ORDER BY b.encours_total DESC
+    da.nom_agence                   AS agence,
+    d.encours_ht,
+    d.montant_echu,
+    d.dso_jours,
+    d.nb_factures_ouvertes
+FROM gld_operationnel.fact_dso_client d
+JOIN gld_shared.dim_clients dc ON dc.tie_id = d.tie_id
+JOIN gld_shared.dim_agences da ON da.rgpcnt_id = d.agence_id
+WHERE d.mois = (SELECT MAX(mois) FROM gld_operationnel.fact_dso_client)
+  AND d.encours_ht > 0
+ORDER BY d.encours_ht DESC
 LIMIT 100
 ```
 **Type** : Table
-**Options** : Search enabled, Sort par encours_total DESC, Page size 25
+**Options** : Search enabled, Sort par encours_ht DESC, Page size 25
 **Conditional Formatting** :
-- `niveau_risque = 'LITIGIEUX'` → fond rouge
-- `niveau_risque = 'A_RISQUE'` → fond orange
-- `taux_vetusite_pct` > 20 → texte rouge
-- `montant_plus_90j` > 0 → gras rouge
+- `dso_jours` > 60 → fond rouge clair
+- `dso_jours` > 30 → fond orange clair
+- `montant_echu` > 0 → texte rouge gras
 
 ---
 
@@ -303,17 +307,18 @@ LIMIT 100
 **SQL Custom** :
 ```sql
 SELECT
-    da.nom              AS agence,
+    da.nom_agence       AS agence,
     d.mois,
-    d.dso_moyen_jours
-FROM gld_commercial.fact_dso_client d
+    ROUND(AVG(d.dso_jours), 1) AS dso_jours
+FROM gld_operationnel.fact_dso_client d
 JOIN gld_shared.dim_agences da ON da.rgpcnt_id = d.agence_id
 WHERE d.mois >= CURRENT_DATE - INTERVAL '12 months'
   AND d.agence_id IN (
-    SELECT agence_id FROM gld_commercial.fact_dso_client
-    WHERE mois = (SELECT MAX(mois) FROM gld_commercial.fact_dso_client)
-    ORDER BY dso_moyen_jours DESC LIMIT 10
+    SELECT agence_id FROM gld_operationnel.fact_dso_client
+    WHERE mois = (SELECT MAX(mois) FROM gld_operationnel.fact_dso_client)
+    ORDER BY AVG(dso_jours) DESC LIMIT 10
   )
+GROUP BY da.nom_agence, d.mois
 ORDER BY d.mois
 ```
 **Type** : Time-series Line Chart
@@ -327,42 +332,44 @@ ORDER BY d.mois
 **SQL Custom** :
 ```sql
 SELECT
-    'Non échu'    AS tranche, SUM(montant_non_echu)  AS montant FROM gld_commercial.fact_balance_agee
-UNION ALL
-SELECT '0-30 jours',          SUM(montant_0_30j)    FROM gld_commercial.fact_balance_agee
-UNION ALL
-SELECT '31-60 jours',         SUM(montant_30_60j)   FROM gld_commercial.fact_balance_agee
-UNION ALL
-SELECT '61-90 jours',         SUM(montant_60_90j)   FROM gld_commercial.fact_balance_agee
-UNION ALL
-SELECT 'Plus de 90 jours',    SUM(montant_plus_90j)  FROM gld_commercial.fact_balance_agee
+    tranche,
+    SUM(montant_echu) AS montant
+FROM gld_operationnel.fact_balance_agee
+WHERE mois = (SELECT MAX(mois) FROM gld_operationnel.fact_balance_agee)
+GROUP BY tranche
+ORDER BY CASE tranche
+    WHEN '0-30j'  THEN 1
+    WHEN '31-60j' THEN 2
+    WHEN '61-90j' THEN 3
+    WHEN '>90j'   THEN 4
+END
 ```
 **Type** : Pie Chart (Donut)
-**Couleurs** : identiques à Chart 2
+**Couleurs** : 0-30j=#F39C12, 31-60j=#E67E22, 61-90j=#E74C3C, >90j=#922B21
 **Options** : Labels = montant €, Tooltips = % + montant
 
 ---
 
-### Chart 6 — Bar Chart : Top 15 Clients par Encours > 30j
+### Chart 6 — Bar Chart : Top 15 Clients par Montant Échu
 
 **SQL Custom** :
 ```sql
 SELECT
-    dc.raison_sociale                             AS client,
-    da.nom                                        AS agence,
-    b.montant_0_30j + b.montant_30_60j
-    + b.montant_60_90j + b.montant_plus_90j       AS encours_retard,
-    b.niveau_risque
-FROM gld_commercial.fact_balance_agee b
-JOIN gld_shared.dim_clients dc ON dc.tie_id = b.tie_id AND dc.is_current
-JOIN gld_shared.dim_agences da ON da.rgpcnt_id = b.agence_id
-WHERE b.montant_0_30j + b.montant_30_60j
-      + b.montant_60_90j + b.montant_plus_90j > 0
-ORDER BY encours_retard DESC
+    dc.raison_sociale           AS client,
+    da.nom_agence               AS agence,
+    d.montant_echu,
+    d.encours_ht,
+    d.dso_jours
+FROM gld_operationnel.fact_dso_client d
+JOIN gld_shared.dim_clients dc ON dc.tie_id = d.tie_id
+JOIN gld_shared.dim_agences da ON da.rgpcnt_id = d.agence_id
+WHERE d.mois = (SELECT MAX(mois) FROM gld_operationnel.fact_dso_client)
+  AND d.montant_echu > 0
+ORDER BY d.montant_echu DESC
 LIMIT 15
 ```
 **Type** : Bar Chart horizontal
-**Couleur** : niveau_risque (LITIGIEUX=rouge foncé, A_RISQUE=orange, NORMAL=bleu)
+**Couleur** : dso_jours (gradient vert ≤30j → orange ≤60j → rouge >60j)
 
 ---
 
@@ -371,36 +378,37 @@ LIMIT 15
 **SQL Custom** :
 ```sql
 SELECT
-    dc.raison_sociale                                  AS client,
-    d.dso_moyen_jours,
-    b.encours_total,
-    b.taux_vetusite_pct,
-    b.niveau_risque
-FROM gld_commercial.fact_dso_client d
-JOIN gld_commercial.fact_balance_agee b
-    ON b.tie_id = d.tie_id
-JOIN gld_shared.dim_clients dc
-    ON dc.tie_id = d.tie_id AND dc.is_current
-WHERE d.mois = (SELECT MAX(mois) FROM gld_commercial.fact_dso_client)
-  AND b.encours_total > 0
+    dc.raison_sociale           AS client,
+    da.nom_agence               AS agence,
+    d.dso_jours,
+    d.encours_ht,
+    d.montant_echu,
+    d.nb_factures_ouvertes
+FROM gld_operationnel.fact_dso_client d
+JOIN gld_shared.dim_clients dc ON dc.tie_id = d.tie_id
+JOIN gld_shared.dim_agences da ON da.rgpcnt_id = d.agence_id
+WHERE d.mois = (SELECT MAX(mois) FROM gld_operationnel.fact_dso_client)
+  AND d.encours_ht > 0
+ORDER BY d.encours_ht DESC
+LIMIT 200
 ```
 **Type** : Scatter Plot (Bubble Chart)
-**X** : dso_moyen_jours, **Y** : taux_vetusite_pct, **Taille** : encours_total
-**Couleur** : niveau_risque
-**Lignes de référence** : X=45j (DSO critique), Y=20% (vétusté critique)
+**X** : dso_jours, **Y** : montant_echu, **Taille bulle** : encours_ht
+**Couleur** : dso_jours (gradient vert → rouge)
+**Lignes de référence** : X=30j (cible), X=45j (critique)
 **Quadrants** :
-- Bas gauche = Zone saine (DSO ok, peu de vétusté)
-- Haut droit = Zone rouge (DSO long + encours vieux)
+- Bas gauche = Zone saine (DSO court, peu d'échu)
+- Haut droit = Zone rouge (DSO long + montant échu élevé)
 
 ---
 
 ### Chart 8 — Filter Box
 
 **Filtres** :
-- **Agence** : multi-select
-- **Niveau risque** : LITIGIEUX / A_RISQUE / NORMAL
-- **Mode règlement** : multi-select (MRG_CODE)
-- **Tranche encours** : checkbox (non_echu / 0-30j / 30-60j / 60-90j / +90j)
+- **Agence** : multi-select (dim_agences.nom_agence)
+- **Tranche** : multi-select (`fact_balance_agee.tranche` : 0-30j / 31-60j / 61-90j / >90j)
+- **DSO seuil** : native filter numérique sur `dso_jours` (≥ X jours)
+- **Mois** : dropdown derniers 12 mois
 
 ---
 
@@ -572,8 +580,8 @@ ORDER BY 1
 
 | Alerte | Condition | Destinataires | Fréquence |
 |---|---|---|---|
-| DSO critique | `AVG(dso_moyen_jours) > 45` | Finance, Direction | Lundi matin |
-| Encours > 90j | `SUM(montant_plus_90j) > 50000` | Finance, Agence concernée | Quotidien |
+| DSO critique | `AVG(dso_jours) > 45` sur `gld_operationnel.fact_dso_client` | Finance, Direction | Lundi matin |
+| Encours > 90j | `SUM(montant_echu) > 50000` sur `fact_balance_agee WHERE tranche = '>90j'` | Finance, Agence concernée | Quotidien |
 | Taux rupture élevé | `AVG(taux_rupture_pct) > 10` | Dir. Régional, Agence | Lundi matin |
 | Coeff < seuil | `AVG(coeff_moyen_pondere) < 1.25` | Directeur Régional | Hebdomadaire |
 

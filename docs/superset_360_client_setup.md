@@ -12,10 +12,10 @@
 2. Menu **Settings** → **Database Connections** → **+ Database**
 3. Choisir **PostgreSQL**
 4. Renseigner :
-   - Host : `gi-poc-warehouse.postgresql.ovh.net`
-   - Port : `5432`
-   - Database : `gi_poc`
-   - Username / Password : credentials PG Gold
+   - Host : `postgresql-161a1420-of9dcfaf6.database.cloud.ovh.net`
+   - Port : `20184`
+   - Database : `gi_data`
+   - Username : `gi_gold_user` / Password : voir `.env` OVH_PG_PASSWORD
    - SSL : `require`
 5. **Test Connection** → succès → **Connect**
 

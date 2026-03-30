@@ -5,9 +5,11 @@
 
 ## Connexion
 
-- **Database** : PostgreSQL Gold (`gi-poc-warehouse`)
-- **Schemas** : `gld_performance`, `gld_shared`
-- Superset → Settings → Database Connections → PostgreSQL déjà configurée (cf. POC Phase 0)
+- **Database** : PostgreSQL Gold — `gi_data`
+- **Host** : `postgresql-161a1420-of9dcfaf6.database.cloud.ovh.net` · **Port** : `20184` · **SSL** : require
+- **User** : `gi_gold_user`
+- **Schemas** : `gld_performance`, `gld_shared`, `gld_commercial`, `gld_clients`
+- Superset → Settings → Database Connections → + Database → PostgreSQL
 
 ---
 
@@ -163,6 +165,6 @@ GROUP BY tendance
 
 ## Refresh & Permissions
 
-- **Cache timeout** : 3600s (1h) — données rafraîchies quotidiennement par dag_phase3
+- **Cache timeout** : 3600s (1h) — données rafraîchies quotidiennement par DAG `gi_pipeline`
 - **Roles** : "Direction" (full access), "Agence" (filtré par RLS sur agence_id)
 - **RLS** : `agence_id = {{ current_user_agence_id() }}` pour role "Agence"

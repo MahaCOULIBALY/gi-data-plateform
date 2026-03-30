@@ -612,3 +612,12 @@ CREATE TABLE IF NOT EXISTS gld_operationnel.fact_balance_agee (
     _loaded_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     PRIMARY KEY (agence_id, mois, tranche)
 );
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 7 #20 (2026-03-30) — fact_concentration_client : top-5 absolu
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ca_net_top5           : CA des 5 plus gros clients par agence/mois (DENSE_RANK <= 5)
+-- taux_concentration_top5 : ca_net_top5 / ca_net_total
+ALTER TABLE gld_clients.fact_concentration_client
+    ADD COLUMN IF NOT EXISTS ca_net_top5            DECIMAL(18,2),
+    ADD COLUMN IF NOT EXISTS taux_concentration_top5 DECIMAL(8,4);

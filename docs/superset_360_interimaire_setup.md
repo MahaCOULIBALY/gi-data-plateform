@@ -49,7 +49,7 @@ LEFT JOIN (
     GROUP BY per_id
 ) a ON a.per_id = di.per_id::INT
 LEFT JOIN gld_shared.dim_agences da ON da.rgpcnt_id = di.agence_rattachement::INT
-WHERE di.is_actif = 'true'
+WHERE di.is_actif = true
 ```
 
 Enregistrer comme Dataset virtuel : `v_interimaires_activite`
