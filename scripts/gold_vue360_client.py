@@ -104,7 +104,7 @@ def build_vue360_query(cfg: Config) -> str:
         d.code_postal,
         d.adresse_complete,
         NULL::VARCHAR                                                      AS secteur_activite,
-        d.effectif_tranche                                                 AS effectif,
+        LEFT(d.effectif_tranche::VARCHAR, 50)                             AS effectif,
         d.statut_client                                                    AS statut,
         COALESCE(ca.ca_ytd, 0)                                            AS ca_ytd,
         COALESCE(ca.ca_n1, 0)                                             AS ca_n1,
@@ -194,7 +194,7 @@ def _run_pg_fallback(cfg: Config, pg_conn) -> list[tuple]:
         d.code_postal,
         NULL::TEXT,                                          -- adresse_complete (absent de gld_shared.dim_clients)
         d.naf_libelle,                                       -- NULL en Gold (Phase 2)
-        d.effectif_tranche,
+        LEFT(d.effectif_tranche::VARCHAR, 50),
         d.statut_client,
         COALESCE(ca.ca_ytd, 0),
         COALESCE(ca.ca_n1, 0),

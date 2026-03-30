@@ -122,6 +122,21 @@ def run(cfg: Config) -> dict:
         except Exception:
             existing = []
 
+        # Normaliser agence_rattachement → int propre.
+        # Cause : DuckDB read_json_auto infère JSON (pas BIGINT) quand la fenêtre de sampling
+        # ne voit que des NULLs (nulls en tête de fichier) ; chaque re-run SCD2 ajoute un
+        # niveau d'encodage JSON supplémentaire. Décoder ici avant la boucle SCD2.
+        for r in existing:
+            v = r.get("agence_rattachement")
+            if v is not None and not isinstance(v, int):
+                while isinstance(v, str):
+                    try:
+                        v = json.loads(v)
+                    except (json.JSONDecodeError, ValueError):
+                        v = None
+                        break
+                r["agence_rattachement"] = int(v) if isinstance(v, (int, float)) else None
+
         current_by_id: dict[int, dict] = {
             int(r["per_id"]): r for r in existing if r.get("is_current")}
         historical = [r for r in existing if not r.get("is_current")]
@@ -170,7 +185,9 @@ def run(cfg: Config) -> dict:
         changed_ids = {int(r["per_id"]) for r in new_records}
         unchanged_current = [
             r for pid, r in current_by_id.items() if pid not in changed_ids]
-        all_records = historical + closed_records + unchanged_current + new_records
+        # new_records en premier : la fenêtre de sampling DuckDB voit des valeurs non-nulles
+        # pour agence_rattachement → inférence BIGINT au lieu de JSON dans read_json_auto.
+        all_records = new_records + historical + closed_records + unchanged_current
         # Normalisation schema — garantit que toutes les colonnes ajoutées après le 1er run
         # sont présentes dans TOUS les records (JSONL union_by_name ne suffit pas si les
         # nouvelles colonnes n'apparaissent qu'en fin de fichier, hors de la fenêtre de sampling)

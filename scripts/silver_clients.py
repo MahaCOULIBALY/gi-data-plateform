@@ -186,11 +186,31 @@ def run(cfg: Config) -> dict:
         except Exception:
             existing = []
 
+        # Normaliser effectif_tranche → chaîne simple.
+        # Même cause que silver_interimaires : DuckDB infère JSON (pas VARCHAR) quand
+        # la fenêtre de sampling ne voit que des NULLs → encodage JSON s'accumule à chaque run.
+        for r in existing:
+            v = r.get("effectif_tranche")
+            if v is not None and isinstance(v, str):
+                while isinstance(v, str):
+                    try:
+                        decoded = json.loads(v)
+                        if isinstance(decoded, str):
+                            v = decoded
+                        else:
+                            v = str(decoded) if decoded is not None else None
+                            break
+                    except (json.JSONDecodeError, ValueError):
+                        break
+                r["effectif_tranche"] = v
+
         # historical = versions déjà fermées dans le Silver (is_current=False)
         historical = [r for r in existing if not r.get("is_current")]
         new_records, closed_records, unchanged_current = _apply_scd2(
             staging, existing, now)
-        all_records = historical + closed_records + unchanged_current + new_records
+        # new_records en premier : garantit que DuckDB voit effectif_tranche non-null
+        # dans la fenêtre de sampling → inférence VARCHAR, pas JSON.
+        all_records = new_records + historical + closed_records + unchanged_current
         # Normalisation schema — garantit que toutes les colonnes ajoutées après le 1er run
         # sont présentes dans TOUS les records (JSONL union_by_name ne suffit pas si les
         # nouvelles colonnes n'apparaissent qu'en fin de fichier, hors de la fenêtre de sampling)

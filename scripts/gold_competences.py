@@ -34,7 +34,9 @@ def build_competences_dispo_query(cfg: Config) -> str:
         WHERE type_competence = 'METIER' AND is_active = true AND code != ''
     ),
     dim_int AS (
-        SELECT per_id, agence_rattachement AS rgpcnt_id, is_actif
+        SELECT per_id,
+               TRY_CAST(agence_rattachement::VARCHAR AS INTEGER) AS rgpcnt_id,
+               is_actif
         FROM read_parquet('{slv}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true AND is_actif = true AND agence_rattachement IS NOT NULL
         QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1

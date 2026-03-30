@@ -96,7 +96,7 @@ def build_dim_clients(ddb, cfg: Config) -> list[tuple]:
             naf_code,
             NULLIF(TRIM(COALESCE(naf_libelle::VARCHAR, '')), '')      AS naf_libelle,
             ville, code_postal, statut_client,
-            effectif_tranche
+            LEFT(effectif_tranche::VARCHAR, 50)                        AS effectif_tranche
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_clients/dim_clients/**/*.parquet')
         WHERE is_current = true
         QUALIFY ROW_NUMBER() OVER (PARTITION BY tie_id ORDER BY valid_from DESC NULLS LAST) = 1
@@ -108,7 +108,8 @@ def build_dim_interimaires(ddb, cfg: Config) -> list[tuple]:
     return ddb.execute(f"""
         SELECT interimaire_sk, per_id, matricule, nom, prenom,
                ville, code_postal, date_entree, is_actif, is_candidat,
-               is_permanent, agence_rattachement
+               is_permanent,
+               TRY_CAST(agence_rattachement::VARCHAR AS INTEGER) AS agence_rattachement
         FROM read_parquet('s3://{cfg.bucket_silver}/slv_interimaires/dim_interimaires/**/*.parquet')
         WHERE is_current = true
         QUALIFY ROW_NUMBER() OVER (PARTITION BY per_id ORDER BY valid_from DESC NULLS LAST) = 1
